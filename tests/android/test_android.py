@@ -98,8 +98,9 @@ class AndroidManifestTest(unittest.TestCase):
         root = manifest(
             f'''<manifest xmlns:android="{ANDROID_NS}" package="com.dobby.vpn">
               <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
               <application android:debuggable="true" android:usesCleartextTraffic="false">
-                <service android:name="com.dobby.feature.vpn_service.DobbyVpnService" android:exported="true" android:permission="android.permission.BIND_VPN_SERVICE"><intent-filter><action android:name="android.net.VpnService" /></intent-filter></service>
+                <service android:name="com.dobby.feature.vpn_service.DobbyVpnService" android:exported="true" android:permission="android.permission.BIND_VPN_SERVICE" android:foregroundServiceType="specialUse"><property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="VPN lifecycle" /><intent-filter><action android:name="android.net.VpnService" /></intent-filter></service>
                 <activity android:name="com.dobby.feature.main.ui.DobbySocksActivity" android:exported="true" />
               </application>
             </manifest>'''
@@ -111,14 +112,30 @@ class AndroidManifestTest(unittest.TestCase):
         root = manifest(
             f'''<manifest xmlns:android="{ANDROID_NS}" package="com.dobby.vpn">
               <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
               <application android:debuggable="true" android:usesCleartextTraffic="false">
-                <service android:name="com.dobby.feature.vpn_service.DobbyVpnService" android:exported="true"><intent-filter><action android:name="android.net.VpnService" /></intent-filter></service>
+                <service android:name="com.dobby.feature.vpn_service.DobbyVpnService" android:exported="true" android:foregroundServiceType="specialUse"><property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="VPN lifecycle" /><intent-filter><action android:name="android.net.VpnService" /></intent-filter></service>
                 <activity android:name="com.dobby.feature.main.ui.DobbySocksActivity" android:exported="true" />
               </application>
             </manifest>'''
         )
 
         with self.assertRaisesRegex(AndroidContractError, "BIND_VPN_SERVICE"):
+            verify_application_manifest(root)
+
+    def test_rejects_system_exempted_before_vpn_activation(self) -> None:
+        root = manifest(
+            f'''<manifest xmlns:android="{ANDROID_NS}" package="com.dobby.vpn">
+              <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
+              <application android:debuggable="true" android:usesCleartextTraffic="false">
+                <service android:name="com.dobby.feature.vpn_service.DobbyVpnService" android:exported="true" android:permission="android.permission.BIND_VPN_SERVICE" android:foregroundServiceType="systemExempted"><intent-filter><action android:name="android.net.VpnService" /></intent-filter></service>
+                <activity android:name="com.dobby.feature.main.ui.DobbySocksActivity" android:exported="true" />
+              </application>
+            </manifest>'''
+        )
+
+        with self.assertRaisesRegex(AndroidContractError, "FOREGROUND_SERVICE_SPECIAL_USE"):
             verify_application_manifest(root)
 
     def test_accepts_expected_instrumentation_manifest(self) -> None:
