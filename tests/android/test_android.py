@@ -138,6 +138,20 @@ class AndroidManifestTest(unittest.TestCase):
         with self.assertRaisesRegex(AndroidContractError, "FOREGROUND_SERVICE_SPECIAL_USE"):
             verify_application_manifest(root)
 
+    def test_accepts_compiled_special_use_bitmask(self) -> None:
+        root = manifest(
+            f'''<manifest xmlns:android="{ANDROID_NS}" package="com.dobby.vpn">
+              <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <application android:debuggable="true" android:usesCleartextTraffic="false">
+                <service android:name="com.dobby.feature.vpn_service.DobbyVpnService" android:exported="true" android:permission="android.permission.BIND_VPN_SERVICE" android:foregroundServiceType="0x40000000"><property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="VPN lifecycle" /><intent-filter><action android:name="android.net.VpnService" /></intent-filter></service>
+                <activity android:name="com.dobby.feature.main.ui.DobbySocksActivity" android:exported="true" />
+              </application>
+            </manifest>'''
+        )
+
+        verify_application_manifest(root)
+
     def test_accepts_expected_instrumentation_manifest(self) -> None:
         root = manifest(
             f'''<manifest xmlns:android="{ANDROID_NS}" package="com.dobby.vpn.test">

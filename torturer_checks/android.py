@@ -245,7 +245,8 @@ def verify_application_manifest(root: ElementTree.Element) -> None:
     _require(service.get(_android_attribute("exported")) == "true", "VPN service must be exported to Android")
     _require(service.get(_android_attribute("permission")) == "android.permission.BIND_VPN_SERVICE", "VPN service must require BIND_VPN_SERVICE")
     _require(
-        service.get(_android_attribute("foregroundServiceType")) == "specialUse",
+        service.get(_android_attribute("foregroundServiceType"))
+        in {"specialUse", "0x40000000"},
         "VPN service must use the specialUse foreground-service type",
     )
     special_use = next(
