@@ -227,11 +227,41 @@ def verify_application_manifest(root: ElementTree.Element) -> None:
     _require(application is not None, "application manifest has no <application>")
     _require(application.get(_android_attribute("debuggable")) == "true", "debug APK must be debuggable")
     _require(application.get(_android_attribute("usesCleartextTraffic")) == "false", "application must disable cleartext traffic")
+    permissions = {
+        item.get(_android_attribute("name"))
+        for item in root.findall("uses-permission")
+    }
+    _require(
+        "android.permission.FOREGROUND_SERVICE_SPECIAL_USE" in permissions,
+        "application must declare FOREGROUND_SERVICE_SPECIAL_USE",
+    )
+    _require(
+        "android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" not in permissions,
+        "application must not rely on systemExempted before the VPN is active",
+    )
 
     service = next((item for item in application.findall("service") if item.get(_android_attribute("name")) == VPN_SERVICE), None)
     _require(service is not None, "VPN service is absent from application manifest")
     _require(service.get(_android_attribute("exported")) == "true", "VPN service must be exported to Android")
     _require(service.get(_android_attribute("permission")) == "android.permission.BIND_VPN_SERVICE", "VPN service must require BIND_VPN_SERVICE")
+    _require(
+        service.get(_android_attribute("foregroundServiceType")) == "specialUse",
+        "VPN service must use the specialUse foreground-service type",
+    )
+    special_use = next(
+        (
+            item
+            for item in service.findall("property")
+            if item.get(_android_attribute("name"))
+            == "android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+        ),
+        None,
+    )
+    _require(
+        special_use is not None
+        and bool(special_use.get(_android_attribute("value"), "").strip()),
+        "VPN service must explain its specialUse foreground-service subtype",
+    )
     actions = {action.get(_android_attribute("name")) for action in service.findall("./intent-filter/action")}
     _require("android.net.VpnService" in actions, "VPN service must advertise android.net.VpnService")
 
