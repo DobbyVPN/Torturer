@@ -42,3 +42,5 @@ local VMs, and physical-device tests belong to the private Harness.
 - Generated manifests are diagnostic evidence, not signing attestations.
 
 See `docs/contract.md` for the planned caller and result contracts.
+
+Licensed under the Apache License, Version 2.0.

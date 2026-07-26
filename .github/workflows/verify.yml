@@ -1,0 +1,451 @@
+name: Torturer verification
+
+on:
+  workflow_call:
+    inputs:
+      source_repository:
+        description: Public GitHub owner/repository containing the candidate.
+        required: true
+        type: string
+      commit_sha:
+        description: Exact lowercase 40-character candidate commit SHA.
+        required: true
+        type: string
+      pr_number:
+        description: Positive pull-request number for diagnostics.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Torturer / artifact contract (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out pinned Torturer helpers
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: DobbyVPN/Torturer
+          ref: 5980b453cadf00391ea733dc5169f8e5ae9fa04b
+          path: torturer
+          persist-credentials: false
+
+      - name: Validate untrusted request identity
+        env:
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+
+          sys.path.insert(0, "torturer")
+          from torturer_contract.request import ValidationError, VerificationRequest
+
+          try:
+              request = VerificationRequest.parse(
+                  source_repository=os.environ["SOURCE_REPOSITORY"],
+                  commit_sha=os.environ["COMMIT_SHA"],
+                  pr_number=os.environ["PR_NUMBER"],
+              )
+          except ValidationError as error:
+              raise SystemExit(f"invalid reusable-workflow input: {error}") from error
+          print(request.to_json())
+          PY
+
+      - name: Check out exact candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.commit_sha }}
+          path: candidate
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Verify candidate checkout identity
+        env:
+          CANDIDATE_DIR: ${{ github.workspace }}/candidate
+          EXPECTED_COMMIT: ${{ inputs.commit_sha }}
+        run: |
+          actual_commit="$(git -C "$CANDIDATE_DIR" rev-parse HEAD)"
+          test "$actual_commit" = "$EXPECTED_COMMIT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Run public Linux helper
+        env:
+          CANDIDATE_DIR: ${{ github.workspace }}/candidate
+          EXPECTED_COMMIT: ${{ inputs.commit_sha }}
+        working-directory: torturer
+        run: >-
+          python3 -m torturer_checks.linux_slice
+          --candidate "$CANDIDATE_DIR"
+          --commit-sha "$EXPECTED_COMMIT"
+          --allow-bootstrap
+
+      - name: Record diagnostic request identity
+        if: always()
+        env:
+          DIAGNOSTICS_DIR: ${{ runner.temp }}/torturer-diagnostics
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          mkdir -p "$DIAGNOSTICS_DIR"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          Path(os.environ["DIAGNOSTICS_DIR"], "request.json").write_text(
+              json.dumps(
+                  {
+                      "source_repository": os.environ["SOURCE_REPOSITORY"],
+                      "commit_sha": os.environ["COMMIT_SHA"],
+                      "pr_number": os.environ["PR_NUMBER"],
+                  },
+                  sort_keys=True,
+              ) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload diagnostic request identity
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        with:
+          name: torturer-linux-request
+          path: ${{ runner.temp }}/torturer-diagnostics/request.json
+          if-no-files-found: error
+
+  windows:
+    name: Torturer / artifact contract (Windows)
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Check out pinned Torturer helpers
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: DobbyVPN/Torturer
+          ref: 5980b453cadf00391ea733dc5169f8e5ae9fa04b
+          path: torturer
+          persist-credentials: false
+
+      - name: Validate untrusted request identity
+        shell: pwsh
+        env:
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          python -c "import os, sys; sys.path.insert(0, 'torturer'); from torturer_contract.request import VerificationRequest; print(VerificationRequest.parse(source_repository=os.environ['SOURCE_REPOSITORY'], commit_sha=os.environ['COMMIT_SHA'], pr_number=os.environ['PR_NUMBER']).to_json())"
+
+      - name: Check out exact candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.commit_sha }}
+          path: candidate
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Verify candidate checkout identity
+        shell: pwsh
+        env:
+          CANDIDATE_DIR: ${{ github.workspace }}/candidate
+          EXPECTED_COMMIT: ${{ inputs.commit_sha }}
+        run: |
+          $actualCommit = git -C $env:CANDIDATE_DIR rev-parse HEAD
+          if ($actualCommit.Trim() -cne $env:EXPECTED_COMMIT) { throw "candidate checkout does not match the requested commit" }
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Run public Windows helper
+        shell: pwsh
+        env:
+          CANDIDATE_DIR: ${{ github.workspace }}/candidate
+          EXPECTED_COMMIT: ${{ inputs.commit_sha }}
+        working-directory: torturer
+        run: >-
+          python -m torturer_checks.desktop_slice
+          --candidate "$env:CANDIDATE_DIR"
+          --commit-sha "$env:EXPECTED_COMMIT"
+          --platform windows
+          --arch amd64
+          --allow-bootstrap
+
+  macos_arm64:
+    name: Torturer / artifact contract (macOS arm64)
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Check out pinned Torturer helpers
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: DobbyVPN/Torturer
+          ref: 5980b453cadf00391ea733dc5169f8e5ae9fa04b
+          path: torturer
+          persist-credentials: false
+
+      - name: Validate untrusted request identity
+        env:
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+
+          sys.path.insert(0, "torturer")
+          from torturer_contract.request import ValidationError, VerificationRequest
+
+          try:
+              request = VerificationRequest.parse(
+                  source_repository=os.environ["SOURCE_REPOSITORY"],
+                  commit_sha=os.environ["COMMIT_SHA"],
+                  pr_number=os.environ["PR_NUMBER"],
+              )
+          except ValidationError as error:
+              raise SystemExit(f"invalid reusable-workflow input: {error}") from error
+          print(request.to_json())
+          PY
+
+      - name: Check out exact candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.commit_sha }}
+          path: candidate
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Verify candidate checkout identity
+        env:
+          CANDIDATE_DIR: ${{ github.workspace }}/candidate
+          EXPECTED_COMMIT: ${{ inputs.commit_sha }}
+        run: |
+          actual_commit="$(git -C "$CANDIDATE_DIR" rev-parse HEAD)"
+          test "$actual_commit" = "$EXPECTED_COMMIT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Run public macOS arm64 helper
+        env:
+          CANDIDATE_DIR: ${{ github.workspace }}/candidate
+          EXPECTED_COMMIT: ${{ inputs.commit_sha }}
+        working-directory: torturer
+        run: >-
+          python3 -m torturer_checks.desktop_slice
+          --candidate "$CANDIDATE_DIR"
+          --commit-sha "$EXPECTED_COMMIT"
+          --platform macos
+          --arch arm64
+          --allow-bootstrap
+
+  macos_intel:
+    name: Torturer / artifact contract (macOS Intel)
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - name: Check out pinned Torturer helpers
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: DobbyVPN/Torturer
+          ref: 5980b453cadf00391ea733dc5169f8e5ae9fa04b
+          path: torturer
+          persist-credentials: false
+
+      - name: Validate untrusted request identity
+        env:
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+
+          sys.path.insert(0, "torturer")
+          from torturer_contract.request import ValidationError, VerificationRequest
+
+          try:
+              request = VerificationRequest.parse(
+                  source_repository=os.environ["SOURCE_REPOSITORY"],
+                  commit_sha=os.environ["COMMIT_SHA"],
+                  pr_number=os.environ["PR_NUMBER"],
+              )
+          except ValidationError as error:
+              raise SystemExit(f"invalid reusable-workflow input: {error}") from error
+          print(request.to_json())
+          PY
+
+      - name: Check out exact candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.commit_sha }}
+          path: candidate
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Verify candidate checkout identity
+        env:
+          CANDIDATE_DIR: ${{ github.workspace }}/candidate
+          EXPECTED_COMMIT: ${{ inputs.commit_sha }}
+        run: |
+          actual_commit="$(git -C "$CANDIDATE_DIR" rev-parse HEAD)"
+          test "$actual_commit" = "$EXPECTED_COMMIT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Run public macOS Intel helper
+        env:
+          CANDIDATE_DIR: ${{ github.workspace }}/candidate
+          EXPECTED_COMMIT: ${{ inputs.commit_sha }}
+        working-directory: torturer
+        run: >-
+          python3 -m torturer_checks.desktop_slice
+          --candidate "$CANDIDATE_DIR"
+          --commit-sha "$EXPECTED_COMMIT"
+          --platform macos
+          --arch amd64
+          --allow-bootstrap
+
+  android:
+    name: Torturer / Android service contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out pinned Torturer helpers
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: DobbyVPN/Torturer
+          ref: 5980b453cadf00391ea733dc5169f8e5ae9fa04b
+          path: torturer
+          persist-credentials: false
+
+      - name: Validate untrusted request identity
+        env:
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+
+          sys.path.insert(0, "torturer")
+          from torturer_contract.request import ValidationError, VerificationRequest
+
+          try:
+              request = VerificationRequest.parse(
+                  source_repository=os.environ["SOURCE_REPOSITORY"],
+                  commit_sha=os.environ["COMMIT_SHA"],
+                  pr_number=os.environ["PR_NUMBER"],
+              )
+          except ValidationError as error:
+              raise SystemExit(f"invalid reusable-workflow input: {error}") from error
+          print(request.to_json())
+          PY
+
+      - name: Check out exact candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.commit_sha }}
+          path: candidate
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Verify candidate checkout identity
+        env:
+          CANDIDATE_DIR: ${{ github.workspace }}/candidate
+          EXPECTED_COMMIT: ${{ inputs.commit_sha }}
+        run: |
+          actual_commit="$(git -C "$CANDIDATE_DIR" rev-parse HEAD)"
+          test "$actual_commit" = "$EXPECTED_COMMIT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Validate candidate Go version
+        id: go_version
+        env:
+          GO_VERSION_FILE: ${{ github.workspace }}/candidate/.go-version
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = Path(os.environ["GO_VERSION_FILE"]).read_text(encoding="utf-8").strip()
+          if not re.fullmatch(r"1\.\d{1,2}(?:\.\d{1,2})?(?:rc\d+|beta\d+)?", version):
+              raise SystemExit("candidate .go-version must contain one supported numeric Go version")
+          Path(os.environ["GITHUB_OUTPUT"]).write_text(f"version={version}\n", encoding="utf-8")
+          PY
+
+      - name: Set up candidate Go version
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: ${{ steps.go_version.outputs.version }}
+          cache: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407
+
+      - name: Install required Android SDK packages and NDK
+        run: |
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;36.0.0" \
+            "ndk;27.2.12479018" \
+            "cmake;3.22.1" \
+            "system-images;android-35;google_apis;x86_64"
+
+      - name: Initialise gomobile
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260520154334-0e4426e1883d
+          "$(go env GOPATH)/bin/gomobile" init
+
+      - name: Enable KVM for the job-local emulator
+        run: sudo chmod a+rw /dev/kvm
+
+      - name: Run public Android helper
+        env:
+          CANDIDATE_DIR: ${{ github.workspace }}/candidate
+          EXPECTED_COMMIT: ${{ inputs.commit_sha }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018
+        working-directory: torturer
+        run: |
+          python3 tests/android/run_contract.py \
+            --candidate-root "$CANDIDATE_DIR" \
+            --commit-sha "$EXPECTED_COMMIT" \
+            --sdk-root "$ANDROID_SDK_ROOT" \
+            --work-dir "$RUNNER_TEMP/torturer-android"
