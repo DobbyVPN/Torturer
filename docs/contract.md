@@ -69,6 +69,52 @@ The schema records immutable source identity, runner identity, file format,
 size, SHA-256, component hashes, and Torturer revision. It is test evidence,
 not authority to sign or publish the artefact.
 
+## Desktop ZIP helper contract
+
+`torturer_checks.artifact` is the portable v1 implementation for the Windows
+and macOS artifact jobs.  A caller first proves the local checkout identity:
+
+```python
+source = source_identity_from_checkout(
+    checkout, repository=source_repository, expected_commit=commit_sha
+)
+windows = inspect_windows_zip(artifact_zip, source=source, architecture="amd64")
+macos = inspect_macos_zip(artifact_zip, source=source, architecture="arm64")
+manifest_json = windows.manifest_json_v1(workflow_revision=torturer_revision)
+```
+
+The expected commit and resolved checkout `HEAD` must be identical lowercase
+40-character SHAs.  No ref, abbreviated SHA, or build-time provenance claim is
+accepted as a substitute.  The helper hashes the artifact and its checked main
+executable, records their sizes, and emits compact sorted JSON with `schema: 1`.
+It intentionally omits a timestamp, so an unchanged inspection has identical
+manifest bytes.
+
+When an artifact digest and size are supplied from a trusted download record,
+pass them as `expected_sha256` and `expected_size_bytes`; any mismatch fails
+the inspection.  The emitted manifest always contains the observed SHA-256 and
+byte size of the ZIP and checked main executable.
+
+The Windows default layout is
+`dobbyVPN-windows/bin/Dobby Vpn.exe`; the macOS default layout is
+`Dobby Vpn.app/Contents/Info.plist` plus
+`Dobby Vpn.app/Contents/MacOS/Dobby Vpn`.  Both helpers reject archive and
+input-file symlinks, unsafe/absolute/traversal paths, case-colliding ZIP names,
+encrypted entries, oversized or high-ratio members, and files outside that
+package root.  The PE machine type and Mach-O main executable slice must match
+the requested target architecture.  The macOS bundle executable must also
+match `CFBundleExecutable` in `Info.plist`.
+
+Only a short list of unmistakable credential *markers* is scanned in member
+names and bytes.  Failures identify no matched text, member, or candidate
+value.  This is deliberately a coarse public safety check, not a secret
+scanner or a proof that an artifact contains no credentials.
+
+The contract proves the inspected ZIP and the checked-out source identity; it
+cannot by itself prove that arbitrary build tooling produced that ZIP from that
+source.  The protected workflow remains responsible for checkout provenance,
+the build step, and associating its output with this manifest.
+
 ## Public/private boundary
 
 Public synthetic tests may verify package layout, process and service
