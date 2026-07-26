@@ -54,7 +54,7 @@ class VerifyWorkflowPolicyTest(unittest.TestCase):
 
     def test_checks_out_pinned_helpers_and_exact_candidate_without_credentials(self) -> None:
         helper_refs = re.findall(r"(?m)^          ref: ([0-9a-f]{40})$", self.text)
-        self.assertEqual(helper_refs, ["98e60000b8ce5b90a1c15c436d75d27f1652f872"] * 5)
+        self.assertEqual(helper_refs, ["e88b3e9f2a4c7528b529c19956dbaad043c51cbb"] * 5)
         candidate_checkout = re.search(
             r"- name: Check out exact candidate\n.*?(?=\n      - name:)",
             self.text,
