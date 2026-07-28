@@ -47,14 +47,24 @@ class VerifyWorkflowPolicyTest(unittest.TestCase):
         runners = re.findall(r"(?m)^    runs-on: ([^\s#]+)$", self.text)
         self.assertCountEqual(
             runners,
-            ["ubuntu-24.04", "windows-2022", "macos-15", "macos-15-intel", "ubuntu-24.04"],
+            [
+                "ubuntu-24.04",
+                "windows-2022",
+                "macos-15",
+                "macos-15-intel",
+                "macos-15",
+                "ubuntu-24.04",
+            ],
         )
         self.assertTrue(set(runners).issubset(HOSTED_RUNNERS))
         self.assertNotIn("self-hosted", self.text)
 
     def test_checks_out_pinned_helpers_and_exact_candidate_without_credentials(self) -> None:
         helper_refs = re.findall(r"(?m)^          ref: ([0-9a-f]{40})$", self.text)
-        self.assertEqual(helper_refs, ["e88b3e9f2a4c7528b529c19956dbaad043c51cbb"] * 5)
+        self.assertEqual(
+            helper_refs,
+            ["b3b8b772680134834ce8dd705acd25f35c6204d5"] * 6,
+        )
         candidate_checkout = re.search(
             r"- name: Check out exact candidate\n.*?(?=\n      - name:)",
             self.text,
@@ -73,6 +83,9 @@ class VerifyWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("python3 -m torturer_checks.linux_slice", self.text)
         self.assertIn("python -m torturer_checks.desktop_slice", self.text)
         self.assertIn("python3 -m torturer_checks.desktop_slice", self.text)
+        self.assertIn("source_identity_from_simulator_checkout", self.text)
+        self.assertIn(":app:iosSimulatorArm64Test", self.text)
+        self.assertIn("swift test --enable-code-coverage", self.text)
         self.assertIn("python3 tests/android/run_contract.py", self.text)
         self.assertGreaterEqual(self.text.count("--commit-sha"), 5)
 

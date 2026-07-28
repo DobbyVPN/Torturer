@@ -38,4 +38,4 @@ This proves APK identity/layout, manifest intent, installation, launcher
 process lifecycle, installed service declaration, and the candidate-owned
 Android service-shell checks.  It does **not** prove a real VPN connection,
 Android VPN consent, TUN creation, DNS or traffic routing, endpoint reachability,
-external IP, throughput, or failover.  Those require private Harness coverage.
+external IP, throughput, or failover. Those are outside this public contract.

@@ -29,6 +29,7 @@ The intended v1 required checks are:
 - `Torturer / artifact contract (Windows)`
 - `Torturer / artifact contract (macOS arm64)`
 - `Torturer / artifact contract (macOS Intel)`
+- `Torturer / iOS Simulator core contract`
 - `Torturer / Android service contract`
 
 Names become a compatibility surface once configured in DobbyVPN branch
@@ -115,24 +116,32 @@ cannot by itself prove that arbitrary build tooling produced that ZIP from that
 source.  The protected workflow remains responsible for checkout provenance,
 the build step, and associating its output with this manifest.
 
-## Public/private boundary
+## Public test scope
 
 Public synthetic tests may verify package layout, process and service
 lifecycle, public CLI behaviour, malformed inputs, cleanup, file permissions,
 network-denial behaviour, and absence of obvious embedded credentials.
 
-Actual provider profiles, external-IP expectations, throughput, protocol
-performance, real failover, soak runs, private VM definitions/state, rich
-failure artefacts, and physical iOS testing remain in Harness.
+Provider profiles, external-IP expectations, throughput, protocol performance,
+real failover, soak runs, and physical iOS testing are outside this public
+contract.
 
-## Planned iOS Simulator contract (H1 helper only)
+## iOS Simulator contract
 
-H1 provides public, standard-library helpers for a future secretless Simulator
-job. H1 does not add that job or amend any immutable workflow helper pin.
+H1 provides public, standard-library Simulator evidence helpers. H2 pins the
+H1 commit before adding the secretless hosted job, so a candidate cannot alter
+the independent helper revision that judges it.
+
+The initial H2 lane proves an exact clean candidate checkout; verifies the
+pinned H1 helper itself; compiles and runs tests against the candidate's exact
+production Swift lifecycle sources; and links and runs the shared KMP tests on
+an Apple-silicon iOS Simulator. It accepts no secrets, signing inputs, profiles,
+or candidate shell fragments.
 
 Once DobbyVPN exposes a stable public Simulator project/workspace, scheme,
 bundle identifier, named candidate-owned integration test, app output, and
-Simulator XCFramework slice, H2 may independently verify the exact clean
+Simulator XCFramework slice, a later workflow revision may independently
+verify the exact clean
 candidate checkout; build that fixed target without code signing; boot a
 preinstalled iPhone Simulator; inspect/install/launch/terminate the resulting
 app; inspect the XCTest result bundle; and require a non-empty failure-free
@@ -146,13 +155,6 @@ only synthetic configuration and a Simulator-only transport; it does not prove
 NetworkExtension packet-tunnel operation, routes, DNS, traffic, entitlements,
 or any physical-iPhone behaviour.
 
-H2 must be a subsequent Torturer commit that updates every `verify.yml` helper
-checkout to the immutable H1 SHA. Only after H2 exists may DobbyVPN update its
-own immutable Torturer workflow pin.
-
-## Rollout gate
-
-The DobbyVPN caller is not added and no check is made required until the first
-Torturer vertical slice is implemented and proven. The existing protected
-real-profile workflow remains in DobbyVPN until its private Harness replacement
-also passes.
+Every `verify.yml` helper checkout is pinned to the immutable H1 SHA. DobbyVPN
+may update its immutable Torturer workflow pin only to a reviewed H2-or-later
+commit.
