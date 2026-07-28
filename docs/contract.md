@@ -125,6 +125,31 @@ Actual provider profiles, external-IP expectations, throughput, protocol
 performance, real failover, soak runs, private VM definitions/state, rich
 failure artefacts, and physical iOS testing remain in Harness.
 
+## Planned iOS Simulator contract (H1 helper only)
+
+H1 provides public, standard-library helpers for a future secretless Simulator
+job. H1 does not add that job or amend any immutable workflow helper pin.
+
+Once DobbyVPN exposes a stable public Simulator project/workspace, scheme,
+bundle identifier, named candidate-owned integration test, app output, and
+Simulator XCFramework slice, H2 may independently verify the exact clean
+candidate checkout; build that fixed target without code signing; boot a
+preinstalled iPhone Simulator; inspect/install/launch/terminate the resulting
+app; inspect the XCTest result bundle; and require a non-empty failure-free
+test summary. All values are passed to `xcodebuild`, `simctl`, and
+`xcresulttool` as validated argument vectors rather than shell programs.
+
+The helper rejects symlinked app/result bundles, unsafe executable metadata,
+wrong bundle identity or Mach-O architecture, oversized trees, and a short
+list of obvious credential markers without echoing candidate bytes. It uses
+only synthetic configuration and a Simulator-only transport; it does not prove
+NetworkExtension packet-tunnel operation, routes, DNS, traffic, entitlements,
+or any physical-iPhone behaviour.
+
+H2 must be a subsequent Torturer commit that updates every `verify.yml` helper
+checkout to the immutable H1 SHA. Only after H2 exists may DobbyVPN update its
+own immutable Torturer workflow pin.
+
 ## Rollout gate
 
 The DobbyVPN caller is not added and no check is made required until the first

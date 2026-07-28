@@ -26,6 +26,12 @@ co-located unit, package-private, source-set, or seam tests.
 - portable Windows/macOS ZIP identity, layout, architecture, digest, and
   obvious-credential-marker inspection helpers.
 
+The repository also contains an unpinned H1 iOS Simulator evidence helper. It
+is not a required check and does not run in GitHub Actions until DobbyVPN has a
+fixed, public Simulator build/test contract and a later H2 workflow revision
+pins the H1 helper commit. It validates simulator app/result evidence; it does
+not claim NetworkExtension, routing, DNS, or physical-device coverage.
+
 Real VPN endpoints, external-IP assertions, speed tests, prolonged soak tests,
 local VMs, and physical-device tests belong to the private Harness.
 
