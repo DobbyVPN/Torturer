@@ -30,9 +30,9 @@ The repository contains a pinned public iOS Simulator core lane. It proves the
 exact clean candidate identity, verifies the H1 evidence helper, runs tests
 against the candidate's exact production Swift lifecycle sources, and links
 and tests shared KMP code on an Apple-silicon Simulator. The deeper app/result
-inspection helper is ready for a future fixed public app XCTest target. None
-of these checks claims NetworkExtension, routing, DNS, or physical-device
-coverage.
+inspection helper and H3 app-contract runner are ready for a later fixed public
+app XCTest target. None of these checks claims NetworkExtension, routing, DNS,
+or physical-device coverage.
 
 Real VPN endpoints, external-IP assertions, speed tests, prolonged soak tests,
 and physical-device tests are outside Torturer's public test contract.

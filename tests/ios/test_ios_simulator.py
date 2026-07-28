@@ -17,6 +17,7 @@ from torturer_checks.ios_simulator import (
     inspect_simulator_app,
     inspect_xcresult_bundle,
     simctl_boot_command,
+    simctl_bootstatus_command,
     simctl_install_command,
     simctl_launch_command,
     simctl_terminate_command,
@@ -152,6 +153,7 @@ class IOSSimulatorContractTest(unittest.TestCase):
         self.assertIn(f"-only-testing:{TEST}", command)
         self.assertIn("CODE_SIGNING_ALLOWED=NO", command)
         self.assertEqual(simctl_boot_command(UDID), ["xcrun", "simctl", "boot", UDID])
+        self.assertEqual(simctl_bootstatus_command(UDID), ["xcrun", "simctl", "bootstatus", UDID, "-b"])
         self.assertEqual(simctl_install_command(UDID, "/tmp/Dobby VPN.app")[-1], "/tmp/Dobby VPN.app")
         self.assertEqual(simctl_launch_command(UDID, BUNDLE)[-1], BUNDLE)
         self.assertEqual(simctl_terminate_command(UDID, BUNDLE)[-1], BUNDLE)

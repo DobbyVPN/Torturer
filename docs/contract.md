@@ -148,6 +148,14 @@ app; inspect the XCTest result bundle; and require a non-empty failure-free
 test summary. All values are passed to `xcodebuild`, `simctl`, and
 `xcresulttool` as validated argument vectors rather than shell programs.
 
+H3 fixes the Dobby public app contract to the `iosApp` Debug scheme,
+`doBBYVPN.app`, `vpn.dobby.app`, arm64 Simulator output, and
+`IOSSimulatorAppContractTests/IOSSimulatorAppContractTests/testAppLaunchesWithoutCredentials`.
+The app build/install/launch/terminate evidence and named XCTest evidence are
+separate stages, allowing H4 to enable the latter only when the candidate
+actually exposes that target. H3 contains no workflow change; H4 must pin the
+H3 helper revision first.
+
 The helper rejects symlinked app/result bundles, unsafe executable metadata,
 wrong bundle identity or Mach-O architecture, oversized trees, and a short
 list of obvious credential markers without echoing candidate bytes. It uses

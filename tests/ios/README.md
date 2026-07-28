@@ -27,3 +27,18 @@ transport must use synthetic input and must not open a real packet tunnel.
 H2 must be a later Torturer commit that pins this H1 commit SHA in every
 `verify.yml` helper checkout before DobbyVPN pins H2. Do not add an iOS job or
 change an immutable helper pin in H1.
+
+## H3 app-contract runner
+
+`torturer_checks.ios_simulator_app` adds the fixed public app contract for a
+future H4 job: the unsigned `iosApp` Debug product `doBBYVPN.app`, bundle ID
+`vpn.dobby.app`, arm64 Simulator architecture, and a named app XCTest that
+launches without credentials. It selects the newest available iPhone runtime
+from host `simctl` JSON with deterministic tie-breaks, then builds, inspects,
+installs, launches, and terminates the app. XCTest/result-bundle verification
+is an independent opt-in stage, so H4 can enable it only after the named app
+test target exists.
+
+The runner uses an injected argument-vector command executor. Its full
+sequencing tests run on Linux with a fake host; only H4 will supply the real
+ephemeral macOS subprocess executor. H3 itself must not edit `verify.yml`.

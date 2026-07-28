@@ -261,6 +261,11 @@ def simctl_boot_command(device_udid: str) -> list[str]:
     return ["xcrun", "simctl", "boot", _validate_udid(device_udid)]
 
 
+def simctl_bootstatus_command(device_udid: str) -> list[str]:
+    """Wait for one validated Simulator device to finish booting."""
+    return ["xcrun", "simctl", "bootstatus", _validate_udid(device_udid), "-b"]
+
+
 def simctl_install_command(device_udid: str, app: str | Path) -> list[str]:
     app_path = Path(app)
     if app_path.suffix != ".app":
