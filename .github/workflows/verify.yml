@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: DobbyVPN/Torturer
-          ref: b3b8b772680134834ce8dd705acd25f35c6204d5
+          ref: 04f43d3c959b59191b0a3f316d60f5aace9d58ff
           path: torturer
           persist-credentials: false
 
@@ -135,7 +135,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: DobbyVPN/Torturer
-          ref: b3b8b772680134834ce8dd705acd25f35c6204d5
+          ref: 04f43d3c959b59191b0a3f316d60f5aace9d58ff
           path: torturer
           persist-credentials: false
 
@@ -195,7 +195,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: DobbyVPN/Torturer
-          ref: b3b8b772680134834ce8dd705acd25f35c6204d5
+          ref: 04f43d3c959b59191b0a3f316d60f5aace9d58ff
           path: torturer
           persist-credentials: false
 
@@ -268,7 +268,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: DobbyVPN/Torturer
-          ref: b3b8b772680134834ce8dd705acd25f35c6204d5
+          ref: 04f43d3c959b59191b0a3f316d60f5aace9d58ff
           path: torturer
           persist-credentials: false
 
@@ -335,13 +335,13 @@ jobs:
   ios_simulator:
     name: Torturer / iOS Simulator core contract
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Check out pinned Torturer helpers
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: DobbyVPN/Torturer
-          ref: b3b8b772680134834ce8dd705acd25f35c6204d5
+          ref: 04f43d3c959b59191b0a3f316d60f5aace9d58ff
           path: torturer
           persist-credentials: false
 
@@ -410,6 +410,41 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Validate candidate Go version
+        id: ios_go_version
+        env:
+          GO_VERSION_FILE: ${{ github.workspace }}/candidate/.go-version
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = Path(os.environ["GO_VERSION_FILE"]).read_text(encoding="utf-8").strip()
+          if not re.fullmatch(r"1\.\d{1,2}(?:\.\d{1,2})?(?:rc\d+|beta\d+)?", version):
+              raise SystemExit("candidate .go-version must contain one supported numeric Go version")
+          Path(os.environ["GITHUB_OUTPUT"]).write_text(f"version={version}\n", encoding="utf-8")
+          PY
+
+      - name: Set up candidate Go version
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: ${{ steps.ios_go_version.outputs.version }}
+          cache: false
+
+      - name: Build public Go Simulator framework
+        env:
+          CANDIDATE_DIR: ${{ github.workspace }}/candidate
+        run: |
+          mkdir -p "$CANDIDATE_DIR/go_module/modules"
+          cp -R "$CANDIDATE_DIR/Cloak/internal" "$CANDIDATE_DIR/go_module/modules/Cloak/"
+          cd "$CANDIDATE_DIR/go_module"
+          go mod download
+          go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260520154334-0e4426e1883d
+          "$(go env GOPATH)/bin/gomobile" init
+          ./scripts/build_ios_xcframework.sh
+          ditto MyLibrary.xcframework ../swift_module/MyLibrary.xcframework
+
       - name: Verify pinned iOS evidence helper
         working-directory: torturer
         run: python3 -m unittest discover -s tests/ios -p 'test_*.py'
@@ -426,6 +461,28 @@ jobs:
             :app:iosSimulatorArm64Test \
             --stacktrace
 
+      - name: Stage KMP Simulator framework
+        env:
+          CANDIDATE_DIR: ${{ github.workspace }}/candidate
+        run: >-
+          ditto
+          "$CANDIDATE_DIR/kmp_module/app/build/bin/iosSimulatorArm64/debugFramework/app.framework"
+          "$CANDIDATE_DIR/swift_module/app.framework"
+
+      - name: Run public unsigned iOS Simulator app contract
+        env:
+          CANDIDATE_DIR: ${{ github.workspace }}/candidate
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          EXPECTED_COMMIT: ${{ inputs.commit_sha }}
+          TORTURER_IOS_WORK_DIR: ${{ runner.temp }}/torturer-ios-simulator
+        working-directory: torturer
+        run: |
+          python3 tests/ios/run_app_contract.py \
+            --candidate-root "$CANDIDATE_DIR" \
+            --source-repository "$SOURCE_REPOSITORY" \
+            --commit-sha "$EXPECTED_COMMIT" \
+            --work-dir "$TORTURER_IOS_WORK_DIR"
+
   android:
     name: Torturer / Android service contract
     runs-on: ubuntu-24.04
@@ -435,7 +492,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: DobbyVPN/Torturer
-          ref: b3b8b772680134834ce8dd705acd25f35c6204d5
+          ref: 04f43d3c959b59191b0a3f316d60f5aace9d58ff
           path: torturer
           persist-credentials: false
 

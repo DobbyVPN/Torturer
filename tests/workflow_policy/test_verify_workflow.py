@@ -63,7 +63,7 @@ class VerifyWorkflowPolicyTest(unittest.TestCase):
         helper_refs = re.findall(r"(?m)^          ref: ([0-9a-f]{40})$", self.text)
         self.assertEqual(
             helper_refs,
-            ["b3b8b772680134834ce8dd705acd25f35c6204d5"] * 6,
+            ["04f43d3c959b59191b0a3f316d60f5aace9d58ff"] * 6,
         )
         candidate_checkout = re.search(
             r"- name: Check out exact candidate\n.*?(?=\n      - name:)",
@@ -86,6 +86,9 @@ class VerifyWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("source_identity_from_simulator_checkout", self.text)
         self.assertIn(":app:iosSimulatorArm64Test", self.text)
         self.assertIn("swift test --enable-code-coverage", self.text)
+        self.assertIn("python3 tests/ios/run_app_contract.py", self.text)
+        self.assertIn("build_ios_xcframework.sh", self.text)
+        self.assertIn("--work-dir \"$TORTURER_IOS_WORK_DIR\"", self.text)
         self.assertIn("python3 tests/android/run_contract.py", self.text)
         self.assertGreaterEqual(self.text.count("--commit-sha"), 5)
 

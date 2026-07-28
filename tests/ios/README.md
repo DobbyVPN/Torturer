@@ -40,5 +40,7 @@ is an independent opt-in stage, so H4 can enable it only after the named app
 test target exists.
 
 The runner uses an injected argument-vector command executor. Its full
-sequencing tests run on Linux with a fake host; only H4 will supply the real
-ephemeral macOS subprocess executor. H3 itself must not edit `verify.yml`.
+sequencing tests run on Linux with a fake host; H4 supplies the real ephemeral
+macOS subprocess executor for app build/install/launch/terminate evidence,
+but does not yet request the optional XCTest stage. H3 itself did not edit
+`verify.yml`.
