@@ -409,8 +409,16 @@ def _reject_credentials_in_file(path: Path) -> None:
                 # every ordinary resource, including opaque binary resources.
                 if not previous and chunk.startswith(_STATIC_ARCHIVE_MAGIC):
                     return
-                if obvious_credential_marker(previous + chunk):
-                    raise IOSSimulatorContractError("artifact contains an obvious credential marker")
+                marker = obvious_credential_marker(previous + chunk)
+                if marker:
+                    suffix = path.suffix.lower()
+                    safe_suffix = suffix if re.fullmatch(r"\.[a-z0-9]{1,16}", suffix) else "<other>"
+                    name = path.name
+                    safe_name = name if re.fullmatch(r"[A-Za-z0-9._ -]{1,100}", name) else "<other>"
+                    raise IOSSimulatorContractError(
+                        "artifact contains an obvious credential marker "
+                        f"(category={marker}, member={safe_name}, suffix={safe_suffix})"
+                    )
                 previous = (previous + chunk)[-CREDENTIAL_SCAN_OVERLAP_BYTES:]
     except OSError as error:
         raise IOSSimulatorContractError("artifact member could not be read") from error
