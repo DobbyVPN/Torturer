@@ -127,6 +127,12 @@ class IOSSimulatorContractTest(unittest.TestCase):
             app, source=SOURCE, expected_bundle_identifier=BUNDLE, architecture="arm64"
         )
         (app / "Assets" / "ordinary.bin").unlink()
+        (app / "Dobby VPN").write_bytes(
+            fake_macho(0x0100000C) + b"-----BEGIN PRIVATE KEY-----"
+        )
+        inspect_simulator_app(
+            app, source=SOURCE, expected_bundle_identifier=BUNDLE, architecture="arm64"
+        )
         (app / "Assets" / "large.bin").write_bytes(b"0123456789")
         with self.assertRaisesRegex(IOSSimulatorContractError, "size limit"):
             inspect_simulator_app(
