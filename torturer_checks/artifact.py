@@ -29,18 +29,20 @@ _WINDOWS_MACHINES = {0x8664: "amd64", 0xAA64: "arm64", 0x14C: "x86"}
 _MACHO_CPUS = {0x01000007: "amd64", 0x0100000C: "arm64"}
 _ARCH_ALIASES = {"x86_64": "amd64", "aarch64": "arm64"}
 
-# Labels, rather than matched bytes, are intentionally reported.  This makes a
-# diagnostic useful without allowing a candidate artifact to echo a secret.
-_CREDENTIAL_MARKERS = (
-    ("private-key", b"PRIVATE KEY-----"),
-    ("aws-access-key", b"AKIA"),
-    ("github-token", b"ghp_"),
-    ("github-fine-grained-token", b"github_pat_"),
-    ("slack-bot-token", b"xoxb-"),
-    ("slack-user-token", b"xoxp-"),
-    ("slack-app-token", b"xapp-"),
-    ("google-api-key", b"AIza"),
+# Labels, rather than matched bytes, are intentionally reported.  Require a
+# plausible complete token shape: short prefixes such as AKIA legitimately
+# occur in compiled binaries and are not credentials by themselves.
+_CREDENTIAL_PATTERNS = (
+    ("private-key", re.compile(rb"-----BEGIN [A-Z0-9 ]{0,32}PRIVATE KEY-----", re.IGNORECASE)),
+    ("aws-access-key", re.compile(rb"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])")),
+    ("github-token", re.compile(rb"ghp_[A-Za-z0-9_]{20,}")),
+    ("github-fine-grained-token", re.compile(rb"github_pat_[A-Za-z0-9_]{20,}")),
+    ("slack-bot-token", re.compile(rb"xoxb-[A-Za-z0-9-]{20,}")),
+    ("slack-user-token", re.compile(rb"xoxp-[A-Za-z0-9-]{20,}")),
+    ("slack-app-token", re.compile(rb"xapp-[A-Za-z0-9-]{20,}")),
+    ("google-api-key", re.compile(rb"AIza[A-Za-z0-9_-]{30,}")),
 )
+CREDENTIAL_SCAN_OVERLAP_BYTES = 128
 
 
 class ArtifactContractError(ValueError):
@@ -474,7 +476,6 @@ def _reject_credentials_in_archive(
 
 
 def _credential_marker_in_member(artifact: str | Path, info: zipfile.ZipInfo) -> str | None:
-    longest = max(len(marker) for _, marker in _CREDENTIAL_MARKERS)
     previous = b""
     try:
         with zipfile.ZipFile(_artifact_path(artifact)) as archive, archive.open(info) as handle:
@@ -482,17 +483,15 @@ def _credential_marker_in_member(artifact: str | Path, info: zipfile.ZipInfo) ->
                 marker = _credential_marker(previous + chunk)
                 if marker:
                     return marker
-                previous = (previous + chunk)[-(longest - 1):]
+                previous = (previous + chunk)[-CREDENTIAL_SCAN_OVERLAP_BYTES:]
     except (OSError, RuntimeError, zipfile.BadZipFile) as error:
         raise ArtifactContractError("archive member could not be read") from error
     return None
 
 
 def _credential_marker(data: bytes) -> str | None:
-    upper = data.upper()
-    for label, marker in _CREDENTIAL_MARKERS:
-        haystack = upper if marker.isupper() else data
-        if marker in haystack:
+    for label, pattern in _CREDENTIAL_PATTERNS:
+        if pattern.search(data):
             return label
     return None
 

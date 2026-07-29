@@ -21,6 +21,7 @@ from typing import Any
 
 from torturer_checks.artifact import (
     ArtifactContractError,
+    CREDENTIAL_SCAN_OVERLAP_BYTES,
     SourceIdentity,
     obvious_credential_marker,
     source_identity_from_checkout,
@@ -386,14 +387,13 @@ def _hash_file(path: Path) -> tuple[str, int]:
 
 
 def _reject_credentials_in_file(path: Path) -> None:
-    longest_marker = 23
     previous = b""
     try:
         with path.open("rb") as handle:
             while chunk := handle.read(1024 * 1024):
                 if obvious_credential_marker(previous + chunk):
                     raise IOSSimulatorContractError("artifact contains an obvious credential marker")
-                previous = (previous + chunk)[-(longest_marker - 1):]
+                previous = (previous + chunk)[-CREDENTIAL_SCAN_OVERLAP_BYTES:]
     except OSError as error:
         raise IOSSimulatorContractError("artifact member could not be read") from error
 

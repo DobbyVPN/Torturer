@@ -122,6 +122,11 @@ class IOSSimulatorContractTest(unittest.TestCase):
         self.assertNotIn(secret.decode(), str(raised.exception))
 
         (app / "Assets" / "credential.bin").unlink()
+        (app / "Assets" / "ordinary.bin").write_bytes(b"compiled-AKIA-AIza-ghp_-xoxb-fragments")
+        inspect_simulator_app(
+            app, source=SOURCE, expected_bundle_identifier=BUNDLE, architecture="arm64"
+        )
+        (app / "Assets" / "ordinary.bin").unlink()
         (app / "Assets" / "large.bin").write_bytes(b"0123456789")
         with self.assertRaisesRegex(IOSSimulatorContractError, "size limit"):
             inspect_simulator_app(
