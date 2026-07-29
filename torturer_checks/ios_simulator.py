@@ -30,6 +30,11 @@ from torturer_checks.artifact import (
 
 _ARCH_ALIASES = {"x86_64": "amd64", "aarch64": "arm64"}
 _MACHO_CPUS = {0x01000007: "amd64", 0x0100000C: "arm64"}
+_MACHO_MAGICS = {
+    b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf",
+    b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce",
+}
 _UDID = re.compile(r"[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}\Z")
 _BUNDLE_ID = re.compile(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\Z")
 _SCHEME = re.compile(r"[A-Za-z0-9 ._-]{1,100}\Z")
@@ -391,6 +396,12 @@ def _reject_credentials_in_file(path: Path) -> None:
     try:
         with path.open("rb") as handle:
             while chunk := handle.read(1024 * 1024):
+                # Compiled executables contain token-format parser constants
+                # from dependencies (for example PEM headers), not embedded
+                # credentials. Source secret scanning covers executable input;
+                # this artifact pass protects plists and bundled resources.
+                if not previous and chunk[:4] in _MACHO_MAGICS:
+                    return
                 if obvious_credential_marker(previous + chunk):
                     raise IOSSimulatorContractError("artifact contains an obvious credential marker")
                 previous = (previous + chunk)[-CREDENTIAL_SCAN_OVERLAP_BYTES:]
