@@ -37,6 +37,7 @@ STABLE_CHECK_NAMES = (
     "Torturer / artifact contract (Windows)",
     "Torturer / artifact contract (macOS arm64)",
     "Torturer / artifact contract (macOS Intel)",
+    "Torturer / iOS Simulator core contract",
     "Torturer / Android service contract",
 )
 

@@ -26,8 +26,17 @@ co-located unit, package-private, source-set, or seam tests.
 - portable Windows/macOS ZIP identity, layout, architecture, digest, and
   obvious-credential-marker inspection helpers.
 
+The repository contains a pinned public iOS Simulator core lane. It proves the
+exact clean candidate identity, verifies the H1 evidence helper, runs tests
+against the candidate's exact production Swift lifecycle sources, and links
+and tests shared KMP code on an Apple-silicon Simulator. It also source-builds,
+inspects, installs, launches, and terminates the fixed unsigned Simulator app
+without credentials. The named app XCTest evidence remains a separate later
+stage until DobbyVPN exposes that target. None of these checks claims
+NetworkExtension, routing, DNS, or physical-device coverage.
+
 Real VPN endpoints, external-IP assertions, speed tests, prolonged soak tests,
-local VMs, and physical-device tests belong to the private Harness.
+and physical-device tests are outside Torturer's public test contract.
 
 ## Security promises
 

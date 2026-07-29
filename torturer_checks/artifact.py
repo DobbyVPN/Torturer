@@ -497,6 +497,16 @@ def _credential_marker(data: bytes) -> str | None:
     return None
 
 
+def obvious_credential_marker(data: bytes) -> str | None:
+    """Return a safe label for an unmistakable credential marker, if present.
+
+    The label is safe to include in diagnostics; callers must never display the
+    matching candidate bytes.  This narrow public check is shared by public
+    artifact contracts and is not a general-purpose secret scanner.
+    """
+    return _credential_marker(data)
+
+
 def _normalize_architecture(value: str) -> str:
     if not isinstance(value, str):
         raise ArtifactContractError("architecture must be a string")
