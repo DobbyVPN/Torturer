@@ -35,6 +35,10 @@ _MACHO_MAGICS = {
     b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe",
     b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce",
 }
+_TEXT_RESOURCE_SUFFIXES = {
+    ".conf", ".config", ".ini", ".json", ".mobileconfig", ".ovpn",
+    ".plist", ".properties", ".txt", ".xml", ".yaml", ".yml",
+}
 _UDID = re.compile(r"[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}\Z")
 _BUNDLE_ID = re.compile(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\Z")
 _SCHEME = re.compile(r"[A-Za-z0-9 ._-]{1,100}\Z")
@@ -402,11 +406,30 @@ def _reject_credentials_in_file(path: Path) -> None:
                 # this artifact pass protects plists and bundled resources.
                 if not previous and chunk[:4] in _MACHO_MAGICS:
                     return
+                # Asset catalogs, static archives, compiled UI resources, and
+                # other non-Mach-O build products can also contain credential
+                # *parser* constants. Scan declared text resources and files
+                # whose content is actually text; source scanning remains the
+                # fail-closed control for compiled inputs.
+                if not previous and not _is_text_resource(path, chunk):
+                    return
                 if obvious_credential_marker(previous + chunk):
                     raise IOSSimulatorContractError("artifact contains an obvious credential marker")
                 previous = (previous + chunk)[-CREDENTIAL_SCAN_OVERLAP_BYTES:]
     except OSError as error:
         raise IOSSimulatorContractError("artifact member could not be read") from error
+
+
+def _is_text_resource(path: Path, sample: bytes) -> bool:
+    if path.suffix.lower() in _TEXT_RESOURCE_SUFFIXES:
+        return True
+    if b"\0" in sample:
+        return False
+    try:
+        decoded = sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return all(character.isprintable() or character in "\t\r\n" for character in decoded)
 
 
 def _macho_architectures(data: bytes) -> set[str]:
