@@ -207,7 +207,9 @@ def inspect_simulator_app(
     if executable not in files:
         raise IOSSimulatorContractError("Simulator app is missing its declared executable")
     executable_sha256, executable_size = _hash_file(executable)
-    if normalized_architecture not in _macho_architectures(_read_file(executable, maximum=4096)):
+    if normalized_architecture not in _macho_architectures(
+        _read_file_prefix(executable, maximum=4096)
+    ):
         raise IOSSimulatorContractError("Simulator app executable architecture differs from the contract")
     return SimulatorAppInspection(
         source=source,
@@ -374,6 +376,20 @@ def _read_file(path: Path, *, maximum: int) -> bytes:
     except OSError as error:
         raise IOSSimulatorContractError("artifact member could not be read") from error
     if len(data) != size:
+        raise IOSSimulatorContractError("artifact member changed while it was inspected")
+    return data
+
+
+def _read_file_prefix(path: Path, *, maximum: int) -> bytes:
+    """Read at most ``maximum`` bytes while detecting an in-flight file change."""
+    try:
+        before = path.stat()
+        with path.open("rb") as handle:
+            data = handle.read(maximum)
+        after = path.stat()
+    except OSError as error:
+        raise IOSSimulatorContractError("artifact member could not be read") from error
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
         raise IOSSimulatorContractError("artifact member changed while it was inspected")
     return data
 
