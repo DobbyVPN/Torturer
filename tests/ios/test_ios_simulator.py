@@ -119,6 +119,9 @@ class IOSSimulatorContractTest(unittest.TestCase):
         with self.assertRaises(IOSSimulatorContractError) as raised:
             inspect_simulator_app(app, source=SOURCE, expected_bundle_identifier=BUNDLE, architecture="arm64")
         self.assertIn("credential marker", str(raised.exception))
+        self.assertIn("category=github-token", str(raised.exception))
+        self.assertIn("member=credential.bin", str(raised.exception))
+        self.assertIn("suffix=.bin", str(raised.exception))
         self.assertNotIn(secret.decode(), str(raised.exception))
 
         (app / "Assets" / "credential.bin").unlink()
