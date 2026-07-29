@@ -127,7 +127,7 @@ class IOSSimulatorContractTest(unittest.TestCase):
             app, source=SOURCE, expected_bundle_identifier=BUNDLE, architecture="arm64"
         )
         (app / "Assets" / "ordinary.bin").write_bytes(
-            b"\0compiled-data\0-----BEGIN PRIVATE KEY-----\0"
+            b"!<arch>\ncompiled-data\0-----BEGIN PRIVATE KEY-----\0"
         )
         inspect_simulator_app(
             app, source=SOURCE, expected_bundle_identifier=BUNDLE, architecture="arm64"
