@@ -78,13 +78,15 @@ class IOSSimulatorContractTest(unittest.TestCase):
         )
 
     def test_app_contract_hashes_declared_executable_and_manifest_is_stable(self) -> None:
-        app = self.make_app()
+        executable = fake_macho() + b"\0" * 8192
+        app = self.make_app(executable=executable)
         result = inspect_simulator_app(
             app, source=SOURCE, expected_bundle_identifier=BUNDLE, architecture="aarch64"
         )
         manifest = result.manifest_v1()
 
         self.assertEqual(result.architecture, "arm64")
+        self.assertEqual(result.executable_size_bytes, len(executable))
         self.assertEqual(result.executable_sha256, hashlib.sha256((app / "Dobby VPN").read_bytes()).hexdigest())
         self.assertEqual(manifest["source"], {"repository": "DobbyVPN/DobbyVPN", "commit": "a" * 40})
         self.assertEqual(json.loads(result.manifest_json_v1())["artifact"]["format"], "app-directory")
