@@ -168,18 +168,22 @@ class ArtifactContractTest(unittest.TestCase):
         self.assertIn("credential marker", str(raised.exception))
         self.assertNotIn(secret.decode(), str(raised.exception))
 
-    def test_common_binary_xox_bytes_are_not_treated_as_a_slack_token(self) -> None:
+    def test_short_credential_prefixes_in_binary_are_not_treated_as_tokens(self) -> None:
         artifact = self.directory / "ordinary-binary.zip"
         write_zip(
             artifact,
-            {WINDOWS_EXECUTABLE: fake_pe(payload=b"ordinary-xox-binary-bytes")},
+            {
+                WINDOWS_EXECUTABLE: fake_pe(
+                    payload=b"ordinary-xox-binary-bytes-AKIA-AIza-ghp_-github_pat_-xoxb-"
+                )
+            },
         )
 
         inspect_windows_zip(artifact, source=SOURCE)
 
         write_zip(
             artifact,
-            {WINDOWS_EXECUTABLE: fake_pe(payload=b"xoxb-not-a-real-token")},
+            {WINDOWS_EXECUTABLE: fake_pe(payload=b"xoxb-1234567890abcdefghij")},
         )
         with self.assertRaisesRegex(ArtifactContractError, "credential marker"):
             inspect_windows_zip(artifact, source=SOURCE)
