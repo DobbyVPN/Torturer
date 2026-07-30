@@ -27,10 +27,18 @@ def fake_macho() -> bytes:
 
 
 class FakeRunner:
-    def __init__(self, *, work_dir: Path, inventory: dict[str, object], fail: tuple[str, ...] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        work_dir: Path,
+        inventory: dict[str, object],
+        fail: tuple[str, ...] | None = None,
+        terminate_returncodes: tuple[int, ...] = (),
+    ) -> None:
         self.work_dir = work_dir
         self.inventory = inventory
         self.fail = fail
+        self.terminate_returncodes = iter(terminate_returncodes)
         self.commands: list[list[str]] = []
 
     def run(self, command: list[str] | tuple[str, ...], *, cwd: Path | None = None) -> CommandResult:
@@ -49,6 +57,8 @@ class FakeRunner:
             return CommandResult(0)
         if command[:4] == ["xcrun", "xcresulttool", "get", "test-results"]:
             return CommandResult(0, '{"passedTests":1,"failedTests":0}')
+        if command[:3] == ["xcrun", "simctl", "terminate"]:
+            return CommandResult(next(self.terminate_returncodes, 0))
         return CommandResult(0, "current state: Booted" if command[:3] == ["xcrun", "simctl", "boot"] else "")
 
     def _write_app(self) -> None:
@@ -180,6 +190,48 @@ class IOSSimulatorAppContractTest(unittest.TestCase):
         self.assertIn("install Simulator app failed with exit code 9", str(raised.exception))
         self.assertNotIn("candidate output", str(raised.exception))
         self.assertFalse(any(command[:2] == ["xcodebuild", "test"] for command in runner.commands))
+
+    def test_retries_transient_terminate_not_running_result_after_launch(self) -> None:
+        runner = FakeRunner(
+            work_dir=self.root / "work",
+            inventory=simulator_inventory(),
+            terminate_returncodes=(3, 0),
+        )
+        run_ios_simulator_app_contract(
+            candidate_root=self.candidate,
+            repository="DobbyVPN/DobbyVPN",
+            commit_sha=self.commit,
+            work_dir=self.root / "work",
+            runner=runner,
+        )
+        terminate_commands = [
+            command for command in runner.commands
+            if command[:3] == ["xcrun", "simctl", "terminate"]
+        ]
+        self.assertEqual(len(terminate_commands), 2)
+
+    def test_persistent_terminate_not_running_result_fails_after_one_retry(self) -> None:
+        runner = FakeRunner(
+            work_dir=self.root / "work",
+            inventory=simulator_inventory(),
+            terminate_returncodes=(3, 3),
+        )
+        with self.assertRaisesRegex(
+            IOSSimulatorAppContractError,
+            "terminate Simulator app failed with exit code 3",
+        ):
+            run_ios_simulator_app_contract(
+                candidate_root=self.candidate,
+                repository="DobbyVPN/DobbyVPN",
+                commit_sha=self.commit,
+                work_dir=self.root / "work",
+                runner=runner,
+            )
+        terminate_commands = [
+            command for command in runner.commands
+            if command[:3] == ["xcrun", "simctl", "terminate"]
+        ]
+        self.assertEqual(len(terminate_commands), 2)
 
 
 if __name__ == "__main__":

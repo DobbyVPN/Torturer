@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import time
 from typing import Protocol, Sequence
 
 from torturer_checks.ios_simulator import (
@@ -42,6 +43,8 @@ _CONFIGURATION = "Debug"
 _APP_PRODUCT = "doBBYVPN.app"
 _BUNDLE_IDENTIFIER = "vpn.dobby.app"
 _ARCHITECTURE = "arm64"
+_TERMINATE_NOT_RUNNING_EXIT_CODE = 3
+_TERMINATE_RETRY_DELAY_SECONDS = 1.0
 _TEST_IDENTIFIER = (
     "IOSSimulatorAppContractTests/IOSSimulatorAppContractTests/"
     "testAppLaunchesWithoutCredentials"
@@ -247,7 +250,7 @@ def run_ios_simulator_app_contract(
         raise IOSSimulatorAppContractError(str(error)) from error
     _require_success(runner, simctl_install_command(simulator.udid, app.app_path), "install Simulator app")
     _require_success(runner, simctl_launch_command(simulator.udid, contract.bundle_identifier), "launch Simulator app")
-    _require_success(runner, simctl_terminate_command(simulator.udid, contract.bundle_identifier), "terminate Simulator app")
+    _terminate_simulator_app(runner, simulator.udid, contract.bundle_identifier)
 
     xcresult: XCResultInspection | None = None
     if with_xctest:
@@ -279,4 +282,19 @@ def _require_success(runner: CommandRunner, command: Sequence[str], stage: str) 
     if result.returncode:
         # Do not echo candidate-controlled build/test output in public diagnostics.
         raise IOSSimulatorAppContractError(f"{stage} failed with exit code {result.returncode}")
+    return result
+
+
+def _terminate_simulator_app(runner: CommandRunner, device_udid: str, bundle_identifier: str) -> CommandResult:
+    """Terminate a just-launched app, retrying one transient not-running result."""
+    command = simctl_terminate_command(device_udid, bundle_identifier)
+    result = runner.run(command)
+    if result.returncode == _TERMINATE_NOT_RUNNING_EXIT_CODE:
+        time.sleep(_TERMINATE_RETRY_DELAY_SECONDS)
+        result = runner.run(command)
+    if result.returncode:
+        # Do not echo candidate-controlled app output in public diagnostics.
+        raise IOSSimulatorAppContractError(
+            f"terminate Simulator app failed with exit code {result.returncode}"
+        )
     return result
