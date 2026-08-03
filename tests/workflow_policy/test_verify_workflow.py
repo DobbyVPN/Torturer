@@ -83,7 +83,7 @@ class VerifyWorkflowPolicyTest(unittest.TestCase):
         helper_refs = re.findall(r"(?m)^          ref: ([0-9a-f]{40})$", self.text)
         self.assertEqual(
             helper_refs,
-            ["ecd79f9b834087369e87fb022b1144e35a06dad1"] * 6,
+            ["57faf08cd85bcd7e4ee8eb29bab3b196c93ec70b"] * 6,
         )
         candidate_checkout = re.search(
             r"- name: Check out exact candidate\n.*?(?=\n      - name:)",
