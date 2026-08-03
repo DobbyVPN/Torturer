@@ -120,7 +120,7 @@ jobs:
 
       - name: Upload diagnostic request identity
         if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: torturer-linux-request
           path: ${{ runner.temp }}/torturer-diagnostics/request.json
@@ -566,7 +566,7 @@ jobs:
           cache: false
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699
 
       - name: Install required Android SDK packages and NDK
         run: |
