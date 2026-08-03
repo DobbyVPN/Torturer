@@ -10,8 +10,12 @@ from __future__ import annotations
 CHECKOUT_ACTION = "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803"
 SETUP_JAVA_ACTION = "actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95"
 SETUP_GO_ACTION = "actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16"
-SETUP_ANDROID_ACTION = "android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407"
-UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4"
+# All five pins below were checked against their upstream action.yml manifests:
+# each runs on node24.  Keep this set intentionally small, immutable, and
+# public-runner-only so the verifier cannot accidentally regain a deprecated
+# Node-20/16 transitive action.
+SETUP_ANDROID_ACTION = "android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699"
+UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f"
 
 PINNED_EXTERNAL_ACTIONS = frozenset(
     {
@@ -22,6 +26,8 @@ PINNED_EXTERNAL_ACTIONS = frozenset(
         UPLOAD_ARTIFACT_ACTION,
     }
 )
+
+NODE24_EXTERNAL_ACTIONS = PINNED_EXTERNAL_ACTIONS
 
 HOSTED_RUNNERS = frozenset(
     {

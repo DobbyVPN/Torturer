@@ -9,6 +9,7 @@ import unittest
 from torturer_contract.workflow_policy import (
     FORBIDDEN_WORKFLOW_TOKENS,
     HOSTED_RUNNERS,
+    NODE24_EXTERNAL_ACTIONS,
     PINNED_EXTERNAL_ACTIONS,
     STABLE_CHECK_NAMES,
 )
@@ -16,6 +17,7 @@ from torturer_contract.workflow_policy import (
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "verify.yml"
+SELF_TEST_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
 class VerifyWorkflowPolicyTest(unittest.TestCase):
     @classmethod
@@ -42,6 +44,24 @@ class VerifyWorkflowPolicyTest(unittest.TestCase):
         self.assertEqual(set(self.uses), PINNED_EXTERNAL_ACTIONS)
         for action in self.uses:
             self.assertRegex(action, r"^[^@\s]+@[0-9a-f]{40}$")
+
+    def test_all_public_workflow_actions_are_reviewed_node24_pins(self) -> None:
+        """Reject a Node-16/20 action before a public runner warns about it.
+
+        The immutable constants are reviewed from upstream ``action.yml``
+        manifests when changed; testing every public workflow here prevents a
+        later self-test-only action from bypassing that review.
+        """
+        for workflow in (WORKFLOW, SELF_TEST_WORKFLOW):
+            uses = re.findall(
+                r"^\s*uses:\s*([^\s#]+)",
+                workflow.read_text(encoding="utf-8"),
+                flags=re.MULTILINE,
+            )
+            self.assertTrue(uses, workflow.name)
+            for action in uses:
+                self.assertRegex(action, r"^[^@\s]+@[0-9a-f]{40}$")
+                self.assertIn(action, NODE24_EXTERNAL_ACTIONS, workflow.name)
 
     def test_runs_untrusted_candidate_only_on_ephemeral_hosted_labels(self) -> None:
         runners = re.findall(r"(?m)^    runs-on: ([^\s#]+)$", self.text)
