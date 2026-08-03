@@ -256,25 +256,43 @@ def wait_for_tcp(
     raise SliceFailure(f"service did not listen on loopback TCP port {port} within {timeout_seconds:g}s")
 
 
-def wait_for_unix_socket(path: Path, process: subprocess.Popen[str], timeout_seconds: float) -> None:
-    """Wait for the macOS owner-only Unix control socket."""
+def wait_for_unix_socket(
+    path: Path,
+    process: subprocess.Popen[str],
+    timeout_seconds: float,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> None:
+    """Wait for the macOS owner-only Unix control socket.
 
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
+    The service creates the socket before tightening its mode to ``0600``.
+    Keep polling through that brief creation-to-chmod transition, but never
+    treat it as ready until the final owner-only mode is visible.
+    """
+
+    deadline = clock() + timeout_seconds
+    last_observed_mode: int | None = None
+    while clock() < deadline:
         if process.poll() is not None:
             raise SliceFailure(f"service exited before readiness (exit code {process.returncode})")
         try:
             details = path.stat()
         except FileNotFoundError:
-            time.sleep(0.1)
+            sleeper(0.1)
             continue
         if not stat.S_ISSOCK(details.st_mode):
             raise SliceFailure(f"control path exists but is not a Unix socket: {path}")
-        if stat.S_IMODE(details.st_mode) != 0o600:
-            raise SliceFailure(
-                f"control socket permissions are {stat.S_IMODE(details.st_mode):o}, expected 600"
-            )
-        return
+        mode = stat.S_IMODE(details.st_mode)
+        if mode == 0o600:
+            return
+        last_observed_mode = mode
+        sleeper(0.1)
+    if last_observed_mode is not None:
+        raise SliceFailure(
+            "control socket permissions did not become 600 before readiness timeout "
+            f"({timeout_seconds:g}s; last observed mode {last_observed_mode:o})"
+        )
     raise SliceFailure(f"service did not create its Unix control socket within {timeout_seconds:g}s: {path}")
 
 
