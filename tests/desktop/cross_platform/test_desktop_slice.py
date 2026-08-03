@@ -131,12 +131,56 @@ class DesktopSliceHelperTest(unittest.TestCase):
     def test_readiness_helpers_run_on_linux_with_fakes(self) -> None:
         wait_for_tcp(50151, _FakeProcess(), 1, connector=lambda address, timeout: _FakeConnection())
         wait_for_unix_socket(_FakeSocketPath(mode=stat.S_IFSOCK | 0o600), _FakeProcess(), 1)  # type: ignore[arg-type]
-        with self.assertRaisesRegex(SliceFailure, "expected 600"):
-            wait_for_unix_socket(  # type: ignore[arg-type]
-                _FakeSocketPath(mode=stat.S_IFSOCK | 0o666), _FakeProcess(), 1
-            )
         with self.assertRaisesRegex(SliceFailure, "exit code 7"):
             wait_for_tcp(50151, _FakeProcess(returncode=7), 1)
+
+    def test_unix_socket_readiness_waits_for_initial_permission_transition(self) -> None:
+        clock = _FakeClock()
+        path = _FakeSocketPath(modes=(stat.S_IFSOCK | 0o755, stat.S_IFSOCK | 0o600))
+
+        wait_for_unix_socket(  # type: ignore[arg-type]
+            path,
+            _FakeProcess(),
+            1,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+
+        self.assertEqual(path.stat_calls, 2)
+
+    def test_unix_socket_readiness_reports_persistent_unsafe_permission_at_timeout(self) -> None:
+        clock = _FakeClock()
+        path = _FakeSocketPath(mode=stat.S_IFSOCK | 0o755)
+
+        with self.assertRaisesRegex(SliceFailure, r"last observed mode 755"):
+            wait_for_unix_socket(  # type: ignore[arg-type]
+                path,
+                _FakeProcess(),
+                0.2,
+                clock=clock,
+                sleeper=clock.sleep,
+            )
+
+        self.assertGreaterEqual(path.stat_calls, 1)
+
+    def test_unix_socket_readiness_still_rejects_non_socket_paths_and_exited_service(self) -> None:
+        clock = _FakeClock()
+        with self.assertRaisesRegex(SliceFailure, "is not a Unix socket"):
+            wait_for_unix_socket(  # type: ignore[arg-type]
+                _FakeSocketPath(mode=stat.S_IFREG | 0o600),
+                _FakeProcess(),
+                1,
+                clock=clock,
+                sleeper=clock.sleep,
+            )
+        with self.assertRaisesRegex(SliceFailure, "exit code 7"):
+            wait_for_unix_socket(  # type: ignore[arg-type]
+                _FakeSocketPath(mode=stat.S_IFSOCK | 0o755),
+                _FakeProcess(returncode=7),
+                1,
+                clock=_FakeClock(),
+                sleeper=lambda _: None,
+            )
 
     def test_stop_service_removes_only_a_socket(self) -> None:
         socket_path = _FakeSocketPath(mode=stat.S_IFSOCK | 0o600)
@@ -196,13 +240,20 @@ class _FakeConnection:
 
 
 class _FakeSocketPath:
-    def __init__(self, *, mode: int) -> None:
-        self.mode = mode
+    def __init__(self, *, mode: int | None = None, modes: tuple[int, ...] | None = None) -> None:
+        if (mode is None) == (modes is None):
+            raise ValueError("provide exactly one of mode or modes")
+        self.modes = modes or (mode,)
+        self.mode = self.modes[0]
         self.present = True
+        self.stat_calls = 0
 
     def stat(self):  # type: ignore[no-untyped-def]
         if not self.present:
             raise FileNotFoundError
+        index = min(self.stat_calls, len(self.modes) - 1)
+        self.mode = self.modes[index]
+        self.stat_calls += 1
         return _FakeStat(self.mode)
 
     def lstat(self):  # type: ignore[no-untyped-def]
@@ -224,6 +275,17 @@ class _FakeSocketPath:
 class _FakeStat:
     def __init__(self, mode: int) -> None:
         self.st_mode = mode
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def sleep(self, seconds: float) -> None:
+        self.value += seconds
 
 
 if __name__ == "__main__":
