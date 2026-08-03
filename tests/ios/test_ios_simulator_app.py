@@ -13,17 +13,20 @@ from torturer_checks.ios_simulator_app import (
     IOSSimulatorAppContract,
     IOSSimulatorAppContractError,
     PUBLIC_IOS_SIMULATOR_APP_CONTRACT,
+    public_ios_simulator_app_contract,
     run_ios_simulator_app_contract,
     select_available_iphone,
     xcodebuild_app_command,
 )
+from tests.ios.run_app_contract import parse_arguments
 
 
 UDID = "A12B34C5-1234-5678-9ABC-123456789ABC"
 
 
-def fake_macho() -> bytes:
-    return b"\xcf\xfa\xed\xfe" + struct.pack("<I", 0x0100000C) + b"\0" * 24
+def fake_macho(architecture: str) -> bytes:
+    cpu = {"arm64": 0x0100000C, "amd64": 0x01000007}[architecture]
+    return b"\xcf\xfa\xed\xfe" + struct.pack("<I", cpu) + b"\0" * 24
 
 
 class FakeRunner:
@@ -34,11 +37,13 @@ class FakeRunner:
         inventory: dict[str, object],
         fail: tuple[str, ...] | None = None,
         terminate_returncodes: tuple[int, ...] = (),
+        contract: IOSSimulatorAppContract = PUBLIC_IOS_SIMULATOR_APP_CONTRACT,
     ) -> None:
         self.work_dir = work_dir
         self.inventory = inventory
         self.fail = fail
         self.terminate_returncodes = iter(terminate_returncodes)
+        self.contract = contract
         self.commands: list[list[str]] = []
 
     def run(self, command: list[str] | tuple[str, ...], *, cwd: Path | None = None) -> CommandResult:
@@ -62,14 +67,14 @@ class FakeRunner:
         return CommandResult(0, "current state: Booted" if command[:3] == ["xcrun", "simctl", "boot"] else "")
 
     def _write_app(self) -> None:
-        app = PUBLIC_IOS_SIMULATOR_APP_CONTRACT.app_path(self.work_dir)
+        app = self.contract.app_path(self.work_dir)
         app.mkdir(parents=True)
         (app / "Info.plist").write_bytes(plistlib.dumps({
             "CFBundlePackageType": "APPL",
             "CFBundleIdentifier": "vpn.dobby.app",
             "CFBundleExecutable": "doBBYVPN",
         }))
-        (app / "doBBYVPN").write_bytes(fake_macho())
+        (app / "doBBYVPN").write_bytes(fake_macho(self.contract.architecture))
 
     def _write_xcresult(self) -> None:
         result = self.work_dir / "app-tests.xcresult"
@@ -142,16 +147,57 @@ class IOSSimulatorAppContractTest(unittest.TestCase):
         self.assertIn("CODE_SIGNING_ALLOWED=NO", command)
         self.assertIn("CODE_SIGNING_REQUIRED=NO", command)
         self.assertIn("CODE_SIGN_IDENTITY=", command)
+        self.assertIn("ARCHS=arm64", command)
         self.assertIn(f"platform=iOS Simulator,id={UDID}", command)
         with self.assertRaisesRegex(IOSSimulatorAppContractError, "fixed"):
             IOSSimulatorAppContract(scheme="candidate-script; rm -rf /")
         with self.assertRaisesRegex(IOSSimulatorAppContractError, "product name is fixed"):
             IOSSimulatorAppContract(app_product_name="candidate.app")
+        with self.assertRaisesRegex(IOSSimulatorAppContractError, "arm64 or amd64"):
+            IOSSimulatorAppContract(architecture="x86_64")
         with self.assertRaisesRegex(IOSSimulatorAppContractError, "UDID"):
             xcodebuild_app_command(
                 PUBLIC_IOS_SIMULATOR_APP_CONTRACT,
                 candidate_root=self.candidate, device_udid="$(candidate)", work_dir=self.root / "work",
             )
+
+    def test_intel_contract_enforces_x86_64_build_and_inspection(self) -> None:
+        contract = public_ios_simulator_app_contract("amd64")
+        command = xcodebuild_app_command(
+            contract, candidate_root=self.candidate, device_udid=UDID, work_dir=self.root / "work",
+        )
+        self.assertIn("ARCHS=x86_64", command)
+        runner = FakeRunner(
+            work_dir=self.root / "work", inventory=simulator_inventory(), contract=contract,
+        )
+        evidence = run_ios_simulator_app_contract(
+            candidate_root=self.candidate,
+            repository="DobbyVPN/DobbyVPN",
+            commit_sha=self.commit,
+            work_dir=self.root / "work",
+            runner=runner,
+            contract=contract,
+        )
+        self.assertEqual(evidence.app.architecture, "amd64")
+        self.assertEqual(
+            sum(command[:3] == ["xcrun", "simctl", "terminate"] for command in runner.commands), 1,
+        )
+
+    def test_cli_architecture_is_limited_to_the_two_public_simulator_slices(self) -> None:
+        arguments = parse_arguments([
+            "--candidate-root", "/candidate",
+            "--source-repository", "DobbyVPN/DobbyVPN",
+            "--commit-sha", "a" * 40,
+            "--work-dir", "/work",
+            "--architecture", "amd64",
+        ])
+        self.assertEqual(arguments.architecture, "amd64")
+        self.assertEqual(parse_arguments([
+            "--candidate-root", "/candidate",
+            "--source-repository", "DobbyVPN/DobbyVPN",
+            "--commit-sha", "a" * 40,
+            "--work-dir", "/work",
+        ]).architecture, "arm64")
 
     def test_orchestrates_build_inspection_install_launch_terminate_and_xctest(self) -> None:
         work_dir = self.root / "work"

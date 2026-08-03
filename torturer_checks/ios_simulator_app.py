@@ -42,7 +42,9 @@ _SCHEME_NAME = "iosApp"
 _CONFIGURATION = "Debug"
 _APP_PRODUCT = "doBBYVPN.app"
 _BUNDLE_IDENTIFIER = "vpn.dobby.app"
-_ARCHITECTURE = "arm64"
+_DEFAULT_ARCHITECTURE = "arm64"
+_SUPPORTED_ARCHITECTURES = frozenset(("arm64", "amd64"))
+_XCODE_ARCHITECTURES = {"arm64": "arm64", "amd64": "x86_64"}
 _TERMINATE_NOT_RUNNING_EXIT_CODE = 3
 _TERMINATE_RETRY_DELAY_SECONDS = 1.0
 _TEST_IDENTIFIER = (
@@ -103,7 +105,7 @@ class IOSSimulatorAppContract:
     configuration: str = _CONFIGURATION
     app_product_name: str = _APP_PRODUCT
     bundle_identifier: str = _BUNDLE_IDENTIFIER
-    architecture: str = _ARCHITECTURE
+    architecture: str = _DEFAULT_ARCHITECTURE
     test_identifier: str = _TEST_IDENTIFIER
 
     def __post_init__(self) -> None:
@@ -115,8 +117,10 @@ class IOSSimulatorAppContract:
             raise IOSSimulatorAppContractError("Simulator app product name has unsupported characters")
         if self.app_product_name != _APP_PRODUCT:
             raise IOSSimulatorAppContractError("Simulator app product name is fixed by the public contract")
-        if self.bundle_identifier != _BUNDLE_IDENTIFIER or self.architecture != _ARCHITECTURE:
-            raise IOSSimulatorAppContractError("Simulator app identity is fixed by the public contract")
+        if self.bundle_identifier != _BUNDLE_IDENTIFIER:
+            raise IOSSimulatorAppContractError("Simulator app bundle identity is fixed by the public contract")
+        if self.architecture not in _SUPPORTED_ARCHITECTURES:
+            raise IOSSimulatorAppContractError("Simulator app architecture must be arm64 or amd64")
         if self.test_identifier != _TEST_IDENTIFIER:
             raise IOSSimulatorAppContractError("Simulator XCTest identifier is fixed by the public contract")
         # SimulatorTestContract validates the bundle/test/architecture values.
@@ -140,6 +144,11 @@ class IOSSimulatorAppContract:
 
 
 PUBLIC_IOS_SIMULATOR_APP_CONTRACT = IOSSimulatorAppContract()
+
+
+def public_ios_simulator_app_contract(architecture: str) -> IOSSimulatorAppContract:
+    """Return the fixed public contract for one supported Simulator CPU."""
+    return IOSSimulatorAppContract(architecture=architecture)
 
 
 @dataclass(frozen=True)
@@ -201,6 +210,7 @@ def xcodebuild_app_command(
         "-scheme", contract.scheme, "-configuration", contract.configuration,
         "-sdk", "iphonesimulator", "-destination", f"platform=iOS Simulator,id={validated_udid}",
         "-derivedDataPath", str(work_dir / "derived-data"),
+        f"ARCHS={_XCODE_ARCHITECTURES[contract.architecture]}",
         "CODE_SIGNING_ALLOWED=NO", "CODE_SIGNING_REQUIRED=NO", "CODE_SIGN_IDENTITY=",
     ]
 

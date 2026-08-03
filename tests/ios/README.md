@@ -27,8 +27,10 @@ transport uses only synthetic input and does not open a real packet tunnel.
 
 `torturer_checks.ios_simulator_app` implements the fixed public app contract:
 the unsigned `iosApp` Debug product `doBBYVPN.app`, bundle ID
-`vpn.dobby.app`, arm64 Simulator architecture, and a named app XCTest that
-launches without credentials. It selects the newest available iPhone runtime
+`vpn.dobby.app`, and one explicit Simulator architecture: `arm64` on the
+hosted Apple-silicon runner or `amd64` on an Intel local macOS host. The CLI
+defaults to `arm64`; an Intel invocation must pass `--architecture amd64`.
+It selects the newest available iPhone runtime
 from host `simctl` JSON with deterministic tie-breaks, then builds, inspects,
 installs, launches, and terminates the app. XCTest/result-bundle verification
 is an independent opt-in stage and remains disabled until the named app test

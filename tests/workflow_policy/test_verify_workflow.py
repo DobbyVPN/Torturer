@@ -109,6 +109,8 @@ class VerifyWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("python3 tests/ios/run_app_contract.py", self.text)
         self.assertIn("build_ios_xcframework.sh", self.text)
         self.assertIn("--work-dir \"$TORTURER_IOS_WORK_DIR\"", self.text)
+        self.assertIn("TORTURER_IOS_SIMULATOR_ARCH: arm64", self.text)
+        self.assertIn("--architecture \"$TORTURER_IOS_SIMULATOR_ARCH\"", self.text)
         self.assertIn("python3 tests/android/run_contract.py", self.text)
         self.assertGreaterEqual(self.text.count("--commit-sha"), 5)
 
