@@ -149,7 +149,10 @@ test summary. All values are passed to `xcodebuild`, `simctl`, and
 `xcresulttool` as validated argument vectors rather than shell programs.
 
 H3 fixes the Dobby public app contract to the `iosApp` Debug scheme,
-`doBBYVPN.app`, `vpn.dobby.app`, arm64 Simulator output, and
+`doBBYVPN.app`, `vpn.dobby.app`, and an explicit `arm64` (hosted
+Apple-silicon) or `amd64` (Intel local macOS) Simulator output. The runner
+passes the corresponding fixed `ARCHS` build setting and rejects any other
+slice. The named app test is
 `IOSSimulatorAppContractTests/IOSSimulatorAppContractTests/testAppLaunchesWithoutCredentials`.
 H4 pins H3 and independently source-builds, inspects, installs, launches, and
 terminates that unsigned app. The named XCTest evidence remains a separate

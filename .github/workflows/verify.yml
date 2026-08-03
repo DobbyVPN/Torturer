@@ -475,13 +475,15 @@ jobs:
           SOURCE_REPOSITORY: ${{ inputs.source_repository }}
           EXPECTED_COMMIT: ${{ inputs.commit_sha }}
           TORTURER_IOS_WORK_DIR: ${{ runner.temp }}/torturer-ios-simulator
+          TORTURER_IOS_SIMULATOR_ARCH: arm64
         working-directory: torturer
         run: |
           python3 tests/ios/run_app_contract.py \
             --candidate-root "$CANDIDATE_DIR" \
             --source-repository "$SOURCE_REPOSITORY" \
             --commit-sha "$EXPECTED_COMMIT" \
-            --work-dir "$TORTURER_IOS_WORK_DIR"
+            --work-dir "$TORTURER_IOS_WORK_DIR" \
+            --architecture "$TORTURER_IOS_SIMULATOR_ARCH"
 
   android:
     name: Torturer / Android service contract
