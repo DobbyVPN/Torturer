@@ -436,8 +436,9 @@ jobs:
         env:
           CANDIDATE_DIR: ${{ github.workspace }}/candidate
         run: |
-          mkdir -p "$CANDIDATE_DIR/go_module/modules"
-          cp -R "$CANDIDATE_DIR/Cloak/internal" "$CANDIDATE_DIR/go_module/modules/Cloak/"
+          test -f "$CANDIDATE_DIR/go_module/modules/Cloak/internal/client/connector.go"
+          test -f "$CANDIDATE_DIR/go_module/modules/Cloak/internal/common/dialer.go"
+          test -f "$CANDIDATE_DIR/go_module/modules/Cloak/internal/multiplex/session.go"
           cd "$CANDIDATE_DIR/go_module"
           go mod download
           go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260520154334-0e4426e1883d
