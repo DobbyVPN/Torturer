@@ -114,17 +114,11 @@ class VerifyWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("python3 tests/android/run_contract.py", self.text)
         self.assertGreaterEqual(self.text.count("--commit-sha"), 5)
 
-    def test_ios_uses_candidate_tracked_cloak_dependency_closure(self) -> None:
-        self.assertNotIn('cp -R "$CANDIDATE_DIR/Cloak/internal"', self.text)
-        for path in (
-            "client/connector.go",
-            "common/dialer.go",
-            "multiplex/session.go",
-        ):
-            self.assertIn(
-                f'test -f "$CANDIDATE_DIR/go_module/modules/Cloak/internal/{path}"',
-                self.text,
-            )
+    def test_ios_uses_candidate_session_v2_runtime_and_no_cloak_dependency(self) -> None:
+        self.assertIn('test -f "$CANDIDATE_DIR/go_module/sessionapi/v2/api.go"', self.text)
+        self.assertIn('test -f "$CANDIDATE_DIR/go_module/sessionapi/runtime/lifecycle.go"', self.text)
+        self.assertIn('test ! -e "$CANDIDATE_DIR/go_module/modules/Cloak"', self.text)
+        self.assertNotIn('Cloak/internal', self.text)
 
     def test_android_bootstrap_is_explicit_and_version_is_validated_first(self) -> None:
         validate_position = self.text.index("name: Validate candidate Go version")

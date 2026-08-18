@@ -436,15 +436,15 @@ jobs:
         env:
           CANDIDATE_DIR: ${{ github.workspace }}/candidate
         run: |
-          test -f "$CANDIDATE_DIR/go_module/modules/Cloak/internal/client/connector.go"
-          test -f "$CANDIDATE_DIR/go_module/modules/Cloak/internal/common/dialer.go"
-          test -f "$CANDIDATE_DIR/go_module/modules/Cloak/internal/multiplex/session.go"
+          test -f "$CANDIDATE_DIR/go_module/sessionapi/v2/api.go"
+          test -f "$CANDIDATE_DIR/go_module/sessionapi/runtime/lifecycle.go"
+          test ! -e "$CANDIDATE_DIR/go_module/modules/Cloak"
           cd "$CANDIDATE_DIR/go_module"
           go mod download
           go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260520154334-0e4426e1883d
           "$(go env GOPATH)/bin/gomobile" init
           ./scripts/build_ios_xcframework.sh
-          ditto MyLibrary.xcframework ../swift_module/MyLibrary.xcframework
+          ditto DobbyVPNRuntime.xcframework ../swift_module/DobbyVPNRuntime.xcframework
 
       - name: Verify pinned iOS evidence helper
         working-directory: torturer
