@@ -122,8 +122,11 @@ class ScenarioResult:
         allowed_metrics = {"latency_ms", "download_mbps", "upload_mbps"}
         _safe_key_set(self.metrics, allowed_metrics, "metrics")
         if self.outcome == "passed":
-            if set(self.metrics) != allowed_metrics:
-                raise ResultValidationError("passed results require all bounded metrics")
+            requires_metrics = any(
+                assertion.id == "traffic.metrics_positive" for assertion in self.assertions
+            )
+            if requires_metrics and set(self.metrics) != allowed_metrics:
+                raise ResultValidationError("throughput results require all bounded metrics")
             for key, value in self.metrics.items():
                 _positive_number(value, f"metrics.{key}")
             if not all(assertion.passed for assertion in self.assertions):

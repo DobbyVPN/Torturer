@@ -128,6 +128,21 @@ class FunctionalContractTests(unittest.TestCase):
         self.assertTrue(result.cleanup["verified"])
         self.assertEqual(result.to_dict()["schema"], 1)
 
+    def test_non_throughput_result_does_not_require_metrics(self):
+        class NoMetricAdapter(FakeAdapter):
+            def execute(self, step):
+                value = super().execute(step)
+                for key in ("latency_ms", "download_mbps", "upload_mbps"):
+                    value.pop(key, None)
+                return value
+
+        result = FunctionalEngine("e" * 64).run(
+            get_scenario("functional.disconnect-cleanup"), NoMetricAdapter(), provenance()
+        )
+        self.assertEqual(result.outcome, "passed")
+        self.assertEqual(result.metrics, {})
+        validate_result_payload(result.to_dict())
+
     def test_engine_reports_missing_capability_as_unavailable(self):
         adapter = FakeAdapter(capabilities=frozenset({Capability.CONFIGURE}))
         result = FunctionalEngine("e" * 64).run(
@@ -163,6 +178,11 @@ class FunctionalContractTests(unittest.TestCase):
         invalid_metrics["metrics"]["download_mbps"] = 0
         with self.assertRaises(ResultValidationError):
             validate_result_payload(invalid_metrics)
+
+        missing_metrics = copy.deepcopy(payload)
+        missing_metrics["metrics"] = {}
+        with self.assertRaises(ResultValidationError):
+            validate_result_payload(missing_metrics)
 
         missing_reason = copy.deepcopy(payload)
         missing_reason["outcome"] = "failed"

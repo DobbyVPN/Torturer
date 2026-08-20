@@ -30,8 +30,7 @@
         "not": {"required": ["reason_code"]},
         "properties": {
           "assertions": {"items": {"properties": {"passed": {"const": true}}}},
-          "cleanup": {"properties": {"verified": {"const": true}}},
-          "metrics": {"required": ["latency_ms", "download_mbps", "upload_mbps"]}
+          "cleanup": {"properties": {"verified": {"const": true}}}
         }
       }
     }
