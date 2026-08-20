@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dobbyvpn.example/torturer/functional/result-v1.schema.json",
+  "title": "DobbyVPN canonical functional scenario result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "scenario_id", "scenario_version", "scenario_set_digest", "provenance", "outcome", "assertions", "cleanup", "metrics", "duration_ms", "evidence_refs"],
+  "properties": {
+    "schema": {"const": 1},
+    "scenario_id": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{2,95}$"},
+    "scenario_version": {"const": 1},
+    "scenario_set_digest": {"$ref": "#/$defs/digest"},
+    "provenance": {"$ref": "#/$defs/provenance"},
+    "outcome": {"enum": ["passed", "failed", "unavailable"]},
+    "reason_code": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$"},
+    "assertions": {"type": "array", "items": {"$ref": "#/$defs/assertion"}},
+    "cleanup": {"$ref": "#/$defs/cleanup"},
+    "metrics": {"$ref": "#/$defs/metrics"},
+    "duration_ms": {"type": "integer", "minimum": 0},
+    "evidence_refs": {"type": "array", "items": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{2,95}$"}}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"outcome": {"enum": ["failed", "unavailable"]}}, "required": ["outcome"]},
+      "then": {"required": ["reason_code"]}
+    },
+    {
+      "if": {"properties": {"outcome": {"const": "passed"}}, "required": ["outcome"]},
+      "then": {
+        "not": {"required": ["reason_code"]},
+        "properties": {
+          "assertions": {"items": {"properties": {"passed": {"const": true}}}},
+          "cleanup": {"properties": {"verified": {"const": true}}},
+          "metrics": {"required": ["latency_ms", "download_mbps", "upload_mbps"]}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "image_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "identifier": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{2,95}$"},
+    "assertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "passed"],
+      "properties": {"id": {"$ref": "#/$defs/identifier"}, "passed": {"type": "boolean"}}
+    },
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "verified"],
+      "properties": {"required": {"type": "boolean"}, "verified": {"type": "boolean"}}
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "latency_ms": {"type": "number", "exclusiveMinimum": 0},
+        "download_mbps": {"type": "number", "exclusiveMinimum": 0},
+        "upload_mbps": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_repository", "source_sha", "torturer_sha", "artifact_sha256", "server_image_digest", "platform", "adapter_id", "adapter_version", "capabilities"],
+      "properties": {
+        "source_repository": {"type": "string", "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9_.-]{1,100}$"},
+        "source_sha": {"$ref": "#/$defs/sha"},
+        "torturer_sha": {"$ref": "#/$defs/sha"},
+        "harness_sha": {"$ref": "#/$defs/sha"},
+        "artifact_sha256": {"$ref": "#/$defs/digest"},
+        "server_image_digest": {"$ref": "#/$defs/image_digest"},
+        "provider_generation": {"$ref": "#/$defs/identifier"},
+        "platform": {"$ref": "#/$defs/identifier"},
+        "adapter_id": {"$ref": "#/$defs/identifier"},
+        "adapter_version": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{1,95}$"},
+        "capabilities": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/identifier"}}
+      }
+    }
+  }
+}
