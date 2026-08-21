@@ -57,8 +57,10 @@ network transition, endurance, or throughput without two approved URLs) are
 reported as `unavailable`; they are never inferred as passes. The protected
 `python -m torturer_provider.lease_cli` boundary creates/cleans one tagged
 Render lease and writes the profile only to owner-only storage for immediate
-encryption. No hosted functional workflow is enabled until the immutable server
-image, trusted workflow, and Render account eligibility are proven.
+encryption. The trusted image request passes only `-config=/etc/secrets/config.yml`
+to the image's existing `/outline-ss-server` ENTRYPOINT. No hosted functional
+workflow is enabled until the immutable server image, trusted workflow, and
+Render account eligibility are proven.
 
 ## Security promises
 

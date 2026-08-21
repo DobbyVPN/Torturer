@@ -28,11 +28,14 @@ class FakeAPI:
 
 
 class FakeAcquireAPI:
+    specs: list[object] = []
+
     def __init__(self, token: str) -> None:
         self.token = token
         self.deleted: list[str] = []
 
     def create_service(self, spec):
+        self.specs.append(spec)
         return RenderServiceHandle("srv-acquire123", "dep-acquire123", spec.image_digest)
 
     def service(self, service_id):
@@ -53,6 +56,7 @@ class LeaseCLIContractTests(unittest.TestCase):
     def test_acquire_writes_owner_only_profile_and_safe_lease_record(self) -> None:
         original = lease_cli.RenderAPI
         lease_cli.RenderAPI = FakeAcquireAPI
+        FakeAcquireAPI.specs = []
         try:
             with tempfile.TemporaryDirectory(prefix="lease-cli-acquire-") as directory:
                 root = Path(directory)
@@ -76,6 +80,10 @@ class LeaseCLIContractTests(unittest.TestCase):
                 lease = json.loads((root / "lease.json").read_text(encoding="utf-8"))
                 self.assertEqual(lease["state"], "issued")
                 self.assertNotIn("lease.example.onrender.com", json.dumps(lease))
+                self.assertEqual(
+                    FakeAcquireAPI.specs[0].docker_command,
+                    "-config=/etc/secrets/config.yml",
+                )
         finally:
             lease_cli.RenderAPI = original
 
