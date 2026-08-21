@@ -217,7 +217,11 @@ opaque run ID, platform, and immutable image digest. Acquisition creates one
 random WSS profile and tagged service, writes the plaintext TOML profile only
 to owner-only storage, and emits an opaque lease record. Cleanup is idempotent
 and independently verifies the exact service is absent. Render credentials are
-read only from the protected workflow environment.
+read only from the protected workflow environment. For the selected Outline
+image, the trusted request passes only `-config=/etc/secrets/config.yml` as
+Docker command arguments because the image already supplies
+`/outline-ss-server` as its ENTRYPOINT; the secret file is never baked into the
+image or emitted in a result.
 
 These entry points are unit-tested with fake adapters/provider responses. They
 do not claim live Render provisioning or complete hosted platform coverage

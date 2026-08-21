@@ -26,6 +26,7 @@ from .render import RenderAPI, RenderAPIError, RenderServiceSpec
 
 _IMAGE_PATH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{2,255}$")
 _SERVICE_ID = re.compile(r"^srv-[A-Za-z0-9][A-Za-z0-9_-]{1,99}$")
+_OUTLINE_CONFIG_COMMAND = "-config=/etc/secrets/config.yml"
 
 
 def _owner_output(path: Path, payload: dict[str, object]) -> None:
@@ -98,6 +99,7 @@ def acquire(args: argparse.Namespace) -> int:
         image_digest=request.image_digest,
         region=args.region,
         secret_files=profile.render_secret_files(args.listen_port),
+        docker_command=_OUTLINE_CONFIG_COMMAND,
     )
     journal = RenderLeaseJournal(args.journal)
     lease = RenderLease(api, spec, descriptor, journal)
