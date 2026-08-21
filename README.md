@@ -38,6 +38,15 @@ NetworkExtension, routing, DNS, or physical-device coverage.
 Real VPN endpoints, external-IP assertions, speed tests, prolonged soak tests,
 and physical-device tests are outside Torturer's public test contract.
 
+The provider package also contains a pure, secret-safe Outline WSS input
+contract (`torturer_provider.outline`). It creates one run-scoped shared path
+prefix and key, emits both canonical `websocket-stream` (`/tcp`) and
+`websocket-packet` (`/udp`) listener definitions for the pinned image, and
+builds the in-memory DobbyVPN profile only after a trusted service URL is
+known. The key and generated config are provider handoff data; they are never
+public result data. This contract is tested locally and does not claim that a
+live Render service has been provisioned.
+
 ## Security promises
 
 - Candidate code runs with no secrets and minimum read-only permissions.

@@ -132,7 +132,10 @@ class RenderServiceSpec:
     image_digest: str
     region: str = "oregon"
     plan: str = "free"
-    health_check_path: str = "/healthz"
+    # None is intentional for Outline WSS images: the listener rejects a
+    # plain HTTP GET, so authenticated WebSocket readiness belongs to the
+    # functional adapter rather than a fabricated HTTP health path.
+    health_check_path: str | None = None
     secret_files: tuple[tuple[str, str], ...] = ()
     docker_command: str | None = None
 
@@ -146,10 +149,11 @@ class RenderServiceSpec:
             raise ValueError("unsupported Render region")
         if self.plan != "free":
             raise ValueError("disposable controller only permits the free plan")
-        if not isinstance(self.health_check_path, str) or not self.health_check_path.startswith("/"):
-            raise ValueError("health_check_path must be an absolute path")
-        if any(character in self.health_check_path for character in "?#"):
-            raise ValueError("health_check_path must not contain a query or fragment")
+        if self.health_check_path is not None:
+            if not isinstance(self.health_check_path, str) or not self.health_check_path.startswith("/"):
+                raise ValueError("health_check_path must be an absolute path")
+            if any(character in self.health_check_path for character in "?#"):
+                raise ValueError("health_check_path must not contain a query or fragment")
         if not isinstance(self.secret_files, tuple):
             raise ValueError("secret_files must be a tuple")
         seen_names: set[str] = set()
@@ -174,8 +178,9 @@ class RenderServiceSpec:
             "plan": self.plan,
             "region": self.region,
             "numInstances": 1,
-            "healthCheckPath": self.health_check_path,
         }
+        if self.health_check_path is not None:
+            service_details["healthCheckPath"] = self.health_check_path
         if self.docker_command is not None:
             service_details["envSpecificDetails"] = {"dockerCommand": self.docker_command}
         payload: dict[str, object] = {

@@ -100,6 +100,12 @@ class RenderControllerTests(unittest.TestCase):
             "/outline-ss-server -config=/etc/secrets/config.yml",
         )
 
+    def test_outline_wss_spec_can_omit_fake_http_health_path(self) -> None:
+        value = image_spec_with_runtime_config().__dict__
+        value["health_check_path"] = None
+        payload = RENDER.RenderServiceSpec(**value).payload()
+        self.assertNotIn("healthCheckPath", payload["serviceDetails"])
+
     def test_secret_file_and_command_validation_is_fail_closed(self) -> None:
         fields = image_spec_with_runtime_config().__dict__
         with self.assertRaises(ValueError):
