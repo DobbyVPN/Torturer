@@ -195,3 +195,31 @@ or any physical-iPhone behaviour.
 Every `verify.yml` helper checkout is pinned to the immutable H1 SHA. DobbyVPN
 may update its immutable Torturer workflow pin only to a reviewed H2-or-later
 commit.
+
+## Trusted hosted adapter boundary
+
+The hosted functional entry point is `python3 -m
+torturer_checks.hosted.run`. It requires an exact candidate artifact digest, an
+owner-only profile file, an immutable server-image digest, and a full source
+SHA. It invokes the product's existing `dobby-cli` operations (`check-config`,
+`connect-profile`, `status --json`, `external-ip`, `disconnect`) as argument
+vectors. It never imports DobbyVPN source or defines product behavior.
+
+Each command's original stdout and stderr bytes are retained under the trusted
+runner's owner-only temporary evidence directory. The emitted result contains
+only canonical scenario outcomes, stable failure codes, provenance, and safe
+metrics; it never contains the profile, URL, key, or observed public identity.
+The adapter advertises only capabilities it can actually observe.
+
+`python3 -m torturer_provider.lease_cli acquire` and `cleanup` are trusted
+provider operations, not public candidate steps. The request contains only an
+opaque run ID, platform, and immutable image digest. Acquisition creates one
+random WSS profile and tagged service, writes the plaintext TOML profile only
+to owner-only storage, and emits an opaque lease record. Cleanup is idempotent
+and independently verifies the exact service is absent. Render credentials are
+read only from the protected workflow environment.
+
+These entry points are unit-tested with fake adapters/provider responses. They
+do not claim live Render provisioning or complete hosted platform coverage
+until the server-image provenance, trusted workflow, and account-eligibility
+gates in the transition plan are complete.

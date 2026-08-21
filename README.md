@@ -47,6 +47,19 @@ known. The key and generated config are provider handoff data; they are never
 public result data. This contract is tested locally and does not claim that a
 live Render service has been provisioned.
 
+The trusted-runner package `torturer_checks.hosted` now provides one narrow
+CLI adapter for Linux, Windows, macOS, and Android entry points. It drives only
+DobbyVPN's existing public CLI, records complete command bytes in a private
+runner-local directory, translates independently observed connection facts, and
+leaves scenario assertions and outcomes to the canonical engine. Capabilities
+that the current adapter cannot prove (sleep/wake, process-loss recovery,
+network transition, endurance, or throughput without two approved URLs) are
+reported as `unavailable`; they are never inferred as passes. The protected
+`python -m torturer_provider.lease_cli` boundary creates/cleans one tagged
+Render lease and writes the profile only to owner-only storage for immediate
+encryption. No hosted functional workflow is enabled until the immutable server
+image, trusted workflow, and Render account eligibility are proven.
+
 ## Security promises
 
 - Candidate code runs with no secrets and minimum read-only permissions.
