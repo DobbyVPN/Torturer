@@ -116,6 +116,25 @@ cannot by itself prove that arbitrary build tooling produced that ZIP from that
 source.  The protected workflow remains responsible for checkout provenance,
 the build step, and associating its output with this manifest.
 
+## Disposable Outline WebSocket provider input
+
+The trusted provider-side input builder uses one random 32-byte Outline secret
+and one random path prefix per platform lease. Its generated owner-only config
+binds the Render-provided port and exposes exactly two listeners:
+
+- `websocket-stream` at `<prefix>/tcp`;
+- `websocket-packet` at `<prefix>/udp`.
+
+The corresponding in-memory DobbyVPN block uses the Render HTTPS hostname,
+port 443, the same prefix, and the pinned
+`chacha20-ietf-poly1305` cipher. The secret is never part of public metadata,
+lease journals, command arguments, or result artifacts. A plain HTTP health
+path is deliberately not configured because the upstream listener returns a
+non-success response to a non-WebSocket request; the first authenticated
+WebSocket connection is the functional readiness check. The module's unit
+contract is tested locally, but no live provider run is claimed by this public
+contract until the trusted lease workflow and account eligibility are proven.
+
 ## Public test scope
 
 Public synthetic tests may verify package layout, process and service
