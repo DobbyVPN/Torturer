@@ -25,6 +25,7 @@ _OWNER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,99}$")
 _SERVICE_NAME = re.compile(r"^[a-z][a-z0-9-]{2,62}$")
 _IMAGE_PATH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{2,255}$")
 _IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_SECRET_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _READY_STATUSES = frozenset({"live"})
 _FAILED_STATUSES = frozenset({"build_failed", "update_failed", "canceled", "deactivated"})
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -113,6 +114,8 @@ class RenderServiceSpec:
     region: str = "oregon"
     plan: str = "free"
     health_check_path: str = "/healthz"
+    secret_files: tuple[tuple[str, str], ...] = ()
+    docker_command: str | None = None
 
     def __post_init__(self) -> None:
         _require(self.owner_id, _OWNER_ID, "owner_id")
@@ -128,24 +131,47 @@ class RenderServiceSpec:
             raise ValueError("health_check_path must be an absolute path")
         if any(character in self.health_check_path for character in "?#"):
             raise ValueError("health_check_path must not contain a query or fragment")
+        if not isinstance(self.secret_files, tuple):
+            raise ValueError("secret_files must be a tuple")
+        seen_names: set[str] = set()
+        for name, content in self.secret_files:
+            _require(name, _SECRET_NAME, "secret file name")
+            if name in seen_names:
+                raise ValueError("secret file names must be unique")
+            seen_names.add(name)
+            if not isinstance(content, str) or not content or "\x00" in content:
+                raise ValueError("secret file content must be non-empty text")
+        if self.docker_command is not None:
+            if not isinstance(self.docker_command, str) or not self.docker_command or "\x00" in self.docker_command:
+                raise ValueError("docker_command must be non-empty text")
+            if any(character in self.docker_command for character in "\r\n"):
+                raise ValueError("docker_command must be one line")
 
     def payload(self) -> dict[str, object]:
         """Build the image-backed, one-instance, no-autodeploy request."""
 
-        return {
+        service_details: dict[str, object] = {
+            "runtime": "image",
+            "plan": self.plan,
+            "region": self.region,
+            "numInstances": 1,
+            "healthCheckPath": self.health_check_path,
+        }
+        if self.docker_command is not None:
+            service_details["envSpecificDetails"] = {"dockerCommand": self.docker_command}
+        payload: dict[str, object] = {
             "type": "web_service",
             "name": self.name,
             "ownerId": self.owner_id,
             "autoDeploy": "no",
             "image": {"ownerId": self.image_owner_id, "imagePath": self.image_path},
-            "serviceDetails": {
-                "runtime": "image",
-                "plan": self.plan,
-                "region": self.region,
-                "numInstances": 1,
-                "healthCheckPath": self.health_check_path,
-            },
+            "serviceDetails": service_details,
         }
+        if self.secret_files:
+            payload["secretFiles"] = [
+                {"name": name, "content": content} for name, content in self.secret_files
+            ]
+        return payload
 
 @dataclass(frozen=True)
 class RenderServiceHandle:
