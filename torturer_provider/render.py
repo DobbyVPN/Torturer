@@ -145,6 +145,8 @@ class RenderServiceSpec:
         _require(self.name, _SERVICE_NAME, "name")
         _require(self.image_path, _IMAGE_PATH, "image_path")
         _require(self.image_digest, _IMAGE_DIGEST, "image_digest")
+        if not self.image_path.endswith("@" + self.image_digest):
+            raise ValueError("image_path must use the declared immutable digest")
         if self.region not in _REGIONS:
             raise ValueError("unsupported Render region")
         if self.plan != "free":
