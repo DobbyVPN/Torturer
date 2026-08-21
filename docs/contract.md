@@ -135,6 +135,14 @@ WebSocket connection is the functional readiness check. The module's unit
 contract is tested locally, but no live provider run is claimed by this public
 contract until the trusted lease workflow and account eligibility are proven.
 
+The cross-job profile handoff uses an ephemeral recipient certificate and
+OpenSSL CMS `-aes-256-gcm` argument vectors. The platform job keeps its private
+key and plaintext profile owner-only; the trusted lease job encrypts the
+profile to the public certificate and publishes only the ciphertext under an
+opaque run/platform artifact name. Command construction rejects shell-style
+interpolation and file collisions. The handoff helper is a contract boundary,
+not permission to publish a plaintext profile or to expose the Render token.
+
 ## Public test scope
 
 Public synthetic tests may verify package layout, process and service
