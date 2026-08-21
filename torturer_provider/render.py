@@ -10,12 +10,13 @@ status; response bodies and the bearer token are never included in an error.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import re
 import time
 from typing import Any, Callable, Mapping, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -102,6 +103,24 @@ def _require(value: object, pattern: re.Pattern[str], name: str) -> str:
     return value
 
 
+def _timestamp(value: object, name: str = "created_at") -> float:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} has an invalid format")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"{name} has an invalid format") from error
+    if parsed.tzinfo is None:
+        raise ValueError(f"{name} must include a timezone")
+    return parsed.astimezone(timezone.utc).timestamp()
+
+
+def _service_prefix(value: object) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[a-z][a-z0-9-]{2,62}", value):
+        raise ValueError("service name prefix has an invalid format")
+    return value
+
+
 @dataclass(frozen=True)
 class RenderServiceSpec:
     """The only service configuration allowed by the disposable lane."""
@@ -174,6 +193,25 @@ class RenderServiceSpec:
         return payload
 
 @dataclass(frozen=True)
+class RenderServiceRecord:
+    """Safe identity fields returned by the Render service list endpoint."""
+
+    service_id: str
+    name: str
+    owner_id: str
+    service_type: str
+    created_at: str
+
+    def __post_init__(self) -> None:
+        _require(self.service_id, _SERVICE_ID, "service_id")
+        _require(self.name, _SERVICE_NAME, "name")
+        _require(self.owner_id, _OWNER_ID, "owner_id")
+        if self.service_type != "web_service":
+            raise ValueError("service list contained a non-web service")
+        _timestamp(self.created_at)
+
+
+@dataclass(frozen=True)
 class RenderServiceHandle:
     service_id: str
     deploy_id: str | None
@@ -227,13 +265,21 @@ class RenderAPI:
         payload: Mapping[str, object] | None = None,
         *,
         expected: frozenset[int],
+        query: Mapping[str, object] | None = None,
     ) -> object:
         if not path.startswith("/") or "?" in path or "#" in path:
             raise ValueError("Render API path must be a fixed path")
+        request_path = path
+        if query:
+            if any(not isinstance(key, str) or not key for key in query):
+                raise ValueError("Render API query names must be non-empty strings")
+            if any(not isinstance(value, (str, int)) or isinstance(value, bool) for value in query.values()):
+                raise ValueError("Render API query values must be strings or integers")
+            request_path = f"{path}?{urlencode(query)}"
         try:
             response = self._transport.request(
                 method,
-                path,
+                request_path,
                 payload,
                 {
                     "Accept": "application/json",
@@ -269,6 +315,57 @@ class RenderAPI:
     def service(self, service_id: str) -> Mapping[str, Any]:
         _require(service_id, _SERVICE_ID, "service_id")
         return self._object(self._request("GET", f"/services/{service_id}", expected=frozenset({200})))
+
+    def list_services(
+        self,
+        owner_id: str,
+        *,
+        page_limit: int = 100,
+        max_pages: int = 100,
+    ) -> tuple[RenderServiceRecord, ...]:
+        """List only web services in one owner workspace, with bounded pagination."""
+        _require(owner_id, _OWNER_ID, "owner_id")
+        if not 1 <= page_limit <= 100 or max_pages <= 0:
+            raise ValueError("Render service-list bounds are invalid")
+        records: list[RenderServiceRecord] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        for _ in range(max_pages):
+            query: dict[str, object] = {
+                "ownerId": owner_id,
+                "type": "web_service",
+                "limit": page_limit,
+            }
+            if cursor is not None:
+                query["cursor"] = cursor
+            payload = self._request("GET", "/services", expected=frozenset({200}), query=query)
+            if not isinstance(payload, list):
+                raise RenderAPIError("INVALID_SERVICE_LIST")
+            for item in payload:
+                wrapper = self._object(item, "INVALID_SERVICE_LIST")
+                service = self._object(wrapper.get("service"), "INVALID_SERVICE_LIST")
+                try:
+                    records.append(RenderServiceRecord(
+                        service_id=service["id"],
+                        name=service["name"],
+                        owner_id=service["ownerId"],
+                        service_type=service["type"],
+                        created_at=service["createdAt"],
+                    ))
+                except (KeyError, TypeError, ValueError) as error:
+                    raise RenderAPIError("INVALID_SERVICE_LIST") from error
+            if len(payload) < page_limit:
+                return tuple(records)
+            if not payload:
+                return tuple(records)
+            last = self._object(payload[-1], "INVALID_SERVICE_LIST")
+            next_cursor = last.get("cursor")
+            if not isinstance(next_cursor, str) or not next_cursor or next_cursor in seen_cursors:
+                raise RenderAPIError("INVALID_SERVICE_CURSOR")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        raise RenderAPIError("SERVICE_LIST_PAGINATION_LIMIT")
+
 
     def deploy(self, service_id: str, deploy_id: str) -> Mapping[str, Any]:
         _require(service_id, _SERVICE_ID, "service_id")
@@ -361,10 +458,11 @@ class DisposableRenderController:
 
 
 class RenderReaper:
-    """Idempotent cleanup for explicit service IDs from trusted run state."""
+    """Idempotent cleanup for explicit IDs or aged, name-selected test services."""
 
-    def __init__(self, api: RenderAPI) -> None:
+    def __init__(self, api: RenderAPI, *, clock: Callable[[], float] = time.time) -> None:
         self.api = api
+        self._clock = clock
 
     def reap(self, service_ids: tuple[str, ...]) -> None:
         for service_id in service_ids:
@@ -372,6 +470,44 @@ class RenderReaper:
             self.api.delete_service(service_id)
             if self.api.exists(service_id):
                 raise RenderAPIError("REAPER_DELETE_NOT_VERIFIED")
+
+    def reap_tagged(
+        self,
+        owner_id: str,
+        name_prefix: str,
+        *,
+        active_service_ids: tuple[str, ...] = (),
+        older_than_seconds: float = 900.0,
+    ) -> tuple[str, ...]:
+        """Delete only aged services in the dedicated owner/name namespace.
+
+        Render's public service API has no arbitrary tag field.  The safe
+        selector is therefore the exact owner, web-service type, and a
+        validated dedicated name prefix; active lease IDs are excluded.
+        """
+        _require(owner_id, _OWNER_ID, "owner_id")
+        prefix = _service_prefix(name_prefix)
+        if older_than_seconds < 0:
+            raise ValueError("reaper age bound must not be negative")
+        active = set()
+        for service_id in active_service_ids:
+            active.add(_require(service_id, _SERVICE_ID, "active_service_id"))
+        now = self._clock()
+        if not isinstance(now, (int, float)) or isinstance(now, bool):
+            raise ValueError("reaper clock returned an invalid value")
+        deleted: list[str] = []
+        for record in self.api.list_services(owner_id):
+            if record.owner_id != owner_id or record.service_id in active or not record.name.startswith(prefix):
+                continue
+            try:
+                age = now - _timestamp(record.created_at)
+            except ValueError:
+                continue
+            if age < older_than_seconds:
+                continue
+            self.reap((record.service_id,))
+            deleted.append(record.service_id)
+        return tuple(deleted)
 
 
 __all__ = [
@@ -381,6 +517,7 @@ __all__ = [
     "RenderAPIError",
     "RenderReaper",
     "RenderServiceHandle",
+    "RenderServiceRecord",
     "RenderServiceReady",
     "RenderServiceSpec",
 ]
