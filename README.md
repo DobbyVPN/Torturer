@@ -56,6 +56,9 @@ live Render service has been provisioned.
   validated, never interpolated directly into shell programs.
 - Fork pull requests receive the same public synthetic tests but no privileged
   context.
+- The trusted profile handoff uses owner-only files and an OpenSSL CMS
+  AES-256-GCM argument vector; plaintext profile material is never a command
+  argument or public artifact.
 - Generated manifests are diagnostic evidence, not signing attestations.
 
 See `docs/contract.md` for the caller and result contracts.
