@@ -69,6 +69,19 @@ def spec() -> object:
     )
 
 
+def image_spec_with_runtime_config() -> object:
+    return RENDER.RenderServiceSpec(
+        owner_id="tea-test123",
+        name="dobby-test-123",
+        image_owner_id="tea-test123",
+        image_path="ghcr.io/dobbyvpn/outline-ss-server@" + IMAGE_DIGEST,
+        image_digest=IMAGE_DIGEST,
+        health_check_path="/probe/tcp",
+        secret_files=(("config.yml", "web:\n  servers: []\n"),),
+        docker_command="/outline-ss-server -config=/etc/secrets/config.yml",
+    )
+
+
 class RenderControllerTests(unittest.TestCase):
     def test_payload_is_one_free_image_service_without_secrets(self) -> None:
         value = spec().payload()
@@ -77,6 +90,22 @@ class RenderControllerTests(unittest.TestCase):
         self.assertEqual(value["serviceDetails"]["numInstances"], 1)
         self.assertEqual(value["serviceDetails"]["runtime"], "image")
         self.assertNotIn("token", repr(value).lower())
+
+    def test_payload_can_bind_immutable_image_runtime_config_without_echoing_content(self) -> None:
+        value = image_spec_with_runtime_config().payload()
+        self.assertEqual(value["image"]["imagePath"], "ghcr.io/dobbyvpn/outline-ss-server@" + IMAGE_DIGEST)
+        self.assertEqual(value["secretFiles"], [{"name": "config.yml", "content": "web:\n  servers: []\n"}])
+        self.assertEqual(
+            value["serviceDetails"]["envSpecificDetails"]["dockerCommand"],
+            "/outline-ss-server -config=/etc/secrets/config.yml",
+        )
+
+    def test_secret_file_and_command_validation_is_fail_closed(self) -> None:
+        fields = image_spec_with_runtime_config().__dict__
+        with self.assertRaises(ValueError):
+            RENDER.RenderServiceSpec(**{**fields, "secret_files": (("../config", "x"),)})
+        with self.assertRaises(ValueError):
+            RENDER.RenderServiceSpec(**{**fields, "docker_command": "x\ny"})
 
     def test_acquire_waits_for_live_https_service_and_release_verifies_deletion(self) -> None:
         transport = FakeTransport()
