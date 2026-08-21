@@ -18,6 +18,7 @@ from torturer_contract.workflow_policy import (
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "verify.yml"
 SELF_TEST_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+PINNED_TORTURER_COMMIT = "105c7e135a506b567b0979338b158dc793d202a1"
 
 class VerifyWorkflowPolicyTest(unittest.TestCase):
     @classmethod
@@ -83,7 +84,7 @@ class VerifyWorkflowPolicyTest(unittest.TestCase):
         helper_refs = re.findall(r"(?m)^          ref: ([0-9a-f]{40})$", self.text)
         self.assertEqual(
             helper_refs,
-            ["57faf08cd85bcd7e4ee8eb29bab3b196c93ec70b"] * 6,
+            [PINNED_TORTURER_COMMIT] * 6,
         )
         candidate_checkout = re.search(
             r"- name: Check out exact candidate\n.*?(?=\n      - name:)",
@@ -96,6 +97,16 @@ class VerifyWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("ref: ${{ inputs.commit_sha }}", candidate_checkout.group())
         self.assertIn("persist-credentials: false", candidate_checkout.group())
         self.assertIn("submodules: recursive", candidate_checkout.group())
+
+    def test_functional_platform_lanes_have_the_documented_30_minute_bound(self) -> None:
+        for job in ("ios_simulator", "android"):
+            section = re.search(
+                rf"(?ms)^  {job}:\n.*?(?=^  [a-zA-Z0-9_]+:|\Z)",
+                self.text,
+            )
+            self.assertIsNotNone(section, job)
+            assert section is not None
+            self.assertRegex(section.group(), r"(?m)^    timeout-minutes: 30$")
 
     def test_stable_job_names_and_helper_clis_are_present(self) -> None:
         for name in STABLE_CHECK_NAMES:
