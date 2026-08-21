@@ -125,8 +125,10 @@ binds the Render-provided port and exposes exactly two listeners:
 - `websocket-stream` at `<prefix>/tcp`;
 - `websocket-packet` at `<prefix>/udp`.
 
-The corresponding in-memory DobbyVPN block uses the Render HTTPS hostname,
-port 443, the same prefix, and the pinned
+The trusted Render service specification must reference the server image by
+`image@sha256:<64 lowercase hex>` and must reject tags such as `latest`, even
+when a separate digest field is present. The corresponding in-memory DobbyVPN
+block uses the Render HTTPS hostname, port 443, the same prefix, and the pinned
 `chacha20-ietf-poly1305` cipher. The secret is never part of public metadata,
 lease journals, command arguments, or result artifacts. A plain HTTP health
 path is deliberately not configured because the upstream listener returns a

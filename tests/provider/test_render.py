@@ -106,6 +106,15 @@ class RenderControllerTests(unittest.TestCase):
         payload = RENDER.RenderServiceSpec(**value).payload()
         self.assertNotIn("healthCheckPath", payload["serviceDetails"])
 
+    def test_mutable_image_reference_is_rejected_even_with_a_digest_field(self) -> None:
+        fields = image_spec_with_runtime_config().__dict__
+        with self.assertRaisesRegex(ValueError, "immutable digest"):
+            RENDER.RenderServiceSpec(**{**fields, "image_path": "ghcr.io/dobbyvpn/outline-ss-server:latest"})
+        with self.assertRaisesRegex(ValueError, "immutable digest"):
+            RENDER.RenderServiceSpec(
+                **{**fields, "image_path": "ghcr.io/dobbyvpn/outline-ss-server@sha256:" + "b" * 64}
+            )
+
     def test_secret_file_and_command_validation_is_fail_closed(self) -> None:
         fields = image_spec_with_runtime_config().__dict__
         with self.assertRaises(ValueError):
