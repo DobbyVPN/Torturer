@@ -182,7 +182,6 @@ def cli_command(root: Path, target_platform: str, *arguments: str) -> list[str]:
     return [
         str(root / gradle),
         "--no-daemon",
-        "--quiet",
         ":app:run",
         "--args=" + " ".join(arguments),
     ]

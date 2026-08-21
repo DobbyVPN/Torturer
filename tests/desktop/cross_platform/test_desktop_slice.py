@@ -68,7 +68,6 @@ class DesktopSliceHelperTest(unittest.TestCase):
             [
                 "/candidate/kmp_module/gradlew",
                 "--no-daemon",
-                "--quiet",
                 ":app:run",
                 "--args=status --json",
             ],
