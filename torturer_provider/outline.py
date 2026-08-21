@@ -120,6 +120,27 @@ class OutlineWSSProfile:
             "DisguisePrefix": "POST ",
         }
 
+    def client_toml(self, service_url: str) -> str:
+        """Serialize the trusted client block in DobbyVPN's public TOML shape.
+
+        This serializer is intentionally kept beside the provider contract so
+        the hosted lease does not invent a second profile format. Values are
+        validated by :meth:`client_block` before interpolation; the returned
+        string is handoff data and must remain owner-only.
+        """
+
+        block = self.client_block(service_url)
+        return (
+            "[[Outline]]\n"
+            'Description = "DobbyVPN Torturer disposable Render lease"\n'
+            f"WebSocket = {str(block['WebSocket']).lower()}\n"
+            f'Server = "{block["Server"]}"\n'
+            f"Port = {block['Port']}\n"
+            f'Password = "{block["Password"]}"\n'
+            f'WebSocketPath = "{block["WebSocketPath"]}"\n'
+            f'DisguisePrefix = "{block["DisguisePrefix"]}"\n'
+        )
+
     def public_metadata(self) -> Mapping[str, str]:
         """Safe metadata suitable for a lease journal or hosted result."""
 

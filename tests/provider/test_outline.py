@@ -32,6 +32,15 @@ class OutlineWSSProfileTests(unittest.TestCase):
         self.assertEqual(block["WebSocketPath"], self.profile.web_path)
         self.assertEqual(block["Password"], "a" * 64)
 
+    def test_client_toml_matches_the_product_outline_websocket_shape(self) -> None:
+        toml = self.profile.client_toml("https://example.onrender.com")
+        self.assertIn("[[Outline]]", toml)
+        self.assertIn("WebSocket = true", toml)
+        self.assertIn('Server = "example.onrender.com"', toml)
+        self.assertIn("Port = 443", toml)
+        self.assertIn('WebSocketPath = "' + self.profile.web_path + '"', toml)
+        self.assertIn('Password = "' + ("a" * 64) + '"', toml)
+
     def test_public_metadata_and_repr_never_include_secret(self) -> None:
         metadata = repr(dict(self.profile.public_metadata()))
         self.assertNotIn("a" * 64, metadata)

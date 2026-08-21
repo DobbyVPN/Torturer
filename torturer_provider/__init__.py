@@ -4,6 +4,7 @@ Provider code owns infrastructure lifecycle only.  Functional scenario
 meaning and assertions remain in :mod:`torturer_contract.functional`.
 """
 
+from .lease_request import LeaseRequestError, RenderLeaseRequest
 from .render import (
     HTTPResponse,
     RenderAPI,
@@ -24,4 +25,6 @@ __all__ = [
     "RenderServiceHandle",
     "RenderServiceReady",
     "RenderServiceSpec",
+    "LeaseRequestError",
+    "RenderLeaseRequest",
 ]
