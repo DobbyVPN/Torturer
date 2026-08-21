@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: DobbyVPN/Torturer
-          ref: 57faf08cd85bcd7e4ee8eb29bab3b196c93ec70b
+          ref: 105c7e135a506b567b0979338b158dc793d202a1
           path: torturer
           persist-credentials: false
 
@@ -135,7 +135,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: DobbyVPN/Torturer
-          ref: 57faf08cd85bcd7e4ee8eb29bab3b196c93ec70b
+          ref: 105c7e135a506b567b0979338b158dc793d202a1
           path: torturer
           persist-credentials: false
 
@@ -195,7 +195,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: DobbyVPN/Torturer
-          ref: 57faf08cd85bcd7e4ee8eb29bab3b196c93ec70b
+          ref: 105c7e135a506b567b0979338b158dc793d202a1
           path: torturer
           persist-credentials: false
 
@@ -268,7 +268,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: DobbyVPN/Torturer
-          ref: 57faf08cd85bcd7e4ee8eb29bab3b196c93ec70b
+          ref: 105c7e135a506b567b0979338b158dc793d202a1
           path: torturer
           persist-credentials: false
 
@@ -335,13 +335,13 @@ jobs:
   ios_simulator:
     name: Torturer / iOS Simulator core contract
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - name: Check out pinned Torturer helpers
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: DobbyVPN/Torturer
-          ref: 57faf08cd85bcd7e4ee8eb29bab3b196c93ec70b
+          ref: 105c7e135a506b567b0979338b158dc793d202a1
           path: torturer
           persist-credentials: false
 
@@ -495,7 +495,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: DobbyVPN/Torturer
-          ref: 57faf08cd85bcd7e4ee8eb29bab3b196c93ec70b
+          ref: 105c7e135a506b567b0979338b158dc793d202a1
           path: torturer
           persist-credentials: false
 
