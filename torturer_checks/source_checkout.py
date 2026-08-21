@@ -25,7 +25,7 @@ def verify_source_checkout(candidate: Path, expected_commit: str) -> None:
             check=True,
             text=True,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=None,
         ).stdout.strip()
         tracked_state = subprocess.run(
             [
@@ -39,7 +39,7 @@ def verify_source_checkout(candidate: Path, expected_commit: str) -> None:
             check=True,
             text=True,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=None,
         ).stdout
     except (OSError, subprocess.CalledProcessError) as error:
         raise SourceCheckoutError("candidate is not a readable Git checkout") from error

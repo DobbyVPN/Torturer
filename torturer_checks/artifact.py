@@ -155,7 +155,8 @@ def source_identity_from_checkout(
         result = subprocess.run(
             ["git", "-C", str(directory), "rev-parse", "--verify", "HEAD^{commit}"],
             check=False,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=None,
             text=True,
             timeout=10,
         )
@@ -177,7 +178,8 @@ def source_identity_from_checkout(
                 "--untracked-files=no",
             ],
             check=False,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=None,
             text=True,
             timeout=10,
         )
