@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import socket
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,7 +9,11 @@ from unittest import mock
 
 from torturer_checks.hosted.android import AndroidHostedAdapter
 from torturer_checks.hosted.cli import CommandResult, HostedAdapterError, HostedCLIAdapter, SubprocessRunner
-from torturer_checks.hosted.linux import LinuxHostedAdapter
+from torturer_checks.hosted.linux import (
+    LinuxHostedAdapter,
+    LinuxServiceProcessController,
+    _SERVICE_LAUNCH_SCRIPT,
+)
 from torturer_checks.hosted.macos import MacOSHostedAdapter
 from torturer_checks.hosted.windows import WindowsHostedAdapter
 from torturer_checks.hosted.run import (
@@ -304,6 +309,73 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertEqual(result, {"process_loss_verified": True})
         self.assertEqual(service.timeouts, [9.0])
         self.assertEqual(self.runner.timeouts, [8.0, 7.0])
+
+    def test_linux_restart_launcher_tracks_exact_child_pid(self) -> None:
+        root = Path(self.directory.name)
+        binary = root / "service"
+        binary.write_bytes(b"synthetic service")
+        binary.chmod(0o700)
+        library = root / "library"
+        library.mkdir()
+        socket_path = root / "control.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(socket_path))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        pid_file = root / "service.pid"
+        raw_directory = root / "service-raw"
+
+        class ServiceRunner:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, ...]] = []
+
+            def run(self, command, *, timeout_seconds):
+                argv = tuple(command)
+                self.calls.append(argv)
+                if len(argv) >= 5 and argv[2:5] == ("sh", "-c", _SERVICE_LAUNCH_SCRIPT):
+                    return CommandResult(argv, 0, b"456\n", b"")
+                if argv[2:4] == ("readlink", "-f"):
+                    return CommandResult(
+                        argv,
+                        0,
+                        (str(binary.resolve()) + "\n").encode(),
+                        b"",
+                    )
+                if argv[2:4] == ("kill", "-0"):
+                    return CommandResult(argv, 0, b"", b"")
+                raise AssertionError(argv)
+
+        runner = ServiceRunner()
+        controller = LinuxServiceProcessController(
+            pid=123,
+            binary=binary,
+            socket=socket_path,
+            library_path=library,
+            pid_file=pid_file,
+            runner=runner,
+            raw_directory=raw_directory,
+        )
+        with mock.patch(
+            "torturer_checks.hosted.linux.time.monotonic",
+            side_effect=[100.0, 101.0, 102.0, 103.0],
+        ):
+            controller._start(10.0)
+
+        self.assertEqual(controller.pid, 456)
+        self.assertEqual(pid_file.read_text(encoding="ascii"), "456\n")
+        launcher = next(
+            call
+            for call in runner.calls
+            if len(call) >= 5 and call[2:5] == ("sh", "-c", _SERVICE_LAUNCH_SCRIPT)
+        )
+        self.assertEqual(
+            launcher[:5],
+            ("sudo", "-n", "sh", "-c", _SERVICE_LAUNCH_SCRIPT),
+        )
+        self.assertEqual(launcher[5], "dobbyvpn-service")
+        self.assertEqual(launcher[6], str(binary))
+        self.assertEqual(launcher[7], str(socket_path))
+        self.assertEqual(launcher[9], str(library))
 
     def test_subprocess_runner_retains_complete_stdout_and_stderr_bytes(self) -> None:
         raw = Path(self.directory.name) / "raw"

@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import re
-import subprocess
+import socket
 import time
 
 from torturer_contract.functional.capabilities import Capability
@@ -17,6 +17,27 @@ from .cli import CommandRunner, HostedAdapterError, HostedCLIAdapter
 
 _PID = re.compile(r"^[1-9][0-9]{0,9}$")
 _INTERFACE = re.compile(r"^[A-Za-z0-9_.:-]{1,32}$")
+_SERVICE_LAUNCH_SCRIPT = """\
+set -eu
+binary=$1
+control_socket=$2
+peer_uid=$3
+library_path=$4
+log_path=$5
+if [ -n "$library_path" ]; then
+  env \
+    DOBBYVPN_CONTROL_SOCKET="$control_socket" \
+    DOBBYVPN_CONTROL_PEER_UID="$peer_uid" \
+    LD_LIBRARY_PATH="$library_path" \
+    "$binary" > "$log_path" 2>&1 < /dev/null &
+else
+  env \
+    DOBBYVPN_CONTROL_SOCKET="$control_socket" \
+    DOBBYVPN_CONTROL_PEER_UID="$peer_uid" \
+    "$binary" > "$log_path" 2>&1 < /dev/null &
+fi
+printf '%s\n' "$!"
+"""
 
 
 class LinuxServiceProcessController:
@@ -74,10 +95,19 @@ class LinuxServiceProcessController:
 
     def _verify_candidate_pid(self) -> None:
         try:
-            executable = Path(os.readlink(f"/proc/{self.pid}/exe")).resolve()
-            expected = self.binary.resolve()
-        except OSError as error:
+            result = self.runner.run(
+                ("sudo", "-n", "readlink", "-f", f"/proc/{self.pid}/exe"),
+                timeout_seconds=5.0,
+            )
+        except HostedAdapterError as error:
             raise HostedAdapterError("SERVICE_PID_PROBE_FAILED") from error
+        if result.returncode != 0 or result.timed_out:
+            raise HostedAdapterError("SERVICE_PID_PROBE_FAILED")
+        value = result.stdout_text.strip()
+        if not value:
+            raise HostedAdapterError("SERVICE_PID_PROBE_FAILED")
+        executable = Path(value).resolve()
+        expected = self.binary.resolve()
         if executable != expected:
             raise HostedAdapterError("SERVICE_PID_NOT_CANDIDATE")
 
@@ -89,38 +119,50 @@ class LinuxServiceProcessController:
             time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
         raise ScenarioExecutionError("SERVICE_DID_NOT_EXIT")
 
+    def _socket_ready(self) -> bool:
+        if not self.socket.is_socket():
+            return False
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(0.2)
+            probe.connect(str(self.socket))
+            return True
+        except OSError:
+            return False
+        finally:
+            probe.close()
+
     def _start(self, timeout: float) -> None:
         self._restart_number += 1
         log_path = self.raw_directory / f"service-restart-{self._restart_number:03d}.raw.log"
-        log = log_path.open("wb")
-        log_path.chmod(0o600)
-        command = [
-            "sudo", "-n", "env",
-            f"DOBBYVPN_CONTROL_SOCKET={self.socket}",
-            f"DOBBYVPN_CONTROL_PEER_UID={os.getuid()}",
-        ]
-        if self.library_path is not None:
-            command.append(f"LD_LIBRARY_PATH={self.library_path}")
-        command.append(str(self.binary))
-        try:
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-        except OSError as error:
-            log.close()
-            raise ScenarioExecutionError("SERVICE_RESTART_UNAVAILABLE") from error
-        self._log = log
-        self.pid = process.pid
-        self._write_pid(self.pid)
         deadline = time.monotonic() + timeout
+        library_value = str(self.library_path) if self.library_path is not None else ""
+        command = (
+            "sudo", "-n", "sh", "-c", _SERVICE_LAUNCH_SCRIPT,
+            "dobbyvpn-service",
+            str(self.binary),
+            str(self.socket),
+            str(os.getuid()),
+            library_value,
+            str(log_path),
+        )
+        try:
+            result = self.runner.run(
+                command, timeout_seconds=min(10.0, max(0.2, deadline - time.monotonic()))
+            )
+        except HostedAdapterError as error:
+            raise ScenarioExecutionError("SERVICE_RESTART_UNAVAILABLE") from error
+        if result.returncode != 0 or result.timed_out:
+            raise ScenarioExecutionError("SERVICE_RESTART_UNAVAILABLE")
+        value = result.stdout_text.strip()
+        if _PID.fullmatch(value) is None:
+            raise ScenarioExecutionError("SERVICE_RESTART_PID_INVALID")
+        self.pid = int(value)
+        self._write_pid(self.pid)
         while time.monotonic() < deadline:
-            if process.poll() is not None:
+            if not self._alive(max(0.2, deadline - time.monotonic())):
                 raise ScenarioExecutionError("SERVICE_RESTART_EXITED")
-            if self.socket.exists():
+            if self._socket_ready():
                 self._verify_candidate_pid()
                 return
             time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
