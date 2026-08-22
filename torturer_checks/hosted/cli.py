@@ -10,6 +10,7 @@ folder for the duration of a trusted job; only canonical results are emitted.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import ipaddress
 import json
 import os
@@ -60,12 +61,14 @@ class SubprocessRunner:
         self.raw_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.raw_directory, 0o700)
         self._sequence = 0
+        self._evidence: list[dict[str, object]] = []
 
     def run(self, command: Sequence[str], *, timeout_seconds: float) -> CommandResult:
         if timeout_seconds <= 0 or any(not isinstance(item, str) or not item for item in command):
             raise HostedAdapterError("INVALID_COMMAND")
         argv = tuple(command)
         self._sequence += 1
+        started = time.monotonic()
         try:
             completed = subprocess.run(
                 list(argv),
@@ -79,15 +82,19 @@ class SubprocessRunner:
             stdout = error.stdout if isinstance(error.stdout, bytes) else (error.stdout or b"")
             stderr = error.stderr if isinstance(error.stderr, bytes) else (error.stderr or b"")
             result = CommandResult(argv, 124, stdout, stderr, timed_out=True)
-            self._retain(result)
+            self._retain(result, time.monotonic() - started)
             raise HostedAdapterError("COMMAND_TIMEOUT")
         except OSError as error:
-            self._retain_exception(argv, error)
+            self._retain_exception(argv, error, time.monotonic() - started)
             raise HostedAdapterError("COMMAND_UNAVAILABLE") from error
-        self._retain(result)
+        self._retain(result, time.monotonic() - started)
         return result
 
-    def _retain(self, result: CommandResult) -> None:
+    def safe_evidence(self) -> tuple[dict[str, object], ...]:
+        """Return diagnostics metadata without command arguments or payloads."""
+        return tuple(dict(item) for item in self._evidence)
+
+    def _retain(self, result: CommandResult, duration_seconds: float) -> None:
         label = f"command-{self._sequence:03d}"
         path = self.raw_directory / f"{label}.raw.log"
         with path.open("wb") as output:
@@ -96,8 +103,18 @@ class SubprocessRunner:
             output.write(b"stdout-begin\n" + result.stdout + b"\nstdout-end\n")
             output.write(b"stderr-begin\n" + result.stderr + b"\nstderr-end\n")
         os.chmod(path, 0o600)
+        self._evidence.append({
+            "sequence": self._sequence,
+            "returncode": result.returncode,
+            "timed_out": result.timed_out,
+            "duration_ms": max(0, int(duration_seconds * 1000)),
+            "stdout_bytes": len(result.stdout),
+            "stderr_bytes": len(result.stderr),
+            "stdout_sha256": hashlib.sha256(result.stdout).hexdigest(),
+            "stderr_sha256": hashlib.sha256(result.stderr).hexdigest(),
+        })
 
-    def _retain_exception(self, command: Sequence[str], error: OSError) -> None:
+    def _retain_exception(self, command: Sequence[str], error: OSError, duration_seconds: float) -> None:
         label = f"command-{self._sequence:03d}"
         path = self.raw_directory / f"{label}.exception.raw.log"
         path.write_bytes(
@@ -105,6 +122,15 @@ class SubprocessRunner:
             + b"\nexception=" + repr(error).encode("utf-8", errors="replace") + b"\n"
         )
         os.chmod(path, 0o600)
+        self._evidence.append({
+            "sequence": self._sequence,
+            "returncode": None,
+            "timed_out": False,
+            "duration_ms": max(0, int(duration_seconds * 1000)),
+            "stdout_bytes": 0,
+            "stderr_bytes": 0,
+            "exception": type(error).__name__,
+        })
 
 
 def _owner_only_profile(path: Path) -> None:
@@ -254,8 +280,8 @@ class HostedCLIAdapter:
     def _throughput(self, timeout: float) -> dict[str, object]:
         if self.download_url is None or self.upload_url is None:
             raise ScenarioExecutionError("THROUGHPUT_UNAVAILABLE")
-        download = self._curl_metric(self.download_url, timeout)
-        upload = self._curl_metric(self.upload_url, timeout)
+        download = self._curl_metric(self.download_url, timeout, upload=False)
+        upload = self._curl_metric(self.upload_url, timeout, upload=True)
         return {
             "latency_ms": download[0],
             "download_mbps": download[1],
@@ -300,12 +326,22 @@ class HostedCLIAdapter:
             if connection_attempted:
                 self._command(("disconnect",), remaining(), "RECONNECT_CLEANUP_FAILED")
 
-    def _curl_metric(self, url: str, timeout: float) -> tuple[float, float]:
+    def _curl_metric(self, url: str, timeout: float, *, upload: bool) -> tuple[float, float]:
+        if upload:
+            payload = self._upload_payload()
+            transfer_args = (
+                "--request", "POST", "--upload-file", str(payload),
+                "--write-out", "%{time_total}\t%{size_upload}",
+            )
+        else:
+            transfer_args = (
+                "--output", os.devnull,
+                "--write-out", "%{time_total}\t%{size_download}",
+            )
         result = self.runner.run(
             (
                 "curl", "--fail", "--location", "--show-error",
-                "--max-time", str(max(1, int(timeout))), "--output", os.devnull,
-                "--write-out", "%{time_total}\\t%{size_download}", url,
+                "--max-time", str(max(1, int(timeout))), *transfer_args, url,
             ),
             timeout_seconds=timeout,
         )
@@ -320,6 +356,19 @@ class HostedCLIAdapter:
         if seconds <= 0 or bytes_count <= 0:
             raise ScenarioExecutionError("THROUGHPUT_INVALID")
         return seconds * 1000.0, bytes_count * 8.0 / seconds / 1_000_000.0
+
+    def _upload_payload(self) -> Path:
+        raw_directory = getattr(self.runner, "raw_directory", None)
+        if not isinstance(raw_directory, Path):
+            raise ScenarioExecutionError("THROUGHPUT_UPLOAD_UNAVAILABLE")
+        raw_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(raw_directory, 0o700)
+        payload = raw_directory / "traffic-upload.bin"
+        if not payload.exists():
+            with payload.open("wb") as output:
+                output.write(b"\0" * (1024 * 1024))
+            payload.chmod(0o600)
+        return payload
 
     def _cleanup_verified(self, timeout: float) -> bool:
         result = self._command(("status", "--json"), timeout, "CLEANUP_STATUS_FAILED")

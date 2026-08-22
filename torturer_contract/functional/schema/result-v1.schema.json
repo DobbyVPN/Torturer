@@ -64,7 +64,7 @@
     "provenance": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["source_repository", "source_sha", "torturer_sha", "artifact_sha256", "server_image_digest", "platform", "adapter_id", "adapter_version", "capabilities"],
+      "required": ["source_repository", "source_sha", "torturer_sha", "artifact_sha256", "platform", "adapter_id", "adapter_version", "capabilities"],
       "properties": {
         "source_repository": {"type": "string", "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9_.-]{1,100}$"},
         "source_sha": {"$ref": "#/$defs/sha"},
@@ -72,12 +72,17 @@
         "harness_sha": {"$ref": "#/$defs/sha"},
         "artifact_sha256": {"$ref": "#/$defs/digest"},
         "server_image_digest": {"$ref": "#/$defs/image_digest"},
+        "provider_kind": {"enum": ["render", "private"]},
         "provider_generation": {"$ref": "#/$defs/identifier"},
         "platform": {"$ref": "#/$defs/identifier"},
         "adapter_id": {"$ref": "#/$defs/identifier"},
         "adapter_version": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{1,95}$"},
         "capabilities": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/identifier"}}
-      }
+      },
+      "oneOf": [
+        {"required": ["server_image_digest"], "properties": {"provider_kind": {"const": "render"}}},
+        {"required": ["provider_kind"], "properties": {"provider_kind": {"const": "private"}}}
+      ]
     }
   }
 }

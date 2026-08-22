@@ -47,22 +47,37 @@ known. The key and generated config are provider handoff data; they are never
 public result data. This contract is tested locally and does not claim that a
 live Render service has been provisioned.
 
-The trusted-runner package `torturer_checks.hosted` now provides one narrow
-CLI adapter for Linux, Windows, macOS, and Android entry points. It drives only
-DobbyVPN's existing public CLI, records complete command bytes in a private
-runner-local directory, translates independently observed connection facts, and
-leaves scenario assertions and outcomes to the canonical engine. Capabilities
-that the current adapter cannot prove (sleep/wake, process-loss recovery,
-network transition, endurance, or throughput without two approved URLs) are
-reported as `unavailable`; they are never inferred as passes. The protected
+The trusted-runner package `torturer_checks.hosted` provides one narrow
+CLI adapter for the desktop entry points (Linux, Windows, and macOS), plus an
+Android entry point that is retained only for explicit capability gating. The
+CLI adapter drives only DobbyVPN's existing public CLI, records complete
+command bytes in a private runner-local directory, translates independently
+observed connection facts, and leaves scenario assertions and outcomes to the
+canonical engine.
+The Linux adapter now has real, bounded seams for network transition (an
+explicit runner interface), product-service process loss (an exact service
+PID/binary/socket control set), and timed endurance sampling when an approved
+public download/upload URL pair is supplied. Sleep/wake remains explicitly
+`unavailable` on hosted runners because suspending the runner would terminate
+the job; traffic and endurance remain unavailable without the URL pair. Missing
+capabilities are never inferred as passes. Every command keeps its complete raw
+stdout/stderr in the private runner directory and emits only safe return-code,
+size, duration, and digest metadata. The protected
 `python -m torturer_provider.lease_cli` boundary creates/cleans one tagged
 Render lease and writes the profile only to owner-only storage for immediate
 encryption. The trusted image request sets the complete Render Docker command
-to `/outline-ss-server -config=/etc/secrets/config.yml`. A manual, Linux-only
-trusted workflow now wires that lease boundary to the canonical hosted engine;
-it fails closed when the configured immutable image digest or Render eligibility
-is absent. Windows, macOS, and Android hosted functional lanes remain later
-adapter phases, not silently claimed coverage.
+to `/outline-ss-server -config=/etc/secrets/config.yml`. The manual trusted
+workflow currently wires only the common Linux lane; the advanced Linux seams
+are opt-in inputs until their runner-control wiring is reviewed. In particular,
+network transition currently operates on the explicitly named whole runner
+interface, and the process-loss controller must be given the actual candidate
+PID rather than a sudo launcher PID; neither is enabled by the workflow until
+that safety and cleanup proof exists. Windows, macOS, and Android hosted
+functional lanes still lack their platform-specific profile/control handoff in
+a trusted workflow and are not silently claimed coverage. Android's existing
+public emulator test proves consented TUN and packet routing internally, but it
+does not accept an Outline profile or prove an external server identity, so it
+cannot be substituted for the canonical hosted VPN scenarios.
 
 ## Security promises
 
