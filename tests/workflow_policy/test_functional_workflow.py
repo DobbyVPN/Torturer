@@ -27,6 +27,13 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertRegex(self.text, r"(?m)^    timeout-minutes: 30$")
         self.assertIn("PLATFORM: linux", self.text)
 
+    def test_runner_local_paths_are_initialized_from_runner_environment(self) -> None:
+        self.assertNotIn("${{ runner.temp }}", self.text)
+        self.assertRegex(self.text, r"(?m)^      - name: Establish runner-local paths$")
+        self.assertIn("printf 'HANDOFF_DIR=%s\\n' \"$RUNNER_TEMP/dobbyvpn-render-handoff\" >> \"$GITHUB_ENV\"", self.text)
+        self.assertIn("printf 'SERVICE_DIR=%s\\n' \"$RUNNER_TEMP/dobbyvpn-service\" >> \"$GITHUB_ENV\"", self.text)
+        self.assertIn("printf 'RESULT_PATH=%s\\n' \"$RUNNER_TEMP/dobbyvpn-render-handoff/functional-result.json\" >> \"$GITHUB_ENV\"", self.text)
+
     def test_permissions_and_external_actions_are_minimal_and_immutable(self) -> None:
         self.assertRegex(self.text, r"(?m)^permissions:\n  contents: read\n  actions: write$")
         self.assertEqual(set(self.uses), EXPECTED_ACTIONS)
