@@ -8,6 +8,7 @@ import unittest
 from torturer_checks.hosted.android import AndroidHostedAdapter
 from torturer_checks.hosted.cli import CommandResult, HostedAdapterError, HostedCLIAdapter, SubprocessRunner
 from torturer_checks.hosted.linux import LinuxHostedAdapter
+from torturer_checks.hosted.run import build_parser
 from torturer_contract.functional.capabilities import Capability
 from torturer_contract.functional.engine import FunctionalEngine
 from torturer_contract.functional.scenarios import ScenarioStep, get_scenario
@@ -127,6 +128,16 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertTrue(result["endurance_verified"])
         self.assertGreater(float(result["download_mbps"]), 0)
         self.assertGreater(float(result["upload_mbps"]), 0)
+
+    def test_hosted_runner_can_select_a_bounded_canonical_subset(self) -> None:
+        parsed = build_parser().parse_args([
+            "--platform", "linux", "--cli", str(self.cli), "--profile", str(self.profile),
+            "--source-repository", "DobbyVPN/DobbyVPN", "--source-sha", "a" * 40,
+            "--artifact", str(self.cli), "--server-image-digest", "sha256:" + "b" * 64,
+            "--output", str(self.directory.name + "/result.json"), "--scenario-id",
+            "functional.configure", "--scenario-id", "functional.disconnect-cleanup",
+        ])
+        self.assertEqual(parsed.scenario_ids, ["functional.configure", "functional.disconnect-cleanup"])
 
     def test_android_entrypoint_is_fail_closed_without_profile_session_api(self) -> None:
         adapter = AndroidHostedAdapter(cli=self.cli, profile=self.profile, runner=self.runner)
