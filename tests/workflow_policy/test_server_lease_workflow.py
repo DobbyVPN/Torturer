@@ -27,6 +27,14 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         self.assertRegex(self.text, r"(?m)^    timeout-minutes: 40$")
         self.assertRegex(self.text, r"(?m)^    environment: render-functional$")
 
+    def test_lease_directory_is_owner_only_before_provider_files_are_created(self) -> None:
+        validate = self.text.index("- name: Validate trusted lease boundary")
+        checkout = self.text.index("- name: Check out exact trusted Torturer revision")
+        block = self.text[validate:checkout]
+        self.assertIn("umask 077", block)
+        self.assertIn('mkdir -p "$LEASE_DIR"', block)
+        self.assertIn('chmod 700 "$LEASE_DIR"', block)
+
     def test_runner_local_lease_path_is_initialized_from_runner_environment(self) -> None:
         self.assertNotIn("${{ runner.temp }}", self.text)
         self.assertRegex(self.text, r"(?m)^      - name: Establish runner-local paths$")
