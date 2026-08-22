@@ -26,6 +26,7 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         self.assertNotRegex(self.text, r"(?m)^  (?:push|pull_request|pull_request_target|schedule):")
         self.assertRegex(self.text, r"(?m)^    timeout-minutes: 40$")
         self.assertRegex(self.text, r"(?m)^    environment: render-functional$")
+        self.assertIn("run-name: Trusted Render lease ${{ inputs.lease_run_id }} ${{ inputs.platform }}", self.text)
 
     def test_lease_directory_is_owner_only_before_provider_files_are_created(self) -> None:
         validate = self.text.index("- name: Validate trusted lease boundary")
@@ -77,6 +78,11 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         self.assertIn('workflow_run.get("id") != wanted_run', self.text)
         self.assertIn('files != {"request.json", "recipient.crt"}', self.text)
         self.assertIn('"kind": "dobbyvpn.render-lease-request"', self.text)
+        self.assertIn("torturer_checks.hosted.artifacts", self.text)
+        self.assertIn("--expect-file request.json", self.text)
+        self.assertIn("--expect-file recipient.crt", self.text)
+        self.assertNotIn("unzip -o", self.text)
+        self.assertIn("--timeout-seconds 300", self.text)
 
     def test_plaintext_never_enters_an_uploaded_artifact(self) -> None:
         upload = self.text.index("- name: Upload encrypted profile and safe lease record")

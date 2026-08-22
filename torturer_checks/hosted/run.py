@@ -20,8 +20,8 @@ from .factory import adapter_for_platform
 
 ROOT = Path(__file__).resolve().parents[2]
 _SHA40 = set("0123456789abcdef")
-_MAX_LANE_SECONDS = 30 * 60
-_RESET_TIMEOUT_SECONDS = 20
+_MAX_LANE_SECONDS = 1200
+_RESET_TIMEOUT_SECONDS = 5
 
 
 def _full_sha(value: str, name: str) -> str:
@@ -67,6 +67,22 @@ def _select_scenarios(scenario_ids: list[str] | None) -> tuple:
     if worst_case_seconds > _MAX_LANE_SECONDS:
         raise ValueError("selected scenarios exceed the 30-minute lane bound")
     return scenarios
+
+
+def _partition_applicable(scenarios, capabilities) -> tuple[tuple, list[dict[str, object]]]:
+    available = frozenset(capabilities)
+    applicable = []
+    unsupported = []
+    for scenario in scenarios:
+        missing = sorted(
+            capability.value
+            for capability in scenario.required_capabilities - available
+        )
+        if missing:
+            unsupported.append({"scenario_id": scenario.id, "missing_capabilities": missing})
+        else:
+            applicable.append(scenario)
+    return tuple(applicable), unsupported
 
 
 def _run_scenarios(engine, scenarios, adapter, provenance) -> tuple[list[dict[str, object]], list[str], int]:
@@ -157,7 +173,16 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(catalog_document(), sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         engine = FunctionalEngine(scenario_set_digest=scenario_set_digest)
-        scenarios = _select_scenarios(args.scenario_ids)
+        selected_scenarios = _select_scenarios(args.scenario_ids)
+        if args.scenario_ids:
+            scenarios = selected_scenarios
+            unsupported_scenarios: list[dict[str, object]] = []
+        else:
+            scenarios, unsupported_scenarios = _partition_applicable(
+                selected_scenarios, adapter.capabilities
+            )
+        if not scenarios:
+            raise ValueError("hosted adapter has no applicable canonical scenarios")
         results, reset_failures, reset_count = _run_scenarios(
             engine, scenarios, adapter, provenance
         )
@@ -172,7 +197,9 @@ def main(argv: list[str] | None = None) -> int:
             "adapter_id": adapter.adapter_id,
             "adapter_version": adapter.adapter_version,
             "scenario_set_digest": engine.scenario_set_digest,
+            "selected_scenario_ids": [scenario.id for scenario in selected_scenarios],
             "scenario_ids": [scenario.id for scenario in scenarios],
+            "unsupported_scenarios": unsupported_scenarios,
             "reset_count": reset_count,
             "reset_failures": len(reset_failures),
             "results": results,
@@ -183,7 +210,8 @@ def main(argv: list[str] | None = None) -> int:
         unavailable = [item for item in results if item["outcome"] == "unavailable"]
         print(
             f"hosted-functional platform={args.platform} scenarios={len(results)} "
-            f"failed={len(failed)} unavailable={len(unavailable)} reset_failures={len(reset_failures)}"
+            f"unsupported={len(unsupported_scenarios)} failed={len(failed)} "
+            f"unavailable={len(unavailable)} reset_failures={len(reset_failures)}"
         )
         return 0 if not failed and not unavailable and not reset_failures else 2
     except Exception as error:

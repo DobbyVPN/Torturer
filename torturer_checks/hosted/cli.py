@@ -198,8 +198,10 @@ class HostedCLIAdapter:
         if operation == "configure":
             return {"configured": self._configure(timeout)}
         if operation == "connect":
-            self._capture_baseline(timeout)
-            self._command(("connect-profile", str(self.profile), "0"), timeout, "CONNECT_FAILED")
+            deadline = time.monotonic() + timeout
+            self._capture_baseline(self._remaining(deadline, "CONNECT_TIMEOUT"))
+            self._command(("connect-profile", str(self.profile), "0"),
+                          self._remaining(deadline, "CONNECT_TIMEOUT"), "CONNECT_FAILED")
             return {}
         if operation == "observe_tunnel":
             key = "second_tunnel_interface" if step.id == "second-tunnel" else "tunnel_interface"
@@ -221,6 +223,13 @@ class HostedCLIAdapter:
         if operation == "inspect_cleanup":
             return {"cleanup_verified": self._cleanup_verified(timeout)}
         raise ScenarioExecutionError("UNSUPPORTED_OPERATION")
+
+    @staticmethod
+    def _remaining(deadline: float, failure: str) -> float:
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise ScenarioExecutionError(failure)
+        return value
 
     def reset(self, timeout_seconds: float = 30.0) -> None:
         """Stop a scenario's session within one total timeout window."""
@@ -292,8 +301,9 @@ class HostedCLIAdapter:
     def _throughput(self, timeout: float) -> dict[str, object]:
         if self.download_url is None or self.upload_url is None:
             raise ScenarioExecutionError("THROUGHPUT_UNAVAILABLE")
-        download = self._curl_metric(self.download_url, timeout, upload=False)
-        upload = self._curl_metric(self.upload_url, timeout, upload=True)
+        deadline = time.monotonic() + timeout
+        download = self._curl_metric(self.download_url, self._remaining(deadline, "THROUGHPUT_TIMEOUT"), upload=False)
+        upload = self._curl_metric(self.upload_url, self._remaining(deadline, "THROUGHPUT_TIMEOUT"), upload=True)
         return {
             "latency_ms": download[0],
             "download_mbps": download[1],

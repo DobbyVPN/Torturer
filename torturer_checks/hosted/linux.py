@@ -227,9 +227,11 @@ class LinuxHostedAdapter(HostedCLIAdapter):
     def _process_loss(self, timeout: float) -> dict[str, object]:
         if self.service is None:
             raise CapabilityUnavailable()
-        self.service.restart_after_loss(timeout)
-        self._command(("connect-profile", str(self.profile), "0"), timeout, "PROCESS_LOSS_CONNECT_FAILED")
-        if not self._connected(timeout):
+        deadline = time.monotonic() + timeout
+        self.service.restart_after_loss(self._remaining(deadline, "PROCESS_LOSS_TIMEOUT"))
+        self._command(("connect-profile", str(self.profile), "0"),
+                      self._remaining(deadline, "PROCESS_LOSS_TIMEOUT"), "PROCESS_LOSS_CONNECT_FAILED")
+        if not self._connected(self._remaining(deadline, "PROCESS_LOSS_TIMEOUT")):
             raise ScenarioExecutionError("PROCESS_LOSS_NOT_RECOVERED")
         return {"process_loss_verified": True}
 

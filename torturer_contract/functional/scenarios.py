@@ -83,15 +83,15 @@ class ScenarioDefinition:
         }
 
 
-def _step(id: str, operation: str, timeout: int = 30) -> ScenarioStep:
+def _step(id: str, operation: str, timeout: int = 8) -> ScenarioStep:
     return ScenarioStep(id=id, operation=operation, timeout_seconds=timeout)
 
 
 _COMMON_CONNECT = (
     _step("configure", "configure"),
-    _step("connect", "connect", 60),
+    _step("connect", "connect", 40),
     _step("tunnel", "observe_tunnel"),
-    _step("routing", "observe_routing_identity"),
+    _step("routing", "observe_routing_identity", 15),
 )
 
 
@@ -102,7 +102,7 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
         steps=(_step("configure", "configure"),),
         required_capabilities=frozenset({Capability.CONFIGURE}),
         assertion_ids=("configure.accepted",),
-        max_duration_seconds=120,
+        max_duration_seconds=8,
     ),
     ScenarioDefinition(
         id="functional.connect-route-identity",
@@ -121,17 +121,17 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
             "tunnel.established",
             "routing.identity_changed",
         ),
-        max_duration_seconds=240,
+        max_duration_seconds=71,
     ),
     ScenarioDefinition(
         id="functional.core-connection",
         version=1,
         steps=_COMMON_CONNECT
         + (
-            _step("stability", "measure_stability", 180),
-            _step("throughput", "measure_throughput", 180),
-            _step("disconnect", "disconnect"),
-            _step("cleanup", "inspect_cleanup"),
+            _step("stability", "measure_stability", 15),
+            _step("throughput", "measure_throughput", 30),
+            _step("disconnect", "disconnect", 10),
+            _step("cleanup", "inspect_cleanup", 15),
         ),
         required_capabilities=frozenset(
             {
@@ -153,15 +153,15 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
             "disconnect.clean",
             "cleanup.restored",
         ),
-        max_duration_seconds=600,
+        max_duration_seconds=141,
     ),
     ScenarioDefinition(
         id="functional.stability-throughput",
         version=1,
         steps=_COMMON_CONNECT
         + (
-            _step("stability", "measure_stability", 180),
-            _step("throughput", "measure_throughput", 180),
+            _step("stability", "measure_stability", 15),
+            _step("throughput", "measure_throughput", 30),
         ),
         required_capabilities=frozenset(
             {
@@ -179,15 +179,15 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
             "traffic.stable",
             "traffic.metrics_positive",
         ),
-        max_duration_seconds=600,
+        max_duration_seconds=116,
     ),
     ScenarioDefinition(
         id="functional.disconnect-cleanup",
         version=1,
         steps=_COMMON_CONNECT
         + (
-            _step("disconnect", "disconnect"),
-            _step("cleanup", "inspect_cleanup"),
+            _step("disconnect", "disconnect", 10),
+            _step("cleanup", "inspect_cleanup", 15),
         ),
         required_capabilities=frozenset(
             {
@@ -206,19 +206,19 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
             "disconnect.clean",
             "cleanup.restored",
         ),
-        max_duration_seconds=360,
+        max_duration_seconds=96,
     ),
     ScenarioDefinition(
         id="functional.start-stop-start",
         version=1,
         steps=_COMMON_CONNECT
         + (
-            _step("disconnect", "disconnect"),
-            _step("reconnect", "reconnect", 90),
-            _step("second-tunnel", "observe_tunnel"),
-            _step("second-routing", "observe_routing_identity"),
-            _step("final-disconnect", "disconnect"),
-            _step("cleanup", "inspect_cleanup"),
+            _step("disconnect", "disconnect", 10),
+            _step("reconnect", "reconnect", 30),
+            _step("second-tunnel", "observe_tunnel", 8),
+            _step("second-routing", "observe_routing_identity", 15),
+            _step("final-disconnect", "disconnect", 10),
+            _step("cleanup", "inspect_cleanup", 15),
         ),
         required_capabilities=frozenset(
             {
@@ -243,15 +243,15 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
             "disconnect.final_clean",
             "cleanup.restored",
         ),
-        max_duration_seconds=480,
+        max_duration_seconds=159,
     ),
     ScenarioDefinition(
         id="functional.network-transition",
         version=1,
         steps=_COMMON_CONNECT
         + (
-            _step("network", "network_transition", 120),
-            _step("cleanup", "inspect_cleanup"),
+            _step("network", "network_transition", 30),
+            _step("cleanup", "inspect_cleanup", 15),
         ),
         required_capabilities=frozenset(
             {
@@ -270,15 +270,15 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
             "network.transition",
             "cleanup.restored",
         ),
-        max_duration_seconds=480,
+        max_duration_seconds=116,
     ),
     ScenarioDefinition(
         id="functional.sleep-wake",
         version=1,
         steps=_COMMON_CONNECT
         + (
-            _step("sleep_wake", "sleep_wake", 180),
-            _step("cleanup", "inspect_cleanup"),
+            _step("sleep_wake", "sleep_wake", 30),
+            _step("cleanup", "inspect_cleanup", 15),
         ),
         required_capabilities=frozenset(
             {
@@ -297,15 +297,15 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
             "sleep_wake.transition",
             "cleanup.restored",
         ),
-        max_duration_seconds=540,
+        max_duration_seconds=116,
     ),
     ScenarioDefinition(
         id="functional.product-process-loss",
         version=1,
         steps=_COMMON_CONNECT
         + (
-            _step("process_loss", "process_loss", 120),
-            _step("cleanup", "inspect_cleanup"),
+            _step("process_loss", "process_loss", 45),
+            _step("cleanup", "inspect_cleanup", 15),
         ),
         required_capabilities=frozenset(
             {
@@ -324,16 +324,16 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
             "process_loss.recovered",
             "cleanup.restored",
         ),
-        max_duration_seconds=480,
+        max_duration_seconds=131,
     ),
     ScenarioDefinition(
         id="functional.bounded-endurance",
         version=1,
         steps=_COMMON_CONNECT
         + (
-            _step("endurance", "measure_endurance", 900),
-            _step("disconnect", "disconnect"),
-            _step("cleanup", "inspect_cleanup"),
+            _step("endurance", "measure_endurance", 60),
+            _step("disconnect", "disconnect", 10),
+            _step("cleanup", "inspect_cleanup", 15),
         ),
         required_capabilities=frozenset(
             {
@@ -355,7 +355,7 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
             "disconnect.clean",
             "cleanup.restored",
         ),
-        max_duration_seconds=1500,
+        max_duration_seconds=156,
     ),
 )
 

@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "functional.yml"
 EXPECTED_ACTIONS = {
     "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+    "actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131",
     "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f",
 }
 
@@ -21,37 +22,43 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         cls.text = WORKFLOW.read_text(encoding="utf-8")
         cls.uses = re.findall(r"^\s*uses:\s*([^\s#]+)", cls.text, flags=re.MULTILINE)
 
-    def test_is_manual_only_and_bounded_to_thirty_minutes(self) -> None:
+    def test_is_manual_only_and_has_a_hard_thirty_minute_deadline(self) -> None:
         self.assertRegex(self.text, r"(?m)^on:\n  workflow_dispatch:")
         self.assertNotRegex(self.text, r"(?m)^  (?:push|pull_request|pull_request_target|schedule):")
-        self.assertRegex(self.text, r"(?m)^    timeout-minutes: 30$")
-        self.assertIn("timeout --foreground --signal=TERM --kill-after=30s 1120s", self.text)
+        self.assertIn("deadline = int(started.timestamp()) + 30 * 60", self.text)
+        self.assertIn("RUN_DEADLINE_EPOCH", self.text)
+        self.assertIn("RUN_DEADLINE_EPOCH - $(date +%s) - 120", self.text)
+        self.assertIn('timeout --foreground --signal=TERM --kill-after=30s "${remaining}s"', self.text)
         self.assertIn("PLATFORM: linux", self.text)
 
-    def test_linux_lane_selects_only_the_feasible_canonical_subset(self) -> None:
-        expected = (
-            "functional.core-connection",
-            "functional.start-stop-start",
-        )
-        for scenario_id in expected:
-            self.assertIn(f"--scenario-id {scenario_id}", self.text)
-        self.assertNotIn("--scenario-id functional.bounded-endurance", self.text)
-        self.assertNotIn("--scenario-id functional.network-transition", self.text)
-        self.assertNotIn("--scenario-id functional.sleep-wake", self.text)
-        self.assertNotIn("--scenario-id functional.product-process-loss", self.text)
+    def test_linux_lane_runs_every_applicable_canonical_scenario(self) -> None:
+        start = self.text.index("- name: Run canonical Linux functional scenarios")
+        end = self.text.index("- name: Stop candidate service", start)
+        block = self.text[start:end]
+        self.assertNotIn("--scenario-id", block)
+        for option in (
+            "--download-url", "--upload-url", "--service-pid",
+            "--service-binary", "--service-socket", "--service-library-path",
+            "--service-pid-file",
+        ):
+            self.assertIn(option, block)
+        self.assertNotIn("--network-interface", block)
 
     def test_runner_local_paths_are_initialized_from_runner_environment(self) -> None:
-        self.assertNotIn("${{ runner.temp }}", self.text)
-        self.assertRegex(self.text, r"(?m)^      - name: Establish runner-local paths$")
-        self.assertIn("printf 'HANDOFF_DIR=%s\\n' \"$RUNNER_TEMP/dobbyvpn-render-handoff\" >> \"$GITHUB_ENV\"", self.text)
-        self.assertIn("printf 'SERVICE_DIR=%s\\n' \"$RUNNER_TEMP/dobbyvpn-service\" >> \"$GITHUB_ENV\"", self.text)
-        self.assertIn("printf 'DOBBYVPN_CONTROL_SOCKET=%s\\n' \"$control_socket\" >> \"$GITHUB_ENV\"", self.text)
-        self.assertIn("printf 'RESULT_PATH=%s\\n' \"$RUNNER_TEMP/dobbyvpn-render-handoff/functional-result.json\" >> \"$GITHUB_ENV\"", self.text)
+        client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
+        self.assertNotIn("${{ runner.temp }}", client)
+        self.assertRegex(client, r"(?m)^      - name: Establish runner-local paths$")
+        self.assertIn("printf 'HANDOFF_DIR=%s\\n' \"$RUNNER_TEMP/dobbyvpn-render-handoff\" >> \"$GITHUB_ENV\"", client)
+        self.assertIn("printf 'SERVICE_DIR=%s\\n' \"$RUNNER_TEMP/dobbyvpn-service\" >> \"$GITHUB_ENV\"", client)
+        self.assertIn("printf 'DOBBYVPN_CONTROL_SOCKET=%s\\n' \"$control_socket\" >> \"$GITHUB_ENV\"", client)
+        self.assertIn("printf 'RESULT_PATH=%s\\n' \"$RUNNER_TEMP/dobbyvpn-render-handoff/functional-result.json\" >> \"$GITHUB_ENV\"", client)
 
     def test_permissions_and_external_actions_are_minimal_and_immutable(self) -> None:
         self.assertRegex(self.text, r"(?m)^permissions:\n  contents: read$")
+        build = self.text[self.text.index("  build:"):self.text.index("\n\n  client:")]
         client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
         controller = self.text[self.text.index("\n\n  controller:"):]
+        self.assertRegex(build, r"(?m)^    permissions:\n      contents: read$")
         self.assertRegex(client, r"(?m)^    permissions:\n      contents: read\n      actions: read$")
         self.assertRegex(controller, r"(?m)^    permissions:\n      contents: read\n      actions: write$")
         self.assertEqual(set(self.uses), EXPECTED_ACTIONS)
@@ -59,26 +66,30 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
             self.assertRegex(action, r"^[^@\s]+@[0-9a-f]{40}$")
         self.assertNotIn("actions/cache", self.text)
 
-    def test_candidate_side_is_secretless(self) -> None:
-        self.assertNotIn("RENDER_API_TOKEN", self.text)
-        self.assertNotIn("secrets.", self.text)
-        self.assertNotIn("environment:", self.text)
-        self.assertIn("persist-credentials: false", self.text)
-        self.assertIn("submodules: recursive", self.text)
+    def test_untrusted_build_is_secretless_and_ends_at_an_allow_listed_artifact(self) -> None:
+        build = self.text[self.text.index("  build:"):self.text.index("\n\n  client:")]
+        self.assertNotIn("GH_TOKEN", build)
+        self.assertNotIn("github.token", build)
+        self.assertNotIn("secrets.", build)
+        self.assertNotIn("environment:", build)
+        self.assertNotIn("RENDER_", build)
+        self.assertIn("submodules: recursive", build)
+        self.assertIn("Stage an allow-listed candidate runtime closure", build)
+        self.assertIn("Upload isolated candidate runtime", build)
 
-    def test_candidate_job_has_no_controller_token_and_controller_isolated(self) -> None:
-        client = self.text[: self.text.index("\n\n  controller:")]
+    def test_tokens_end_before_any_candidate_execution(self) -> None:
+        client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
+        runtime = client[client.index("- name: Start the candidate Linux service"):]
+        self.assertIn("GH_TOKEN", client[:client.index("- name: Start the candidate Linux service")])
+        self.assertNotIn("GH_TOKEN", runtime)
+        self.assertNotIn("github.token", runtime)
         controller = self.text[self.text.index("\n\n  controller:"):]
-        self.assertNotIn("actions: write", client)
-        self.assertNotIn("GH_TOKEN", client)
-        self.assertNotIn("github.token", client)
         self.assertIn("actions: write", controller)
         self.assertNotIn("actions/checkout", controller)
-        self.assertNotIn("candidate", controller.lower())
         self.assertNotIn("desktop_build.py", controller)
         self.assertIn("Dispatch exactly one trusted Render lease", controller)
 
-    def test_only_ciphertext_crosses_the_job_boundary(self) -> None:
+    def test_only_public_request_and_ciphertext_cross_job_boundaries(self) -> None:
         request = self.text.index("- name: Upload public certificate and opaque request")
         request_end = self.text.index("\n\n      - name:", request)
         request_block = self.text[request:request_end]
@@ -86,7 +97,15 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("request.json", request_block)
         self.assertNotIn("recipient.key", request_block)
         self.assertNotIn("profile.toml", request_block)
-        self.assertIn("PROFILE_HANDOFF_NOT_IMPLEMENTED", self.text)
+        self.assertNotIn("PROFILE_HANDOFF_NOT_IMPLEMENTED", self.text)
+        self.assertIn("torturer_checks.hosted.artifacts", self.text)
+        self.assertIn("--expect-file lease.json", self.text)
+        self.assertIn("--expect-file profile.cms", self.text)
+        self.assertIn('--run-id "$lease_workflow_run_id"', self.text)
+        self.assertNotIn('--run-id "$GITHUB_RUN_ID"', self.text)
+        self.assertIn('"path": ".github/workflows/server-lease.yml"', self.text)
+        self.assertIn('"display_title": sys.argv[3]', self.text)
+        self.assertIn('"head_sha": os.environ["TORTURER_SHA"]', self.text)
         self.assertIn("--raw-log-dir", self.text)
         self.assertIn("--server-image-digest", self.text)
         self.assertIn("render-complete-${{ env.LEASE_RUN_ID }}-linux", self.text)
