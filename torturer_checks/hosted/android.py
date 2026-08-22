@@ -1,17 +1,18 @@
-"""Fail-closed Android adapter until a product-facing functional seam exists."""
+"""Fail-closed Android adapter until a test-facing profile seam exists."""
 
 from torturer_contract.functional.engine import CapabilityUnavailable
 from torturer_contract.functional.scenarios import ScenarioStep
 
 
 class AndroidHostedAdapter:
-    """Expose no canonical VPN capability without a profile/session API.
+    """Expose no canonical VPN capability without a profile-session driver.
 
-    The Android emulator instrumentation suite remains responsible for the
-    product-owned consent/TUN lifecycle. It does not provide the CLI contract
-    required to claim canonical profile, external-identity, or throughput
-    scenarios, so the shared engine must emit unavailable for this entry
-    point rather than executing shell-shaped guesses.
+    The product has an internal AndroidSessionController and the emulator
+    instrumentation suite proves consent/TUN lifecycle. Torturer still has no
+    stable test-facing entrypoint that supplies a profile and returns canonical
+    external-identity or throughput observations, so this adapter fails closed.
+    The shared engine must emit unavailable rather than executing shell-shaped
+    guesses.
     """
 
     adapter_id = "hosted-android-app"

@@ -252,8 +252,11 @@ not accepted. Throughput/endurance additionally require explicit fixed HTTPS
 measurement endpoints and are not silently inferred from the Outline TCP
 service. Windows and macOS still need their trusted workflow to
 install/start the platform service and hand off the profile/control
-credentials. Android's existing candidate instrumentation proves consent,
+credentials. Android's product has an internal `AndroidSessionController`,
+but the current Torturer entrypoint only invokes the candidate's profileless
+`DobbyVpnServiceInstrumentationTest`. That instrumentation proves consent,
 production TUN creation, VPN route state, and documentation-range packet
-routing, but still lacks a candidate-owned automation API that accepts a test
-profile and exposes real external identity/throughput observations; it is not
-converted into a false hosted profile result.
+routing; it does not accept the Render profile or emit real external
+identity/throughput observations. A stable candidate-owned test-facing driver
+(intent, instrumentation command, or equivalent) is still required; Torturer
+does not convert the internal controller into a false hosted profile result.

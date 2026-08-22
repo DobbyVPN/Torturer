@@ -8,6 +8,8 @@ import unittest
 from torturer_checks.hosted.android import AndroidHostedAdapter
 from torturer_checks.hosted.cli import CommandResult, HostedAdapterError, HostedCLIAdapter, SubprocessRunner
 from torturer_checks.hosted.linux import LinuxHostedAdapter
+from torturer_checks.hosted.macos import MacOSHostedAdapter
+from torturer_checks.hosted.windows import WindowsHostedAdapter
 from torturer_checks.hosted.run import _select_scenarios, build_parser
 from torturer_contract.functional.capabilities import Capability
 from torturer_contract.functional.engine import FunctionalEngine
@@ -73,6 +75,18 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertTrue(any(call[1] == "connect-profile" for call in self.runner.calls))
         self.adapter.reset()
         self.assertFalse(self.runner.connected)
+
+    def test_windows_and_macos_use_the_same_canonical_cli_scenarios(self) -> None:
+        scenario = get_scenario("functional.connect-route-identity")
+        for adapter_class, expected_id in (
+            (WindowsHostedAdapter, "hosted-windows-cli"),
+            (MacOSHostedAdapter, "hosted-macos-cli"),
+        ):
+            runner = FakeRunner()
+            adapter = adapter_class(cli=self.cli, profile=self.profile, runner=runner)
+            self.assertEqual(adapter.adapter_id, expected_id)
+            result = FunctionalEngine("f" * 64).run(scenario, adapter, _provenance(adapter))
+            self.assertEqual(result.outcome, "passed")
 
     def test_reconnect_reuses_public_cli_and_leaves_clean_baseline(self) -> None:
         self.assertIn(Capability.RECONNECT, self.adapter.capabilities)
