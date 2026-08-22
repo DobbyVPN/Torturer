@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: DobbyVPN/Torturer
-          ref: c1899f059d6a9f8c26aecf1dfb8e79603c7b27d1
+          ref: 8e370e7308d14af5923c9a329e920f060a6ee87d
           path: torturer
           persist-credentials: false
 
@@ -135,7 +135,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: DobbyVPN/Torturer
-          ref: c1899f059d6a9f8c26aecf1dfb8e79603c7b27d1
+          ref: 8e370e7308d14af5923c9a329e920f060a6ee87d
           path: torturer
           persist-credentials: false
 
@@ -195,7 +195,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: DobbyVPN/Torturer
-          ref: c1899f059d6a9f8c26aecf1dfb8e79603c7b27d1
+          ref: 8e370e7308d14af5923c9a329e920f060a6ee87d
           path: torturer
           persist-credentials: false
 
@@ -268,7 +268,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: DobbyVPN/Torturer
-          ref: c1899f059d6a9f8c26aecf1dfb8e79603c7b27d1
+          ref: 8e370e7308d14af5923c9a329e920f060a6ee87d
           path: torturer
           persist-credentials: false
 
@@ -341,7 +341,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: DobbyVPN/Torturer
-          ref: c1899f059d6a9f8c26aecf1dfb8e79603c7b27d1
+          ref: 8e370e7308d14af5923c9a329e920f060a6ee87d
           path: torturer
           persist-credentials: false
 
@@ -495,7 +495,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: DobbyVPN/Torturer
-          ref: c1899f059d6a9f8c26aecf1dfb8e79603c7b27d1
+          ref: 8e370e7308d14af5923c9a329e920f060a6ee87d
           path: torturer
           persist-credentials: false
 
