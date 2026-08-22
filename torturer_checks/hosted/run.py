@@ -21,7 +21,7 @@ from .factory import adapter_for_platform
 ROOT = Path(__file__).resolve().parents[2]
 _SHA40 = set("0123456789abcdef")
 _MAX_LANE_SECONDS = 30 * 60
-_RESET_TIMEOUT_SECONDS = 30
+_RESET_TIMEOUT_SECONDS = 20
 
 
 def _full_sha(value: str, name: str) -> str:
@@ -63,10 +63,27 @@ def _select_scenarios(scenario_ids: list[str] | None) -> tuple:
     if len({scenario.id for scenario in scenarios}) != len(scenarios):
         raise ValueError("scenario-id values must be unique")
     worst_case_seconds = sum(scenario.max_duration_seconds for scenario in scenarios)
-    worst_case_seconds += max(0, len(scenarios) - 1) * _RESET_TIMEOUT_SECONDS
+    worst_case_seconds += len(scenarios) * _RESET_TIMEOUT_SECONDS
     if worst_case_seconds > _MAX_LANE_SECONDS:
         raise ValueError("selected scenarios exceed the 30-minute lane bound")
     return scenarios
+
+
+def _run_scenarios(engine, scenarios, adapter, provenance) -> tuple[list[dict[str, object]], list[str], int]:
+    results: list[dict[str, object]] = []
+    reset_failures: list[str] = []
+    reset_count = 0
+    for scenario in scenarios:
+        result = engine.run(scenario, adapter, provenance)
+        payload = result.to_dict()
+        validate_result_payload(payload)
+        results.append(payload)
+        reset_count += 1
+        try:
+            adapter.reset(timeout_seconds=_RESET_TIMEOUT_SECONDS)
+        except Exception as error:
+            reset_failures.append(type(error).__name__)
+    return results, reset_failures, reset_count
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
@@ -140,18 +157,10 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(catalog_document(), sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         engine = FunctionalEngine(scenario_set_digest=scenario_set_digest)
-        results: list[dict[str, object]] = []
-        reset_failures: list[str] = []
         scenarios = _select_scenarios(args.scenario_ids)
-        for scenario in scenarios:
-            result = engine.run(scenario, adapter, provenance)
-            payload = result.to_dict()
-            validate_result_payload(payload)
-            results.append(payload)
-            try:
-                adapter.reset()
-            except Exception as error:
-                reset_failures.append(type(error).__name__)
+        results, reset_failures, reset_count = _run_scenarios(
+            engine, scenarios, adapter, provenance
+        )
         document = {
             "schema": 1,
             "kind": "dobbyvpn.functional.hosted-run",
@@ -164,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
             "adapter_version": adapter.adapter_version,
             "scenario_set_digest": engine.scenario_set_digest,
             "scenario_ids": [scenario.id for scenario in scenarios],
+            "reset_count": reset_count,
             "reset_failures": len(reset_failures),
             "results": results,
             "safe_command_evidence": list(getattr(adapter.runner, "safe_evidence", lambda: ())()),

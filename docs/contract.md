@@ -241,9 +241,12 @@ absent. A hosted Linux result is not a claim that sleep/wake is covered; that
 operation remains unavailable on a runner that cannot suspend and resume itself.
 The current Linux workflow selects the five feasible profile/CLI scenarios
 (`configure`, `connect-route-identity`, `disconnect-cleanup`,
-`start-stop-start`, and `failed-repeated-reconnect`). Their declared worst-case
-execution plus four bounded reset windows is exactly 1,800 seconds; the hosted
-runner rejects any selected set that exceeds this 30-minute budget.
+`start-stop-start`, and `failed-repeated-reconnect`). The runner performs one
+independently bounded 20-second reset after every selected scenario, records the
+actual reset count, and rejects any selected set whose declared worst-case
+execution plus all reset windows exceeds 1,800 seconds. This lane is 1,780
+seconds by declaration, leaving 20 seconds inside the 30-minute budget; the
+workflow also wraps the functional command in the same 1,780-second hard bound.
 The optional network-transition seam currently interrupts the named whole
 runner interface, so it is not enabled until endpoint-only interruption or a
 runner-recovery proof is wired. The process-loss seam requires the actual Go
