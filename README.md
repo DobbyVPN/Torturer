@@ -58,9 +58,11 @@ reported as `unavailable`; they are never inferred as passes. The protected
 `python -m torturer_provider.lease_cli` boundary creates/cleans one tagged
 Render lease and writes the profile only to owner-only storage for immediate
 encryption. The trusted image request passes only `-config=/etc/secrets/config.yml`
-to the image's existing `/outline-ss-server` ENTRYPOINT. No hosted functional
-workflow is enabled until the immutable server image, trusted workflow, and
-Render account eligibility are proven.
+to the image's existing `/outline-ss-server` ENTRYPOINT. A manual, Linux-only
+trusted workflow now wires that lease boundary to the canonical hosted engine;
+it fails closed when the configured immutable image digest or Render eligibility
+is absent. Windows, macOS, and Android hosted functional lanes remain later
+adapter phases, not silently claimed coverage.
 
 ## Security promises
 

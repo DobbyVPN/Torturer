@@ -1,0 +1,320 @@
+name: Trusted Render lease
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Trusted lease operation.
+        required: true
+        type: choice
+        options:
+          - acquire
+      origin_run_id:
+        description: Numeric ID of the trusted functional workflow run.
+        required: true
+        type: string
+      lease_run_id:
+        description: Exact 32-hex opaque lease correlation ID.
+        required: true
+        type: string
+      platform:
+        description: Hosted platform requesting one lease.
+        required: true
+        type: choice
+        options:
+          - linux
+      request_artifact_name:
+        description: Opaque request artifact name from the origin run.
+        required: true
+        type: string
+      trusted_ref:
+        description: Protected branch that dispatched this lease.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: trusted-render-lease-${{ inputs.lease_run_id }}
+  cancel-in-progress: false
+
+jobs:
+  lease:
+    name: Trusted Render lease
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    environment: render-functional
+    env:
+      MODE: ${{ inputs.mode }}
+      ORIGIN_RUN_ID: ${{ inputs.origin_run_id }}
+      LEASE_RUN_ID: ${{ inputs.lease_run_id }}
+      PLATFORM: ${{ inputs.platform }}
+      REQUEST_ARTIFACT_NAME: ${{ inputs.request_artifact_name }}
+      TRUSTED_REF: ${{ inputs.trusted_ref }}
+      RENDER_OWNER_ID: ${{ vars.RENDER_OWNER_ID }}
+      RENDER_IMAGE_OWNER_ID: ${{ vars.RENDER_IMAGE_OWNER_ID }}
+      RENDER_IMAGE_PATH: ${{ vars.RENDER_IMAGE_PATH }}
+      RENDER_IMAGE_DIGEST: ${{ vars.RENDER_IMAGE_DIGEST }}
+      RENDER_REGION: ${{ vars.RENDER_REGION }}
+      LEASE_DIR: ${{ runner.temp }}/dobbyvpn-render-lease
+      TORTURER_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Validate trusted lease boundary
+        run: |
+          set -euo pipefail
+          mkdir -p "$LEASE_DIR"
+          test "$MODE" = acquire
+          test "$GITHUB_REF_NAME" = "$TRUSTED_REF"
+          test "$GITHUB_REF_NAME" = "transition/functional-render" || test "$GITHUB_REF_NAME" = "main"
+          python3 - <<'PY'
+          import os
+          import re
+
+          if os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
+              raise SystemExit("lease must be manually dispatched")
+          if os.environ.get("PLATFORM") != "linux":
+              raise SystemExit("only the implemented Linux adapter is enabled")
+          if not re.fullmatch(r"[0-9]+", os.environ["ORIGIN_RUN_ID"]):
+              raise SystemExit("origin_run_id is invalid")
+          if not re.fullmatch(r"[0-9a-f]{32}", os.environ["LEASE_RUN_ID"]):
+              raise SystemExit("lease_run_id is invalid")
+          if not re.fullmatch(r"render-request-[0-9a-f]{32}-linux", os.environ["REQUEST_ARTIFACT_NAME"]):
+              raise SystemExit("request_artifact_name is invalid")
+          digest = os.environ["RENDER_IMAGE_DIGEST"]
+          image_path = os.environ["RENDER_IMAGE_PATH"]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit("RENDER_IMAGE_DIGEST is not immutable")
+          if not image_path.endswith("@" + digest):
+              raise SystemExit("RENDER_IMAGE_PATH must end in the configured digest")
+          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{2,255}", image_path):
+              raise SystemExit("RENDER_IMAGE_PATH is invalid")
+          for name in ("RENDER_OWNER_ID", "RENDER_IMAGE_OWNER_ID"):
+              if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{1,99}", os.environ[name]):
+                  raise SystemExit(f"{name} is invalid")
+          if os.environ["RENDER_REGION"] not in {"frankfurt", "oregon", "ohio", "singapore", "virginia"}:
+              raise SystemExit("RENDER_REGION is unsupported")
+          print("trusted_lease_boundary=validated")
+          PY
+
+      - name: Check out exact trusted Torturer revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: DobbyVPN/Torturer
+          ref: ${{ github.sha }}
+          path: torturer
+          persist-credentials: false
+
+      - name: Verify trusted Torturer checkout
+        run: |
+          set -euo pipefail
+          test "$(git -C torturer rev-parse HEAD)" = "$TORTURER_SHA"
+          test -z "$(git -C torturer status --porcelain=v1 --untracked-files=all)"
+
+      - name: Verify origin workflow run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ORIGIN_RUN_ID}" \
+            | tee "$LEASE_DIR/origin-run.json"
+          python3 - "$LEASE_DIR/origin-run.json" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if value.get("id") != int(os.environ["ORIGIN_RUN_ID"]):
+              raise SystemExit("origin run identity mismatch")
+          if value.get("repository", {}).get("full_name") != os.environ["GITHUB_REPOSITORY"]:
+              raise SystemExit("origin run repository mismatch")
+          if value.get("event") != "workflow_dispatch":
+              raise SystemExit("origin run trigger is not trusted manual dispatch")
+          if value.get("head_branch") != os.environ["TRUSTED_REF"]:
+              raise SystemExit("origin run branch mismatch")
+          if value.get("path") != ".github/workflows/functional.yml":
+              raise SystemExit("origin run workflow mismatch")
+          print("origin_run=validated")
+          PY
+
+      - name: Download and validate opaque lease request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$LEASE_DIR/request"
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${REQUEST_ARTIFACT_NAME}" \
+            | tee "$LEASE_DIR/request/artifacts.json"
+          archive_url="$(python3 - "$LEASE_DIR/request/artifacts.json" "$ORIGIN_RUN_ID" "$REQUEST_ARTIFACT_NAME" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          wanted_run = int(sys.argv[2])
+          wanted_name = sys.argv[3]
+          for artifact in document.get("artifacts", []):
+              workflow_run = artifact.get("workflow_run") or {}
+              if artifact.get("name") != wanted_name or workflow_run.get("id") != wanted_run:
+                  continue
+              if artifact.get("expired") is True:
+                  continue
+              url = artifact.get("archive_download_url")
+              if isinstance(url, str) and url:
+                  print(url)
+                  break
+          PY
+          )"
+          test -n "$archive_url"
+          gh api "$archive_url" > "$LEASE_DIR/request/request.zip"
+          unzip -l "$LEASE_DIR/request/request.zip"
+          unzip -o "$LEASE_DIR/request/request.zip" -d "$LEASE_DIR/request/unpacked"
+          python3 - "$LEASE_DIR/request/unpacked" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          files = {path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()}
+          if files != {"request.json", "recipient.crt"}:
+              raise SystemExit(f"request artifact contains unexpected files: {sorted(files)}")
+          request = json.loads((root / "request.json").read_text(encoding="utf-8"))
+          expected = {
+              "schema": 1,
+              "kind": "dobbyvpn.render-lease-request",
+              "run_id": os.environ["LEASE_RUN_ID"],
+              "platform": "linux",
+              "image_digest": os.environ["RENDER_IMAGE_DIGEST"],
+          }
+          if request != expected:
+              raise SystemExit("lease request does not match trusted inputs")
+          cert = root / "recipient.crt"
+          if cert.is_symlink() or not cert.is_file() or cert.stat().st_size > 16 * 1024:
+              raise SystemExit("recipient certificate is invalid")
+          cert.chmod(0o600)
+          print("lease_request=validated")
+          PY
+
+      - name: Acquire one disposable Render service and profile
+        env:
+          RENDER_API_TOKEN: ${{ secrets.RENDER_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$LEASE_DIR"
+          test -n "$RENDER_API_TOKEN"
+          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_provider.lease_cli acquire \
+            --request "$LEASE_DIR/request/unpacked/request.json" \
+            --owner-id "$RENDER_OWNER_ID" \
+            --image-owner-id "$RENDER_IMAGE_OWNER_ID" \
+            --image-path "$RENDER_IMAGE_PATH" \
+            --expected-image-digest "$RENDER_IMAGE_DIGEST" \
+            --profile-output "$LEASE_DIR/profile.toml" \
+            --lease-output "$LEASE_DIR/lease.json" \
+            --journal "$LEASE_DIR/journal.json" \
+            --region "$RENDER_REGION" \
+            --timeout-seconds 600 \
+            --poll-seconds 5
+          test -f "$LEASE_DIR/profile.toml"
+          test -f "$LEASE_DIR/lease.json"
+          test -f "$LEASE_DIR/journal.json"
+
+      - name: Encrypt and publish the profile handoff
+        run: |
+          set -euo pipefail
+          umask 077
+          openssl cms -encrypt -binary -aes-256-gcm \
+            -in "$LEASE_DIR/profile.toml" \
+            -out "$LEASE_DIR/profile.cms" \
+            -outform DER \
+            "$LEASE_DIR/request/unpacked/recipient.crt"
+          test -s "$LEASE_DIR/profile.cms"
+          rm -f "$LEASE_DIR/profile.toml"
+
+      - name: Upload encrypted profile and safe lease record
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: render-lease-${{ inputs.lease_run_id }}-linux
+          path: |
+            ${{ env.LEASE_DIR }}/profile.cms
+            ${{ env.LEASE_DIR }}/lease.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Wait for opaque functional completion marker
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          marker_name="render-complete-${LEASE_RUN_ID}-linux"
+          marker_found=false
+          for attempt in $(seq 1 180); do
+            response="$LEASE_DIR/completion-${attempt}.json"
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${marker_name}" \
+              | tee "$response"
+            if python3 - "$response" "$ORIGIN_RUN_ID" "$marker_name" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          wanted_run = int(sys.argv[2])
+          wanted_name = sys.argv[3]
+          for artifact in document.get("artifacts", []):
+              if artifact.get("name") != wanted_name:
+                  continue
+              workflow_run = artifact.get("workflow_run") or {}
+              if workflow_run.get("id") != wanted_run or artifact.get("expired") is True:
+                  continue
+              print("completion_marker=found")
+              raise SystemExit(0)
+          raise SystemExit(1)
+          PY
+            then
+              marker_found=true
+              break
+            fi
+            sleep 10
+          done
+          if [ "$marker_found" != true ]; then
+            printf '%s\n' 'functional completion marker deadline expired' >&2
+            exit 1
+          fi
+
+      - name: Delete the exact Render service and verify absence
+        if: always()
+        env:
+          RENDER_API_TOKEN: ${{ secrets.RENDER_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -f "$LEASE_DIR/lease.json" ]; then
+            test -n "$RENDER_API_TOKEN"
+            PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_provider.lease_cli cleanup \
+              --lease "$LEASE_DIR/lease.json"
+          else
+            printf '%s\n' 'no issued lease record exists; acquisition failure owns cleanup'
+          fi
+
+      - name: Remove plaintext lease material
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -f "$LEASE_DIR/profile.toml" "$LEASE_DIR/request/unpacked/recipient.crt"
+
+      - name: Upload safe lease journal
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: render-lease-journal-${{ inputs.lease_run_id }}-linux
+          path: |
+            ${{ env.LEASE_DIR }}/lease.json
+            ${{ env.LEASE_DIR }}/journal.json
+          if-no-files-found: warn
+          retention-days: 1
