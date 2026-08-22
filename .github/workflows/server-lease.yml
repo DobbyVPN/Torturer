@@ -74,7 +74,9 @@ jobs:
       - name: Validate trusted lease boundary
         run: |
           set -euo pipefail
+          umask 077
           mkdir -p "$LEASE_DIR"
+          chmod 700 "$LEASE_DIR"
           test "$MODE" = acquire
           test "$GITHUB_REF_NAME" = "$TRUSTED_REF"
           test "$GITHUB_REF_NAME" = "transition/functional-render" || test "$GITHUB_REF_NAME" = "main"
