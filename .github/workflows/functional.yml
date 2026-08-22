@@ -437,16 +437,39 @@ jobs:
           mkdir -p "$SERVICE_DIR"
           control_socket="$SERVICE_DIR/control.sock"
           service_log="$SERVICE_DIR/service.raw.log"
-          sudo -n env \
-            DOBBYVPN_CONTROL_SOCKET="$control_socket" \
-            DOBBYVPN_CONTROL_PEER_UID="$(id -u)" \
-            LD_LIBRARY_PATH="$GITHUB_WORKSPACE/candidate" \
-            "$GITHUB_WORKSPACE/candidate/ubuntu_grpcvpnserver" \
-            > "$service_log" 2>&1 &
-          service_pid=$!
           expected_service="$GITHUB_WORKSPACE/candidate/ubuntu_grpcvpnserver"
           expected_exe="$(readlink -f "$expected_service")"
+          peer_uid="$(id -u)"
+          service_pid="$(
+            sudo -n sh -c '
+              set -eu
+              binary=$1
+              control_socket=$2
+              peer_uid=$3
+              library_path=$4
+              log_path=$5
+              umask 077
+              env \
+                DOBBYVPN_CONTROL_SOCKET="$control_socket" \
+                DOBBYVPN_CONTROL_PEER_UID="$peer_uid" \
+                LD_LIBRARY_PATH="$library_path" \
+                "$binary" > "$log_path" 2>&1 < /dev/null &
+              printf "%s\n" "$!"
+            ' dobbyvpn-service \
+              "$expected_service" \
+              "$control_socket" \
+              "$peer_uid" \
+              "$GITHUB_WORKSPACE/candidate" \
+              "$service_log"
+          )"
+          case "$service_pid" in
+            ""|0|*[!0-9]*) printf 'candidate service returned invalid pid=%s\n' "$service_pid" >&2; exit 1 ;;
+          esac
+          service_pid_file="$HANDOFF_DIR/service.pid"
+          printf '%s\n' "$service_pid" > "$service_pid_file"
+          chmod 600 "$service_pid_file"
           printf 'SERVICE_PID=%s\n' "$service_pid" >> "$GITHUB_ENV"
+          printf 'SERVICE_PID_FILE=%s\n' "$service_pid_file" >> "$GITHUB_ENV"
           printf 'SERVICE_SOCKET=%s\n' "$control_socket" >> "$GITHUB_ENV"
           printf 'DOBBYVPN_CONTROL_SOCKET=%s\n' "$control_socket" >> "$GITHUB_ENV"
           printf 'SERVICE_LOG=%s\n' "$service_log" >> "$GITHUB_ENV"
@@ -454,15 +477,21 @@ jobs:
           for attempt in $(seq 1 60); do
             if ! sudo -n kill -0 "$service_pid"; then
               printf '%s\n' 'candidate service exited before readiness' >&2
-              cat "$service_log"
+              sudo -n cat "$service_log"
               exit 1
             fi
             if [ -S "$control_socket" ]; then
-              actual_exe="$(readlink -f "/proc/$service_pid/exe")"
-              if [ "$actual_exe" != "$expected_exe" ]; then
-                printf 'service_pid_executable_mismatch expected=%s actual=%s\n' "$expected_exe" "$actual_exe" >&2
-                ps -o pid,ppid,args -p "$service_pid"
-                cat "$service_log"
+              if actual_exe="$(sudo -n readlink -f "/proc/$service_pid/exe")"; then
+                if [ "$actual_exe" != "$expected_exe" ]; then
+                  printf 'service_pid_executable_mismatch expected=%s actual=%s\n' "$expected_exe" "$actual_exe" >&2
+                  sudo -n ps -o pid,ppid,uid,gid,state,etime,args -p "$service_pid"
+                  sudo -n cat "$service_log"
+                  exit 1
+                fi
+              else
+                printf 'candidate service executable could not be resolved for pid=%s\n' "$service_pid" >&2
+                sudo -n ps -o pid,ppid,uid,gid,state,etime,args -p "$service_pid"
+                sudo -n cat "$service_log"
                 exit 1
               fi
               ready=true
@@ -472,7 +501,7 @@ jobs:
           done
           if [ "$ready" != true ]; then
             printf '%s\n' 'candidate service did not create its control socket' >&2
-            cat "$service_log"
+            sudo -n cat "$service_log"
             exit 1
           fi
 
@@ -507,26 +536,34 @@ jobs:
             --service-binary "$GITHUB_WORKSPACE/candidate/ubuntu_grpcvpnserver" \
             --service-socket "$SERVICE_SOCKET" \
             --service-library-path "$GITHUB_WORKSPACE/candidate" \
-            --service-pid-file "$SERVICE_DIR/service.pid"
+            --service-pid-file "$SERVICE_PID_FILE"
 
       - name: Stop candidate service and verify process cleanup
         if: always()
         run: |
           set -euo pipefail
-          if [ -n "${SERVICE_PID:-}" ] && sudo -n kill -0 "$SERVICE_PID"; then
-            sudo -n kill -TERM "$SERVICE_PID"
+          service_pid="${SERVICE_PID:-}"
+          if [ -f "${SERVICE_PID_FILE:-}" ]; then
+            service_pid="$(cat "$SERVICE_PID_FILE")"
+          fi
+          case "$service_pid" in
+            "") ;;
+            0|*[!0-9]*) printf 'cleanup received invalid service pid=%s\n' "$service_pid" >&2; exit 1 ;;
+          esac
+          if [ -n "$service_pid" ] && sudo -n kill -0 "$service_pid"; then
+            sudo -n kill -TERM "$service_pid"
             stopped=false
             for attempt in $(seq 1 30); do
-              if ! sudo -n kill -0 "$SERVICE_PID"; then
+              if ! sudo -n kill -0 "$service_pid"; then
                 stopped=true
                 break
               fi
               sleep 1
             done
             if [ "$stopped" != true ]; then
-              sudo -n kill -KILL "$SERVICE_PID"
+              sudo -n kill -KILL "$service_pid"
               for attempt in $(seq 1 10); do
-                if ! sudo -n kill -0 "$SERVICE_PID"; then
+                if ! sudo -n kill -0 "$service_pid"; then
                   stopped=true
                   break
                 fi
@@ -534,7 +571,7 @@ jobs:
               done
             fi
             test "$stopped" = true
-            children="$(ps -eo pid=,ppid=,args= | awk -v parent="$SERVICE_PID" '$2 == parent {print}')"
+            children="$(ps -eo pid=,ppid=,args= | awk -v parent="$service_pid" '$2 == parent {print}')"
             if [ -n "$children" ]; then
               printf '%s\n' 'candidate service left child processes after cleanup:' >&2
               printf '%s\n' "$children"

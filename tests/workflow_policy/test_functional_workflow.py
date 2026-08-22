@@ -112,6 +112,22 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("actual_exe=", self.text)
         self.assertIn("candidate service left child processes", self.text)
 
+
+    def test_service_pid_is_exact_and_cleanup_tracks_restarts(self) -> None:
+        start = self.text.index("- name: Start the candidate Linux service")
+        run = self.text.index("- name: Run canonical Linux functional scenarios")
+        start_block = self.text[start:run]
+        self.assertIn("sudo -n sh -c", start_block)
+        self.assertIn('printf "%s\\n" "$!"', start_block)
+        self.assertNotIn("service_pid=$!", start_block)
+        self.assertIn("SERVICE_PID_FILE", start_block)
+        self.assertIn('sudo -n readlink -f "/proc/$service_pid/exe"', start_block)
+        stop = self.text.index("- name: Stop candidate service and verify process cleanup")
+        result = self.text.index("- name: Upload safe functional result")
+        cleanup = self.text[stop:result]
+        self.assertIn('service_pid="$(cat "$SERVICE_PID_FILE")"', cleanup)
+        self.assertIn('sudo -n kill -TERM "$service_pid"', cleanup)
+        self.assertNotIn('sudo -n kill -TERM "$SERVICE_PID"', cleanup)
     def test_cleanup_marker_and_plaintext_removal_are_unconditional(self) -> None:
         stop = self.text.index("- name: Stop candidate service and verify process cleanup")
         result = self.text.index("- name: Upload safe functional result")
