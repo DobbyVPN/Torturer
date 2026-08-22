@@ -239,12 +239,21 @@ own checkout before it can acquire a service. Both workflows are bounded and
 fail closed when the immutable image variable or Render account eligibility is
 absent. A hosted Linux result is not a claim that sleep/wake is covered; that
 operation remains unavailable on a runner that cannot suspend and resume itself.
+The current Linux workflow selects the five feasible profile/CLI scenarios
+(`configure`, `connect-route-identity`, `disconnect-cleanup`,
+`start-stop-start`, and `failed-repeated-reconnect`). Their declared worst-case
+execution plus four bounded reset windows is exactly 1,800 seconds; the hosted
+runner rejects any selected set that exceeds this 30-minute budget.
 The optional network-transition seam currently interrupts the named whole
 runner interface, so it is not enabled until endpoint-only interruption or a
 runner-recovery proof is wired. The process-loss seam requires the actual Go
 service PID and independently checked child cleanup; a sudo launcher PID is
-not accepted. Windows and macOS still need their trusted workflow to
+not accepted. Throughput/endurance additionally require explicit fixed HTTPS
+measurement endpoints and are not silently inferred from the Outline TCP
+service. Windows and macOS still need their trusted workflow to
 install/start the platform service and hand off the profile/control
-credentials. Android still needs a candidate-owned automation API that accepts
-a test profile and exposes consent, routing identity, and cleanup observations;
-its current APK contract intentionally supplies none of those.
+credentials. Android's existing candidate instrumentation proves consent,
+production TUN creation, VPN route state, and documentation-range packet
+routing, but still lacks a candidate-owned automation API that accepts a test
+profile and exposes real external identity/throughput observations; it is not
+converted into a false hosted profile result.
