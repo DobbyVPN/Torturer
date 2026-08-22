@@ -27,6 +27,11 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         self.assertRegex(self.text, r"(?m)^    timeout-minutes: 40$")
         self.assertRegex(self.text, r"(?m)^    environment: render-functional$")
 
+    def test_runner_local_lease_path_is_initialized_from_runner_environment(self) -> None:
+        self.assertNotIn("${{ runner.temp }}", self.text)
+        self.assertRegex(self.text, r"(?m)^      - name: Establish runner-local paths$")
+        self.assertIn("printf 'LEASE_DIR=%s\\n' \"$RUNNER_TEMP/dobbyvpn-render-lease\" >> \"$GITHUB_ENV\"", self.text)
+
     def test_permissions_and_external_actions_are_immutable(self) -> None:
         self.assertRegex(self.text, r"(?m)^permissions:\n  contents: read\n  actions: write$")
         self.assertEqual(set(self.uses), EXPECTED_ACTIONS)
