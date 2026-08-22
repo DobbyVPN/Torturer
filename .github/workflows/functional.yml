@@ -284,7 +284,8 @@ jobs:
         working-directory: torturer
         run: |
           set -euo pipefail
-          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.run \
+          timeout --foreground --signal=TERM --kill-after=30s 1780s \
+            env PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.run \
             --platform linux \
             --cli "$GITHUB_WORKSPACE/candidate/kmp_module/services/dobby-cli" \
             --profile "$HANDOFF_DIR/profile.toml" \

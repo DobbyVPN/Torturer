@@ -25,6 +25,7 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertRegex(self.text, r"(?m)^on:\n  workflow_dispatch:")
         self.assertNotRegex(self.text, r"(?m)^  (?:push|pull_request|pull_request_target|schedule):")
         self.assertRegex(self.text, r"(?m)^    timeout-minutes: 30$")
+        self.assertIn("timeout --foreground --signal=TERM --kill-after=30s 1780s", self.text)
         self.assertIn("PLATFORM: linux", self.text)
 
     def test_linux_lane_selects_only_the_feasible_canonical_subset(self) -> None:

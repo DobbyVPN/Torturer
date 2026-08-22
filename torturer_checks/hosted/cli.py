@@ -223,10 +223,20 @@ class HostedCLIAdapter:
         raise ScenarioExecutionError("UNSUPPORTED_OPERATION")
 
     def reset(self, timeout_seconds: float = 30.0) -> None:
-        """Stop a scenario's session before the next independent scenario."""
+        """Stop a scenario's session within one total timeout window."""
+        if timeout_seconds <= 0:
+            raise HostedAdapterError("INVALID_RESET_TIMEOUT")
+        deadline = time.monotonic() + timeout_seconds
+
+        def remaining() -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise HostedAdapterError("RESET_TIMEOUT")
+            return value
+
         try:
-            if self._connected(timeout_seconds):
-                self._command(("disconnect",), timeout_seconds, "RESET_FAILED")
+            if self._connected(remaining()):
+                self._command(("disconnect",), remaining(), "RESET_FAILED")
         finally:
             self._baseline_ip = None
 
