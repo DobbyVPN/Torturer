@@ -16,13 +16,37 @@ import re
 import stat
 from pathlib import PurePosixPath
 from typing import Iterable
-from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.parse import quote, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 import zipfile
 
 
 class ArtifactDownloadError(RuntimeError):
     """The requested artifact is missing or unsafe."""
+
+
+class _CredentialSafeRedirectHandler(HTTPRedirectHandler):
+    """Never forward GitHub credentials to an artifact storage host."""
+
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        redirected = super().redirect_request(
+            request, file_pointer, code, message, headers, new_url
+        )
+        if redirected is None:
+            return None
+        source = urlsplit(request.full_url)
+        target = urlsplit(new_url)
+        if target.scheme.lower() != "https":
+            raise ArtifactDownloadError("artifact redirect is not HTTPS")
+        source_origin = (source.scheme.lower(), source.hostname, source.port)
+        target_origin = (target.scheme.lower(), target.hostname, target.port)
+        if source_origin != target_origin:
+            redirected.remove_header("Authorization")
+            redirected.remove_header("X-GitHub-Api-Version")
+        return redirected
+
+
+_OPENER = build_opener(_CredentialSafeRedirectHandler())
 
 
 def _owner_dir(path: Path) -> None:
@@ -122,7 +146,7 @@ def _get(url: str) -> bytes:
         },
     )
     try:
-        with urlopen(request, timeout=30) as response:
+        with _OPENER.open(request, timeout=30) as response:
             return response.read()
     except Exception as error:  # pragma: no cover - provider/network boundary
         raise ArtifactDownloadError("GitHub artifact request failed") from error

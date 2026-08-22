@@ -7,9 +7,15 @@ import stat
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.request import Request
 import zipfile
 
-from torturer_checks.hosted.artifacts import ArtifactDownloadError, _extract, download_artifact
+from torturer_checks.hosted.artifacts import (
+    ArtifactDownloadError,
+    _CredentialSafeRedirectHandler,
+    _extract,
+    download_artifact,
+)
 
 
 def _zip(entries: list[tuple[str, bytes, int | None]]) -> bytes:
@@ -130,6 +136,43 @@ class HostedArtifactSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(ArtifactDownloadError, "allow-list is invalid"):
                 self._download(b"unused", expected=("manifest.json", "manifest.json"))
         get.assert_not_called()
+
+    def test_cross_origin_redirect_drops_github_authorization(self) -> None:
+        request = Request(
+            "https://api.github.com/repos/o/r/actions/artifacts/42/zip",
+            headers={
+                "Authorization": "Bearer secret",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        redirected = _CredentialSafeRedirectHandler().redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://artifactcache.example.invalid/archive.zip?signature=opaque",
+        )
+        self.assertIsNotNone(redirected)
+        self.assertIsNone(redirected.get_header("Authorization"))
+        self.assertIsNone(redirected.get_header("X-Github-Api-Version"))
+        self.assertEqual(redirected.get_header("Accept"), "application/vnd.github+json")
+
+    def test_redirect_refuses_https_downgrade(self) -> None:
+        request = Request(
+            "https://api.github.com/repos/o/r/actions/artifacts/42/zip",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with self.assertRaisesRegex(ArtifactDownloadError, "not HTTPS"):
+            _CredentialSafeRedirectHandler().redirect_request(
+                request,
+                None,
+                302,
+                "Found",
+                {},
+                "http://artifactcache.example.invalid/archive.zip",
+            )
 
 
 if __name__ == "__main__":
