@@ -41,7 +41,7 @@ jobs:
       - name: Reap only the requested random namespace
         env:
           RENDER_API_TOKEN: ${{ secrets.RENDER_API_TOKEN }}
-          RENDER_OWNER_ID: ${{ secrets.RENDER_OWNER_ID }}
+          RENDER_OWNER_ID: ${{ vars.RENDER_OWNER_ID }}
           NAME_PREFIX: ${{ inputs.name_prefix }}
           OLDER_THAN_SECONDS: ${{ inputs.older_than_seconds }}
           ACTIVE_SERVICE_IDS: ${{ inputs.active_service_ids }}
