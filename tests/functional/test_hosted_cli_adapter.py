@@ -8,7 +8,7 @@ import unittest
 from torturer_checks.hosted.cli import CommandResult, HostedAdapterError, HostedCLIAdapter, SubprocessRunner
 from torturer_contract.functional.capabilities import Capability
 from torturer_contract.functional.engine import FunctionalEngine
-from torturer_contract.functional.scenarios import get_scenario
+from torturer_contract.functional.scenarios import ScenarioStep, get_scenario
 
 
 class FakeRunner:
@@ -66,6 +66,30 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertEqual(result.outcome, "passed")
         self.assertTrue(any(call[1] == "connect-profile" for call in self.runner.calls))
         self.adapter.reset()
+        self.assertFalse(self.runner.connected)
+
+    def test_reconnect_reuses_public_cli_and_leaves_clean_baseline(self) -> None:
+        self.assertIn(Capability.RECONNECT, self.adapter.capabilities)
+        result = FunctionalEngine("d" * 64).run(
+            get_scenario("functional.start-stop-start"),
+            self.adapter,
+            _provenance(self.adapter),
+        )
+        self.assertEqual(result.outcome, "passed")
+        self.assertTrue(result.cleanup["verified"])
+        reconnect_index = next(
+            index for index, call in enumerate(self.runner.calls)
+            if call[1] == "connect-profile" and index > 4
+        )
+        self.assertEqual(self.runner.calls[reconnect_index - 1][1], "disconnect")
+        self.assertEqual(self.runner.calls[reconnect_index + 2][1], "disconnect")
+        self.assertFalse(self.runner.connected)
+
+    def test_reconnect_operation_is_bounded_and_returns_safe_observations(self) -> None:
+        observations = self.adapter.execute(
+            ScenarioStep(id="reconnect", operation="reconnect", timeout_seconds=5)
+        )
+        self.assertEqual(observations, {"restart_verified": True, "reconnect_bounded": True})
         self.assertFalse(self.runner.connected)
 
     def test_cleanup_scenario_proves_disconnect_and_cleanup(self) -> None:

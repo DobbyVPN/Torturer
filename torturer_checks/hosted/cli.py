@@ -162,6 +162,7 @@ class HostedCLIAdapter:
             Capability.TUNNEL_INTERFACE,
             Capability.ROUTING_IDENTITY,
             Capability.DISCONNECT,
+            Capability.RECONNECT,
             Capability.RESOURCE_CLEANUP,
         }
         if self.download_url is not None and self.upload_url is not None:
@@ -189,6 +190,8 @@ class HostedCLIAdapter:
         if operation == "disconnect":
             self._command(("disconnect",), timeout, "DISCONNECT_FAILED")
             return {"disconnect_clean": True}
+        if operation == "reconnect":
+            return self._reconnect(timeout)
         if operation == "inspect_cleanup":
             return {"cleanup_verified": self._cleanup_verified(timeout)}
         raise ScenarioExecutionError("UNSUPPORTED_OPERATION")
@@ -258,6 +261,44 @@ class HostedCLIAdapter:
             "download_mbps": download[1],
             "upload_mbps": upload[1],
         }
+
+    def _reconnect(self, timeout: float) -> dict[str, object]:
+        """Exercise one bounded restart and leave no session behind.
+
+        The public CLI intentionally exposes connect and disconnect rather than
+        a second reconnect command. The adapter composes those existing
+        operations, observes the new session, and closes it before returning so
+        the canonical cleanup step can verify a clean baseline. Every command
+        receives only the time remaining in this operation's declared bound.
+        """
+        deadline = time.monotonic() + timeout
+        connection_attempted = False
+        connected = False
+
+        def remaining() -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise ScenarioExecutionError("RECONNECT_TIMEOUT")
+            return value
+
+        try:
+            self._command(("disconnect",), remaining(), "RECONNECT_DISCONNECT_FAILED")
+            connection_attempted = True
+            self._command(
+                ("connect-profile", str(self.profile), "0"),
+                remaining(),
+                "RECONNECT_CONNECT_FAILED",
+            )
+            connected = self._connected(remaining())
+            if not connected:
+                raise ScenarioExecutionError("RECONNECT_NOT_ESTABLISHED")
+            return {
+                "restart_verified": True,
+                "reconnect_bounded": time.monotonic() <= deadline,
+            }
+        finally:
+            if connection_attempted:
+                self._command(("disconnect",), remaining(), "RECONNECT_CLEANUP_FAILED")
 
     def _curl_metric(self, url: str, timeout: float) -> tuple[float, float]:
         result = self.runner.run(

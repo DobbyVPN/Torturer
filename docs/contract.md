@@ -205,7 +205,10 @@ torturer_checks.hosted.run`. It requires an exact candidate artifact digest, an
 owner-only profile file, an immutable server-image digest, and a full source
 SHA. It invokes the product's existing `dobby-cli` operations (`check-config`,
 `connect-profile`, `status --json`, `external-ip`, `disconnect`) as argument
-vectors. It never imports DobbyVPN source or defines product behavior.
+vectors. The adapter's canonical `reconnect` operation composes the existing
+disconnect/connect-profile/status commands within one bounded step and leaves
+the session disconnected before the cleanup observation. It never imports
+DobbyVPN source or defines product behavior.
 
 Each command's original stdout and stderr bytes are retained under the trusted
 runner's owner-only temporary evidence directory. The emitted result contains
