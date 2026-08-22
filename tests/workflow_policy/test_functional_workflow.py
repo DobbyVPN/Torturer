@@ -32,6 +32,7 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertRegex(self.text, r"(?m)^      - name: Establish runner-local paths$")
         self.assertIn("printf 'HANDOFF_DIR=%s\\n' \"$RUNNER_TEMP/dobbyvpn-render-handoff\" >> \"$GITHUB_ENV\"", self.text)
         self.assertIn("printf 'SERVICE_DIR=%s\\n' \"$RUNNER_TEMP/dobbyvpn-service\" >> \"$GITHUB_ENV\"", self.text)
+        self.assertIn("printf 'DOBBYVPN_CONTROL_SOCKET=%s\\n' \"$control_socket\" >> \"$GITHUB_ENV\"", self.text)
         self.assertIn("printf 'RESULT_PATH=%s\\n' \"$RUNNER_TEMP/dobbyvpn-render-handoff/functional-result.json\" >> \"$GITHUB_ENV\"", self.text)
 
     def test_permissions_and_external_actions_are_minimal_and_immutable(self) -> None:
