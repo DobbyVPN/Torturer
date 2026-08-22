@@ -21,6 +21,7 @@ class FakeRunner:
         self.calls: list[tuple[str, ...]] = []
         self.connected = False
         self.external_calls = 0
+        self.restore_identity = True
 
     def run(self, command, *, timeout_seconds):
         del timeout_seconds
@@ -41,7 +42,10 @@ class FakeRunner:
             return CommandResult(argv, 0, b'{"code":%d,"state":"%s"}\n' % (2 if self.connected else 0, state), b"")
         if operation == "external-ip":
             self.external_calls += 1
-            value = b"198.51.100.10\n" if self.external_calls == 1 else b"203.0.113.10\n"
+            if self.external_calls == 1 or (not self.connected and self.restore_identity):
+                value = b"198.51.100.10\n"
+            else:
+                value = b"203.0.113.10\n"
             return CommandResult(argv, 0, value, b"")
         if operation == "disconnect":
             self.connected = False
@@ -101,8 +105,12 @@ class HostedCLIAdapterTests(unittest.TestCase):
             index for index, call in enumerate(self.runner.calls)
             if call[1] == "connect-profile" and index > 4
         )
-        self.assertEqual(self.runner.calls[reconnect_index - 1][1], "disconnect")
-        self.assertEqual(self.runner.calls[reconnect_index + 2][1], "disconnect")
+        disconnects = [
+            index for index, call in enumerate(self.runner.calls) if call[1] == "disconnect"
+        ]
+        self.assertEqual(len(disconnects), 2)
+        self.assertLess(disconnects[0], reconnect_index)
+        self.assertGreater(disconnects[1], reconnect_index)
         self.assertFalse(self.runner.connected)
 
     def test_reconnect_operation_is_bounded_and_returns_safe_observations(self) -> None:
@@ -110,7 +118,7 @@ class HostedCLIAdapterTests(unittest.TestCase):
             ScenarioStep(id="reconnect", operation="reconnect", timeout_seconds=5)
         )
         self.assertEqual(observations, {"restart_verified": True, "reconnect_bounded": True})
-        self.assertFalse(self.runner.connected)
+        self.assertTrue(self.runner.connected)
 
     def test_cleanup_scenario_proves_disconnect_and_cleanup(self) -> None:
         scenario = get_scenario("functional.disconnect-cleanup")
@@ -118,6 +126,21 @@ class HostedCLIAdapterTests(unittest.TestCase):
         result = engine.run(scenario, self.adapter, _provenance(self.adapter))
         self.assertEqual(result.outcome, "passed")
         self.assertTrue(result.cleanup["verified"])
+
+    def test_disconnect_fails_when_status_is_clean_but_identity_is_not_restored(self) -> None:
+        self.runner.restore_identity = False
+        scenario = get_scenario("functional.disconnect-cleanup")
+        result = FunctionalEngine(scenario_set_digest="a" * 64).run(
+            scenario, self.adapter, _provenance(self.adapter)
+        )
+        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(result.reason_code, "ASSERTION_FAILED")
+        self.assertFalse(
+            any(
+                assertion.id == "disconnect.clean" and assertion.passed
+                for assertion in result.assertions
+            )
+        )
 
     def test_linux_network_transition_requires_and_uses_explicit_interface(self) -> None:
         adapter = LinuxHostedAdapter(
@@ -155,17 +178,14 @@ class HostedCLIAdapterTests(unittest.TestCase):
 
     def test_hosted_runner_accounts_for_one_reset_after_every_selected_scenario(self) -> None:
         scenarios = _select_scenarios([
-            "functional.configure",
-            "functional.connect-route-identity",
-            "functional.disconnect-cleanup",
+            "functional.core-connection",
             "functional.start-stop-start",
-            "functional.failed-repeated-reconnect",
         ])
         results, reset_failures, reset_count = _run_scenarios(
             FunctionalEngine("1" * 64), scenarios, self.adapter, _provenance(self.adapter)
         )
-        self.assertEqual(len(results), 5)
-        self.assertEqual(reset_count, 5)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(reset_count, 2)
         self.assertEqual(reset_failures, [])
 
     def test_hosted_runner_rejects_a_scenario_set_over_the_lane_bound(self) -> None:
@@ -174,13 +194,10 @@ class HostedCLIAdapterTests(unittest.TestCase):
 
     def test_hosted_runner_accepts_all_feasible_cli_scenarios_in_one_lane(self) -> None:
         selected = _select_scenarios([
-            "functional.configure",
-            "functional.connect-route-identity",
-            "functional.disconnect-cleanup",
+            "functional.core-connection",
             "functional.start-stop-start",
-            "functional.failed-repeated-reconnect",
         ])
-        self.assertEqual(len(selected), 5)
+        self.assertEqual(len(selected), 2)
 
     def test_android_entrypoint_is_fail_closed_without_profile_session_api(self) -> None:
         adapter = AndroidHostedAdapter(cli=self.cli, profile=self.profile, runner=self.runner)
@@ -222,16 +239,19 @@ class HostedCLIAdapterTests(unittest.TestCase):
         raw = Path(self.directory.name) / "raw"
         runner = SubprocessRunner(raw)
         result = runner.run(
-            ("python3", "-c", "import sys; sys.stdout.buffer.write(b'out\\n'); sys.stderr.buffer.write(b'err\\n')"),
+            ("python3", "-c", "import sys; sys.stdout.buffer.write(b'198.51.100.10\\n'); sys.stderr.buffer.write(b'err\\n')"),
             timeout_seconds=5,
         )
         self.assertEqual(result.returncode, 0)
         retained = (raw / "command-001.raw.log").read_bytes()
-        self.assertIn(b"out\n", retained)
+        self.assertIn(b"198.51.100.10\n", retained)
         self.assertIn(b"err\n", retained)
         evidence = runner.safe_evidence()
         self.assertEqual(evidence[0]["returncode"], 0)
-        self.assertEqual(evidence[0]["stdout_bytes"], 4)
+        self.assertEqual(evidence[0]["stdout_bytes"], 14)
+        self.assertNotIn("198.51.100.10", repr(evidence[0]))
+        self.assertNotIn("stdout_sha256", evidence[0])
+        self.assertNotIn("stderr_sha256", evidence[0])
         self.assertNotIn("python3", repr(evidence[0]))
 
     def test_profile_must_be_owner_only(self) -> None:

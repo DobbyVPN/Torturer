@@ -13,6 +13,10 @@ on:
         description: Numeric ID of the trusted functional workflow run.
         required: true
         type: string
+      origin_run_attempt:
+        description: Attempt number of the originating functional workflow run.
+        required: true
+        type: string
       origin_torturer_sha:
         description: Exact Torturer commit used by the originating workflow run.
         required: true
@@ -41,7 +45,7 @@ permissions:
   actions: write
 
 concurrency:
-  group: trusted-render-lease-${{ inputs.lease_run_id }}
+  group: trusted-render-lease-${{ inputs.origin_run_id }}-${{ inputs.platform }}
   cancel-in-progress: false
 
 jobs:
@@ -53,6 +57,7 @@ jobs:
     env:
       MODE: ${{ inputs.mode }}
       ORIGIN_RUN_ID: ${{ inputs.origin_run_id }}
+      ORIGIN_RUN_ATTEMPT: ${{ inputs.origin_run_attempt }}
       ORIGIN_TORTURER_SHA: ${{ inputs.origin_torturer_sha }}
       LEASE_RUN_ID: ${{ inputs.lease_run_id }}
       PLATFORM: ${{ inputs.platform }}
@@ -81,6 +86,7 @@ jobs:
           test "$GITHUB_REF_NAME" = "$TRUSTED_REF"
           test "$GITHUB_REF_NAME" = "transition/functional-render" || test "$GITHUB_REF_NAME" = "main"
           python3 - <<'PY'
+          import hashlib
           import os
           import re
 
@@ -90,10 +96,17 @@ jobs:
               raise SystemExit("only the implemented Linux adapter is enabled")
           if not re.fullmatch(r"[0-9]+", os.environ["ORIGIN_RUN_ID"]):
               raise SystemExit("origin_run_id is invalid")
+          if not re.fullmatch(r"[0-9]+", os.environ["ORIGIN_RUN_ATTEMPT"]):
+              raise SystemExit("origin_run_attempt is invalid")
           if not re.fullmatch(r"[0-9a-f]{40}", os.environ["ORIGIN_TORTURER_SHA"]):
               raise SystemExit("origin_torturer_sha is invalid")
-          if not re.fullmatch(r"[0-9a-f]{32}", os.environ["LEASE_RUN_ID"]):
-              raise SystemExit("lease_run_id is invalid")
+          origin_id = os.environ["ORIGIN_RUN_ID"]
+          origin_attempt = os.environ["ORIGIN_RUN_ATTEMPT"]
+          expected_lease = hashlib.sha256(
+              f"{origin_id}:{origin_attempt}:linux:{os.environ['ORIGIN_TORTURER_SHA']}".encode()
+          ).hexdigest()[:32]
+          if os.environ["LEASE_RUN_ID"] != expected_lease:
+              raise SystemExit("lease_run_id does not match origin correlation")
           if not re.fullmatch(r"render-request-[0-9a-f]{32}-linux", os.environ["REQUEST_ARTIFACT_NAME"]):
               raise SystemExit("request_artifact_name is invalid")
           digest = os.environ["RENDER_IMAGE_DIGEST"]
@@ -155,6 +168,29 @@ jobs:
           if value.get("path") != ".github/workflows/functional.yml":
               raise SystemExit("origin run workflow mismatch")
           print("origin_run=validated")
+          PY
+
+      - name: Reject a second lease for this origin and platform
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          artifact_name="render-lease-${LEASE_RUN_ID}-${PLATFORM}"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${artifact_name}" \
+            | tee "$LEASE_DIR/existing-lease-artifacts.json"
+          python3 - "$LEASE_DIR/existing-lease-artifacts.json" "$artifact_name" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected_name = sys.argv[2]
+          for artifact in document.get("artifacts", []):
+              if artifact.get("name") != expected_name:
+                  continue
+              if artifact.get("expired") is not True:
+                  raise SystemExit("one Render lease already exists for this origin/platform")
+          print("origin_lease_slot=available")
           PY
 
       - name: Download and validate opaque lease request

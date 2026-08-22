@@ -32,7 +32,7 @@ class FakeAdapter:
         self.calls.append(step.operation)
         if self.failure is not None:
             raise self.failure
-        return {
+        result = {
             "configured": True,
             "tunnel_interface": True,
             "routing_identity_changed": True,
@@ -49,6 +49,13 @@ class FakeAdapter:
             "download_mbps": 10.0,
             "upload_mbps": 5.0,
         }
+        if step.id == "second-tunnel":
+            result["second_tunnel_interface"] = True
+        if step.id == "second-routing":
+            result["second_routing_identity_changed"] = True
+        if step.id == "final-disconnect":
+            result["final_disconnect_clean"] = True
+        return result
 
 
 def provenance() -> RunProvenance:
@@ -73,12 +80,12 @@ class FunctionalContractTests(unittest.TestCase):
         self.assertEqual(
             set(ids),
             {
+                "functional.core-connection",
                 "functional.configure",
                 "functional.connect-route-identity",
                 "functional.stability-throughput",
                 "functional.disconnect-cleanup",
                 "functional.start-stop-start",
-                "functional.failed-repeated-reconnect",
                 "functional.network-transition",
                 "functional.sleep-wake",
                 "functional.product-process-loss",
@@ -123,10 +130,33 @@ class FunctionalContractTests(unittest.TestCase):
         self.assertEqual(result.outcome, "passed")
         self.assertEqual(
             adapter.calls,
-            ["configure", "connect", "observe_tunnel", "observe_routing_identity", "disconnect", "reconnect", "inspect_cleanup"],
+            ["configure", "connect", "observe_tunnel", "observe_routing_identity", "disconnect", "reconnect", "observe_tunnel", "observe_routing_identity", "disconnect", "inspect_cleanup"],
         )
         self.assertTrue(result.cleanup["verified"])
         self.assertEqual(result.to_dict()["schema"], 1)
+
+    def test_restart_second_cycle_failure_cannot_be_masked(self):
+        class SecondCycleFailureAdapter(FakeAdapter):
+            def execute(self, step):
+                result = super().execute(step)
+                if step.id == "second-tunnel":
+                    result["second_tunnel_interface"] = False
+                if step.id == "second-routing":
+                    result["second_routing_identity_changed"] = True
+                if step.id == "final-disconnect":
+                    result["final_disconnect_clean"] = True
+                return result
+
+        result = FunctionalEngine("e" * 64).run(
+            get_scenario("functional.start-stop-start"),
+            SecondCycleFailureAdapter(),
+            provenance(),
+        )
+        self.assertEqual(result.outcome, "failed")
+        self.assertIn(
+            {"id": "tunnel.second_established", "passed": False},
+            result.to_dict()["assertions"],
+        )
 
     def test_non_throughput_result_does_not_require_metrics(self):
         class NoMetricAdapter(FakeAdapter):

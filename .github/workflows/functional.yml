@@ -14,17 +14,19 @@ on:
 
 permissions:
   contents: read
-  actions: write
 
 concurrency:
   group: trusted-functional-linux-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  linux:
+  client:
     name: Trusted functional Linux
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     env:
       SOURCE_REPOSITORY: ${{ inputs.source_repository }}
       SOURCE_SHA: ${{ inputs.commit_sha }}
@@ -50,8 +52,8 @@ jobs:
           repository = os.environ["SOURCE_REPOSITORY"]
           source_sha = os.environ["SOURCE_SHA"]
           image_digest = os.environ["SERVER_IMAGE_DIGEST"]
-          if not re.fullmatch(r"[A-Za-z0-9.-]+/[A-Za-z0-9_.-]+", repository):
-              raise SystemExit("source_repository is invalid")
+          if repository != "DobbyVPN/DobbyVPN":
+              raise SystemExit("source_repository must be DobbyVPN/DobbyVPN")
           if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
               raise SystemExit("commit_sha must be a full lowercase SHA")
           if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest):
@@ -65,40 +67,6 @@ jobs:
           print(f"server_image_digest={image_digest}")
           PY
 
-      - name: Check out exact Torturer workflow revision
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          repository: DobbyVPN/Torturer
-          ref: ${{ github.sha }}
-          path: torturer
-          persist-credentials: false
-
-      - name: Check out exact DobbyVPN candidate
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          repository: ${{ inputs.source_repository }}
-          ref: ${{ inputs.commit_sha }}
-          path: candidate
-          persist-credentials: false
-          submodules: recursive
-
-      - name: Verify exact source identities and clean Torturer checkout
-        run: |
-          set -euo pipefail
-          test "$(git -C torturer rev-parse HEAD)" = "$TORTURER_SHA"
-          test -z "$(git -C torturer status --porcelain=v1 --untracked-files=all)"
-          test "$(git -C candidate rev-parse HEAD)" = "$SOURCE_SHA"
-
-      - name: Build the candidate Linux service and CLI
-        working-directory: candidate
-        run: |
-          set -euo pipefail
-          python3 .github/scripts/desktop_build.py libs --platform linux --arch amd64
-          python3 .github/scripts/desktop_build.py app --platform linux --skip-libs
-          test -x kmp_module/services/ubuntu_grpcvpnserver
-          test -x kmp_module/services/dobby-cli
-          sha256sum kmp_module/services/ubuntu_grpcvpnserver kmp_module/services/dobby-cli
-
       - name: Create ephemeral recipient and lease request
         run: |
           set -euo pipefail
@@ -108,7 +76,7 @@ jobs:
             -subj "/CN=dobbyvpn-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             -keyout "$HANDOFF_DIR/recipient.key" \
             -out "$HANDOFF_DIR/recipient.crt"
-          run_id="$(openssl rand -hex 16)"
+          run_id="$(printf "%s:%s:%s:%s" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PLATFORM" "$TORTURER_SHA" | sha256sum | cut -c1-32)"
           artifact_name="render-request-${run_id}-${PLATFORM}"
           python3 - "$HANDOFF_DIR/request.json" "$run_id" "$artifact_name" <<'PY'
           import json
@@ -149,68 +117,48 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      - name: Dispatch trusted Render lease wrapper
-        env:
-          GH_TOKEN: ${{ github.token }}
+
+      - name: Check out exact Torturer workflow revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: DobbyVPN/Torturer
+          ref: ${{ github.sha }}
+          path: torturer
+          persist-credentials: false
+
+      - name: Check out exact DobbyVPN candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.commit_sha }}
+          path: candidate
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Verify exact source identities and clean Torturer checkout
         run: |
           set -euo pipefail
-          gh api --method POST \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/server-lease.yml/dispatches" \
-            -f "ref=${GITHUB_REF_NAME}" \
-            -f "inputs[mode]=acquire" \
-            -f "inputs[origin_run_id]=${GITHUB_RUN_ID}" \
-            -f "inputs[origin_torturer_sha]=${TORTURER_SHA}" \
-            -f "inputs[lease_run_id]=${LEASE_RUN_ID}" \
-            -f "inputs[platform]=${PLATFORM}" \
-            -f "inputs[request_artifact_name]=${REQUEST_ARTIFACT_NAME}" \
-            -f "inputs[trusted_ref]=${GITHUB_REF_NAME}"
-          unset GH_TOKEN
+          test "$(git -C torturer rev-parse HEAD)" = "$TORTURER_SHA"
+          test -z "$(git -C torturer status --porcelain=v1 --untracked-files=all)"
+          test "$(git -C candidate rev-parse HEAD)" = "$SOURCE_SHA"
 
-      - name: Poll for encrypted lease response
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Build the candidate Linux service and CLI
+        working-directory: candidate
         run: |
           set -euo pipefail
-          mkdir -p "$HANDOFF_DIR/lease-response"
-          archive_url=""
-          for attempt in $(seq 1 180); do
-            response="$HANDOFF_DIR/lease-response/artifacts-${attempt}.json"
-            gh api \
-              "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=render-lease-${LEASE_RUN_ID}-linux" \
-              | tee "$response"
-            archive_url="$(python3 - "$response" <<'PY'
-          import json
-          import os
-          import sys
-          from pathlib import Path
-
-          document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          for artifact in document.get("artifacts", []):
-              if artifact.get("name") != "render-lease-" + os.environ["LEASE_RUN_ID"] + "-linux":
-                  continue
-              if artifact.get("expired") is True:
-                  continue
-              url = artifact.get("archive_download_url")
-              if isinstance(url, str) and url:
-                  print(url)
-                  break
-          PY
-            )"
-            if [ -n "$archive_url" ]; then
-              break
-            fi
-            sleep 10
-          done
-          test -n "$archive_url"
-          gh api "$archive_url" > "$HANDOFF_DIR/lease-response/lease.zip"
-          unzip -l "$HANDOFF_DIR/lease-response/lease.zip"
-          unzip -o "$HANDOFF_DIR/lease-response/lease.zip" -d "$HANDOFF_DIR/lease-response/unpacked"
-          test -f "$HANDOFF_DIR/lease-response/unpacked/profile.cms"
-          test -f "$HANDOFF_DIR/lease-response/unpacked/lease.json"
+          python3 .github/scripts/desktop_build.py libs --platform linux --arch amd64
+          python3 .github/scripts/desktop_build.py app --platform linux --skip-libs
+          test -x kmp_module/services/ubuntu_grpcvpnserver
+          test -x kmp_module/services/dobby-cli
+          sha256sum kmp_module/services/ubuntu_grpcvpnserver kmp_module/services/dobby-cli
 
       - name: Validate and decrypt the encrypted profile
         run: |
           set -euo pipefail
+          if [ ! -f "$HANDOFF_DIR/lease-response/unpacked/lease.json" ] || [ ! -f "$HANDOFF_DIR/lease-response/unpacked/profile.cms" ]; then
+            printf '%s\n' 'PROFILE_HANDOFF_NOT_IMPLEMENTED: no safe candidate-readable Render response relay is present' >&2
+            exit 1
+          fi
           python3 - "$HANDOFF_DIR/lease-response/unpacked/lease.json" <<'PY'
           import json
           import os
@@ -256,6 +204,15 @@ jobs:
             "$GITHUB_WORKSPACE/candidate/kmp_module/services/ubuntu_grpcvpnserver" \
             > "$service_log" 2>&1 &
           service_pid=$!
+          expected_service="$GITHUB_WORKSPACE/candidate/kmp_module/services/ubuntu_grpcvpnserver"
+          expected_exe="$(readlink -f "$expected_service")"
+          actual_exe="$(readlink -f "/proc/$service_pid/exe")"
+          if [ "$actual_exe" != "$expected_exe" ]; then
+            printf 'service_pid_executable_mismatch expected=%s actual=%s\n' "$expected_exe" "$actual_exe" >&2
+            ps -o pid,ppid,args -p "$service_pid"
+            cat "$service_log"
+            exit 1
+          fi
           printf 'SERVICE_PID=%s\n' "$service_pid" >> "$GITHUB_ENV"
           printf 'SERVICE_SOCKET=%s\n' "$control_socket" >> "$GITHUB_ENV"
           printf 'DOBBYVPN_CONTROL_SOCKET=%s\n' "$control_socket" >> "$GITHUB_ENV"
@@ -284,7 +241,7 @@ jobs:
         working-directory: torturer
         run: |
           set -euo pipefail
-          timeout --foreground --signal=TERM --kill-after=30s 1780s \
+          timeout --foreground --signal=TERM --kill-after=30s 1120s \
             env PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.run \
             --platform linux \
             --cli "$GITHUB_WORKSPACE/candidate/kmp_module/services/dobby-cli" \
@@ -295,11 +252,8 @@ jobs:
             --server-image-digest "$SERVER_IMAGE_DIGEST" \
             --output "$RESULT_PATH" \
             --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" \
-            --scenario-id functional.configure \
-            --scenario-id functional.connect-route-identity \
-            --scenario-id functional.disconnect-cleanup \
-            --scenario-id functional.start-stop-start \
-            --scenario-id functional.failed-repeated-reconnect
+            --scenario-id functional.core-connection \
+            --scenario-id functional.start-stop-start
 
       - name: Stop candidate service and verify process cleanup
         if: always()
@@ -326,6 +280,12 @@ jobs:
               done
             fi
             test "$stopped" = true
+            children="$(ps -eo pid=,ppid=,args= | awk -v parent="$SERVICE_PID" '$2 == parent {print}')"
+            if [ -n "$children" ]; then
+              printf '%s\n' 'candidate service left child processes after cleanup:' >&2
+              printf '%s\n' "$children"
+              exit 1
+            fi
           else
             printf '%s\n' 'candidate service was not running at cleanup'
           fi
@@ -364,3 +324,91 @@ jobs:
         run: |
           set -euo pipefail
           rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/recipient.key"
+
+
+  controller:
+    name: Dispatch isolated Render lease controller
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write
+    env:
+      PLATFORM: linux
+      TORTURER_SHA: ${{ github.sha }}
+      SERVER_IMAGE_DIGEST: ${{ vars.RENDER_IMAGE_DIGEST }}
+      LEASE_RUN_ID: ""
+      REQUEST_ARTIFACT_NAME: ""
+
+    steps:
+      - name: Validate controller inputs
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", os.environ["SERVER_IMAGE_DIGEST"]):
+              raise SystemExit("RENDER_IMAGE_DIGEST must be immutable")
+          if not re.fullmatch(r"[0-9a-f]{40}", os.environ["TORTURER_SHA"]):
+              raise SystemExit("TORTURER_SHA must be a full lowercase SHA")
+          print("controller_inputs=validated")
+          PY
+
+      - name: Derive one origin/platform lease correlation
+        run: |
+          set -euo pipefail
+          run_id="$(printf "%s:%s:%s:%s" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PLATFORM" "$TORTURER_SHA" | sha256sum | cut -c1-32)"
+          printf 'LEASE_RUN_ID=%s\n' "$run_id" >> "$GITHUB_ENV"
+          printf 'REQUEST_ARTIFACT_NAME=render-request-%s-%s\n' "$run_id" "$PLATFORM" >> "$GITHUB_ENV"
+
+      - name: Wait for the client request artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/controller"
+          found=false
+          for attempt in $(seq 1 120); do
+            response="$RUNNER_TEMP/controller/request-${attempt}.json"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${REQUEST_ARTIFACT_NAME}" | tee "$response"
+            if python3 - "$response" "$GITHUB_RUN_ID" "$REQUEST_ARTIFACT_NAME" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          wanted_run = int(sys.argv[2])
+          wanted_name = sys.argv[3]
+          for artifact in document.get("artifacts", []):
+              if artifact.get("name") != wanted_name or artifact.get("expired") is True:
+                  continue
+              if (artifact.get("workflow_run") or {}).get("id") == wanted_run:
+                  raise SystemExit(0)
+          raise SystemExit(1)
+          PY
+            then
+              found=true
+              break
+            fi
+            sleep 5
+          done
+          test "$found" = true
+
+      - name: Dispatch exactly one trusted Render lease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/server-lease.yml/dispatches" \
+            -f "ref=${GITHUB_REF_NAME}" \
+            -f "inputs[mode]=acquire" \
+            -f "inputs[origin_run_id]=${GITHUB_RUN_ID}" \
+            -f "inputs[origin_run_attempt]=${GITHUB_RUN_ATTEMPT}" \
+            -f "inputs[origin_torturer_sha]=${TORTURER_SHA}" \
+            -f "inputs[lease_run_id]=${LEASE_RUN_ID}" \
+            -f "inputs[platform]=${PLATFORM}" \
+            -f "inputs[request_artifact_name]=${REQUEST_ARTIFACT_NAME}" \
+            -f "inputs[trusted_ref]=${GITHUB_REF_NAME}"
+          unset GH_TOKEN

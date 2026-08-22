@@ -124,6 +124,38 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
         max_duration_seconds=240,
     ),
     ScenarioDefinition(
+        id="functional.core-connection",
+        version=1,
+        steps=_COMMON_CONNECT
+        + (
+            _step("stability", "measure_stability", 180),
+            _step("throughput", "measure_throughput", 180),
+            _step("disconnect", "disconnect"),
+            _step("cleanup", "inspect_cleanup"),
+        ),
+        required_capabilities=frozenset(
+            {
+                Capability.CONFIGURE,
+                Capability.CONNECT,
+                Capability.TUNNEL_INTERFACE,
+                Capability.ROUTING_IDENTITY,
+                Capability.TRAFFIC_MEASUREMENT,
+                Capability.DISCONNECT,
+                Capability.RESOURCE_CLEANUP,
+            }
+        ),
+        assertion_ids=(
+            "configure.accepted",
+            "tunnel.established",
+            "routing.identity_changed",
+            "traffic.stable",
+            "traffic.metrics_positive",
+            "disconnect.clean",
+            "cleanup.restored",
+        ),
+        max_duration_seconds=600,
+    ),
+    ScenarioDefinition(
         id="functional.stability-throughput",
         version=1,
         steps=_COMMON_CONNECT
@@ -183,6 +215,9 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
         + (
             _step("disconnect", "disconnect"),
             _step("reconnect", "reconnect", 90),
+            _step("second-tunnel", "observe_tunnel"),
+            _step("second-routing", "observe_routing_identity"),
+            _step("final-disconnect", "disconnect"),
             _step("cleanup", "inspect_cleanup"),
         ),
         required_capabilities=frozenset(
@@ -200,34 +235,12 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
             "configure.accepted",
             "tunnel.established",
             "routing.identity_changed",
+            "disconnect.clean",
             "lifecycle.restart",
-            "cleanup.restored",
-        ),
-        max_duration_seconds=480,
-    ),
-    ScenarioDefinition(
-        id="functional.failed-repeated-reconnect",
-        version=1,
-        steps=_COMMON_CONNECT
-        + (
-            _step("reconnect", "reconnect", 120),
-            _step("cleanup", "inspect_cleanup"),
-        ),
-        required_capabilities=frozenset(
-            {
-                Capability.CONFIGURE,
-                Capability.CONNECT,
-                Capability.TUNNEL_INTERFACE,
-                Capability.ROUTING_IDENTITY,
-                Capability.RECONNECT,
-                Capability.RESOURCE_CLEANUP,
-            }
-        ),
-        assertion_ids=(
-            "configure.accepted",
-            "tunnel.established",
-            "routing.identity_changed",
             "reconnect.bounded",
+            "tunnel.second_established",
+            "routing.second_identity_changed",
+            "disconnect.final_clean",
             "cleanup.restored",
         ),
         max_duration_seconds=480,

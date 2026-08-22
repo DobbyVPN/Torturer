@@ -63,6 +63,13 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
 
     def test_origin_and_request_artifacts_are_bound_to_the_same_run(self) -> None:
         self.assertIn("origin_torturer_sha:", self.text)
+        self.assertIn("origin_run_attempt:", self.text)
+        self.assertIn("ORIGIN_RUN_ATTEMPT: ${{ inputs.origin_run_attempt }}", self.text)
+        self.assertIn("trusted-render-lease-${{ inputs.origin_run_id }}-${{ inputs.platform }}", self.text)
+        self.assertIn("expected_lease = hashlib.sha256", self.text)
+        self.assertIn("actions/artifacts?name=${artifact_name}", self.text)
+        self.assertNotIn("actions/runs/${ORIGIN_RUN_ID}/artifacts", self.text)
+        self.assertIn("one Render lease already exists for this origin/platform", self.text)
         self.assertIn("ORIGIN_TORTURER_SHA: ${{ inputs.origin_torturer_sha }}", self.text)
         self.assertIn('value.get("head_sha") != os.environ["ORIGIN_TORTURER_SHA"]', self.text)
         self.assertIn('value.get("head_sha") != os.environ["TORTURER_SHA"]', self.text)

@@ -145,6 +145,39 @@ opaque run/platform artifact name. Command construction rejects shell-style
 interpolation and file collisions. The handoff helper is a contract boundary,
 not permission to publish a plaintext profile or to expose the Render token.
 
+## Android profile-observation seam
+
+When DobbyVPN exposes a candidate-owned Android profile test seam, its only
+public result must be one JSON observation record with this fixed shape:
+
+```json
+{
+  "schema": 1,
+  "kind": "dobbyvpn.android.profile-observation",
+  "platform": "android",
+  "source_sha": "FULL_40_CHARACTER_LOWERCASE_SHA",
+  "configured": true,
+  "connected": true,
+  "tunnel_interface": true,
+  "routing_identity_changed": true,
+  "stability_verified": true,
+  "latency_ms": 12.5,
+  "download_mbps": 20.0,
+  "upload_mbps": 10.0,
+  "disconnected": true,
+  "cleanup_verified": true,
+  "error_code": "OPTIONAL_SAFE_CODE"
+}
+```
+
+`error_code` is optional and must be an uppercase stable code, never an error
+message containing configuration, endpoint, identity, or credential data.
+The record must not contain a profile, config bytes, token, endpoint, literal
+IP address, command line, or raw log. Android instrumentation emits these
+observations only; the canonical Torturer engine validates the record and
+decides scenario outcomes. The `source_sha` proves which candidate produced
+the record but is not copied into scenario observation facts.
+
 ## Public test scope
 
 Public synthetic tests may verify package layout, process and service
@@ -206,8 +239,9 @@ owner-only profile file, an immutable server-image digest, and a full source
 SHA. It invokes the product's existing `dobby-cli` operations (`check-config`,
 `connect-profile`, `status --json`, `external-ip`, `disconnect`) as argument
 vectors. The adapter's canonical `reconnect` operation composes the existing
-disconnect/connect-profile/status commands within one bounded step and leaves the
-session disconnected before the cleanup observation. On Linux, optional trusted
+connect-profile/status commands after the scenario-owned disconnect within one
+bounded step and leaves that generation connected for independent second
+tunnel/identity observations; the scenario owns the final disconnect and cleanup.
 runner controls add a bounded interface down/up transition, exact service-process
 restart after a recorded loss, and timed status/identity/traffic endurance
 sampling. Those controls require explicit paths and are not inferred from a
@@ -232,21 +266,25 @@ complete start command, not additional arguments for the image ENTRYPOINT. The
 secret file is never baked into the image or emitted in a result.
 
 These entry points are unit-tested with fake adapters/provider responses. The
-manual `functional.yml` workflow currently enables only the common Linux lane and
-hands off one encrypted profile to the separate `server-lease.yml` workflow;
-the lease wrapper binds the originating run's exact Torturer `head_sha` to its
-own checkout before it can acquire a service. Both workflows are bounded and
-fail closed when the immutable image variable or Render account eligibility is
-absent. A hosted Linux result is not a claim that sleep/wake is covered; that
+manual `functional.yml` workflow currently targets only the common Linux lane and
+uses a separate least-privilege controller for the Render dispatch; the
+candidate job has no dispatch permission or repository-control token. The
+controller binds the originating run's exact Torturer `head_sha` to the lease
+request before the provider can acquire a service. Both workflows are bounded
+and fail closed when the immutable image variable or Render account eligibility
+is absent. The encrypted profile handoff into the candidate job is not yet
+wired in this revision, so no hosted functional pass is claimed. A hosted
+Linux result is not a claim that sleep/wake is covered; that
 operation remains unavailable on a runner that cannot suspend and resume itself.
-The current Linux workflow selects the five feasible profile/CLI scenarios
-(`configure`, `connect-route-identity`, `disconnect-cleanup`,
-`start-stop-start`, and `failed-repeated-reconnect`). The runner performs one
-independently bounded 20-second reset after every selected scenario, records the
-actual reset count, and rejects any selected set whose declared worst-case
-execution plus all reset windows exceeds 1,800 seconds. This lane is 1,780
-seconds by declaration, leaving 20 seconds inside the 30-minute budget; the
-workflow also wraps the functional command in the same 1,780-second hard bound.
+The current Linux lane selects the canonical `functional.core-connection`
+scenario and `functional.start-stop-start`. The core scenario has a 600-second
+maximum and the restart scenario has a 480-second maximum; two independently
+bounded 20-second resets give a declared functional budget of 1,120 seconds.
+The runner records the actual reset count and rejects any selected set whose
+declared worst-case execution plus all reset windows exceeds 1,800 seconds.
+The functional subprocess is wrapped in the same 1,120-second hard bound,
+leaving the rest of the 30-minute job for checkout, build, lease coordination,
+service startup, diagnostics, result upload, and unconditional cleanup.
 The optional network-transition seam currently interrupts the named whole
 runner interface, so it is not enabled until endpoint-only interruption or a
 runner-recovery proof is wired. The process-loss seam requires the actual Go
