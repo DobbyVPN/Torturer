@@ -12,7 +12,7 @@ import sys
 
 from torturer_contract.functional.engine import FunctionalEngine
 from torturer_contract.functional.results import RunProvenance, validate_result_payload
-from torturer_contract.functional.scenarios import catalog_document, scenario_catalog
+from torturer_contract.functional.scenarios import catalog_document, get_scenario, scenario_catalog
 
 from .cli import SubprocessRunner
 from .factory import adapter_for_platform
@@ -81,6 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--raw-log-dir", type=Path)
     parser.add_argument("--download-url")
     parser.add_argument("--upload-url")
+    parser.add_argument("--scenario-id", action="append", dest="scenario_ids", help="Run one canonical scenario; repeat to select a bounded subset.")
     parser.add_argument("--service-pid", type=int)
     parser.add_argument("--service-binary", type=Path)
     parser.add_argument("--service-socket", type=Path)
@@ -128,7 +129,10 @@ def main(argv: list[str] | None = None) -> int:
         engine = FunctionalEngine(scenario_set_digest=scenario_set_digest)
         results: list[dict[str, object]] = []
         reset_failures: list[str] = []
-        for scenario in scenario_catalog():
+        scenarios = scenario_catalog() if not args.scenario_ids else tuple(get_scenario(value) for value in args.scenario_ids)
+        if len({scenario.id for scenario in scenarios}) != len(scenarios):
+            raise ValueError("scenario-id values must be unique")
+        for scenario in scenarios:
             result = engine.run(scenario, adapter, provenance)
             payload = result.to_dict()
             validate_result_payload(payload)
@@ -148,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
             "adapter_id": adapter.adapter_id,
             "adapter_version": adapter.adapter_version,
             "scenario_set_digest": engine.scenario_set_digest,
+            "scenario_ids": [scenario.id for scenario in scenarios],
             "reset_failures": len(reset_failures),
             "results": results,
             "safe_command_evidence": list(getattr(adapter.runner, "safe_evidence", lambda: ())()),
