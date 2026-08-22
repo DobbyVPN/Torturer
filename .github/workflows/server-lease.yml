@@ -63,10 +63,14 @@ jobs:
       RENDER_IMAGE_PATH: ${{ vars.RENDER_IMAGE_PATH }}
       RENDER_IMAGE_DIGEST: ${{ vars.RENDER_IMAGE_DIGEST }}
       RENDER_REGION: ${{ vars.RENDER_REGION }}
-      LEASE_DIR: ${{ runner.temp }}/dobbyvpn-render-lease
       TORTURER_SHA: ${{ github.sha }}
 
     steps:
+      - name: Establish runner-local paths
+        run: |
+          set -euo pipefail
+          printf 'LEASE_DIR=%s\n' "$RUNNER_TEMP/dobbyvpn-render-lease" >> "$GITHUB_ENV"
+
       - name: Validate trusted lease boundary
         run: |
           set -euo pipefail
