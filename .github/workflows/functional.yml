@@ -31,11 +31,15 @@ jobs:
       PLATFORM: linux
       TORTURER_SHA: ${{ github.sha }}
       SERVER_IMAGE_DIGEST: ${{ vars.RENDER_IMAGE_DIGEST }}
-      HANDOFF_DIR: ${{ runner.temp }}/dobbyvpn-render-handoff
-      SERVICE_DIR: ${{ runner.temp }}/dobbyvpn-service
-      RESULT_PATH: ${{ runner.temp }}/dobbyvpn-render-handoff/functional-result.json
 
     steps:
+      - name: Establish runner-local paths
+        run: |
+          set -euo pipefail
+          printf 'HANDOFF_DIR=%s\n' "$RUNNER_TEMP/dobbyvpn-render-handoff" >> "$GITHUB_ENV"
+          printf 'SERVICE_DIR=%s\n' "$RUNNER_TEMP/dobbyvpn-service" >> "$GITHUB_ENV"
+          printf 'RESULT_PATH=%s\n' "$RUNNER_TEMP/dobbyvpn-render-handoff/functional-result.json" >> "$GITHUB_ENV"
+
       - name: Validate trusted functional inputs
         run: |
           set -euo pipefail
