@@ -34,6 +34,8 @@ class RenderReaperWorkflowPolicyTest(unittest.TestCase):
         self.assertNotIn("source_repository", self.text)
         self.assertNotIn("commit_sha", self.text)
         self.assertNotIn("candidate", self.text.lower())
+        self.assertEqual(self.text.count("RENDER_OWNER_ID: ${{ vars.RENDER_OWNER_ID }}"), 1)
+        self.assertNotIn("RENDER_OWNER_ID: ${{ secrets.RENDER_OWNER_ID }}", self.text)
         self.assertNotIn("profile", self.text.lower())
 
     def test_command_accepts_only_opaque_namespace_and_service_ids(self) -> None:
