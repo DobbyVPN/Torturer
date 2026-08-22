@@ -258,6 +258,7 @@ jobs:
           service_pid=$!
           printf 'SERVICE_PID=%s\n' "$service_pid" >> "$GITHUB_ENV"
           printf 'SERVICE_SOCKET=%s\n' "$control_socket" >> "$GITHUB_ENV"
+          printf 'DOBBYVPN_CONTROL_SOCKET=%s\n' "$control_socket" >> "$GITHUB_ENV"
           printf 'SERVICE_LOG=%s\n' "$service_log" >> "$GITHUB_ENV"
           ready=false
           for attempt in $(seq 1 60); do
