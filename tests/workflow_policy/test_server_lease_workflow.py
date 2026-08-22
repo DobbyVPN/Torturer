@@ -49,6 +49,10 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         self.assertNotRegex(self.text, r"(?m)^      (?:image_path|image_digest):")
 
     def test_origin_and_request_artifacts_are_bound_to_the_same_run(self) -> None:
+        self.assertIn("origin_torturer_sha:", self.text)
+        self.assertIn("ORIGIN_TORTURER_SHA: ${{ inputs.origin_torturer_sha }}", self.text)
+        self.assertIn('value.get("head_sha") != os.environ["ORIGIN_TORTURER_SHA"]', self.text)
+        self.assertIn('value.get("head_sha") != os.environ["TORTURER_SHA"]', self.text)
         self.assertIn('value.get("path") != ".github/workflows/functional.yml"', self.text)
         self.assertIn('workflow_run.get("id") != wanted_run', self.text)
         self.assertIn('files != {"request.json", "recipient.crt"}', self.text)

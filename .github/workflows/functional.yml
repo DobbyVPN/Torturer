@@ -155,6 +155,7 @@ jobs:
             -f "ref=${GITHUB_REF_NAME}" \
             -f "inputs[mode]=acquire" \
             -f "inputs[origin_run_id]=${GITHUB_RUN_ID}" \
+            -f "inputs[origin_torturer_sha]=${TORTURER_SHA}" \
             -f "inputs[lease_run_id]=${LEASE_RUN_ID}" \
             -f "inputs[platform]=${PLATFORM}" \
             -f "inputs[request_artifact_name]=${REQUEST_ARTIFACT_NAME}" \
