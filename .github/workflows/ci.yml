@@ -21,4 +21,4 @@ jobs:
         run: PYTHONPATH=. python3 -m unittest discover -s tests -p 'test_*.py' -v
 
       - name: Compile Python sources
-        run: python3 -m compileall -q torturer_checks torturer_contract tests
+        run: python3 -m compileall torturer_checks torturer_contract tests

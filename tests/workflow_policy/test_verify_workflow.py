@@ -51,6 +51,10 @@ class VerifyWorkflowPolicyTest(unittest.TestCase):
             "run: PYTHONPATH=. python3 -m unittest discover -s tests -p 'test_*.py' -v",
             SELF_TEST_WORKFLOW.read_text(encoding="utf-8"),
         )
+        self.assertIn(
+            "run: python3 -m compileall torturer_checks torturer_contract tests",
+            SELF_TEST_WORKFLOW.read_text(encoding="utf-8"),
+        )
 
     def test_all_public_workflow_actions_are_reviewed_node24_pins(self) -> None:
         """Reject a Node-16/20 action before a public runner warns about it.
