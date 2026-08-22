@@ -5,6 +5,10 @@ validation. Platform commands, credentials, and evidence storage belong to
 the adapters and callers that execute it.
 """
 
+from .android_observation import (
+    AndroidObservationError,
+    AndroidProfileObservation,
+)
 from .assertions import (
     AssertionOutcome,
     evaluate_assertion,
@@ -33,6 +37,8 @@ from .scenarios import (
 
 __all__ = [
     "AssertionOutcome",
+    "AndroidObservationError",
+    "AndroidProfileObservation",
     "CapabilityUnavailable",
     "Capability",
     "FunctionalEngine",

@@ -10,7 +10,6 @@ folder for the duration of a trusted job; only canonical results are emitted.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import ipaddress
 import json
 import os
@@ -110,8 +109,6 @@ class SubprocessRunner:
             "duration_ms": max(0, int(duration_seconds * 1000)),
             "stdout_bytes": len(result.stdout),
             "stderr_bytes": len(result.stderr),
-            "stdout_sha256": hashlib.sha256(result.stdout).hexdigest(),
-            "stderr_sha256": hashlib.sha256(result.stderr).hexdigest(),
         })
 
     def _retain_exception(self, command: Sequence[str], error: OSError, duration_seconds: float) -> None:
@@ -205,17 +202,20 @@ class HostedCLIAdapter:
             self._command(("connect-profile", str(self.profile), "0"), timeout, "CONNECT_FAILED")
             return {}
         if operation == "observe_tunnel":
-            return {"tunnel_interface": self._connected(timeout)}
+            key = "second_tunnel_interface" if step.id == "second-tunnel" else "tunnel_interface"
+            return {key: self._connected(timeout)}
         if operation == "observe_routing_identity":
             current = self._external_ip(timeout)
-            return {"routing_identity_changed": self._baseline_ip is not None and current != self._baseline_ip}
+            key = "second_routing_identity_changed" if step.id == "second-routing" else "routing_identity_changed"
+            return {key: self._baseline_ip is not None and current != self._baseline_ip}
         if operation == "measure_stability":
             return {"stability_verified": self._stability(timeout)}
         if operation == "measure_throughput":
             return self._throughput(timeout)
         if operation == "disconnect":
-            self._command(("disconnect",), timeout, "DISCONNECT_FAILED")
-            return {"disconnect_clean": True}
+            clean = self._disconnect_clean(timeout)
+            key = "final_disconnect_clean" if step.id == "final-disconnect" else "disconnect_clean"
+            return {key: clean}
         if operation == "reconnect":
             return self._reconnect(timeout)
         if operation == "inspect_cleanup":
@@ -237,6 +237,8 @@ class HostedCLIAdapter:
         try:
             if self._connected(remaining()):
                 self._command(("disconnect",), remaining(), "RESET_FAILED")
+            if self._baseline_ip is not None and not self._cleanup_verified(remaining()):
+                raise HostedAdapterError("RESET_CLEANUP_UNVERIFIED")
         finally:
             self._baseline_ip = None
 
@@ -299,17 +301,14 @@ class HostedCLIAdapter:
         }
 
     def _reconnect(self, timeout: float) -> dict[str, object]:
-        """Exercise one bounded restart and leave no session behind.
+        """Establish and verify the next session generation within one bound.
 
-        The public CLI intentionally exposes connect and disconnect rather than
-        a second reconnect command. The adapter composes those existing
-        operations, observes the new session, and closes it before returning so
-        the canonical cleanup step can verify a clean baseline. Every command
-        receives only the time remaining in this operation's declared bound.
+        The scenario owns the explicit disconnect before this operation and
+        the final disconnect/cleanup after its independent observations. This
+        operation composes only the public connect and status commands; it
+        does not hide a second disconnect or cleanup inside the observation.
         """
         deadline = time.monotonic() + timeout
-        connection_attempted = False
-        connected = False
 
         def remaining() -> float:
             value = deadline - time.monotonic()
@@ -317,24 +316,17 @@ class HostedCLIAdapter:
                 raise ScenarioExecutionError("RECONNECT_TIMEOUT")
             return value
 
-        try:
-            self._command(("disconnect",), remaining(), "RECONNECT_DISCONNECT_FAILED")
-            connection_attempted = True
-            self._command(
-                ("connect-profile", str(self.profile), "0"),
-                remaining(),
-                "RECONNECT_CONNECT_FAILED",
-            )
-            connected = self._connected(remaining())
-            if not connected:
-                raise ScenarioExecutionError("RECONNECT_NOT_ESTABLISHED")
-            return {
-                "restart_verified": True,
-                "reconnect_bounded": time.monotonic() <= deadline,
-            }
-        finally:
-            if connection_attempted:
-                self._command(("disconnect",), remaining(), "RECONNECT_CLEANUP_FAILED")
+        self._command(
+            ("connect-profile", str(self.profile), "0"),
+            remaining(),
+            "RECONNECT_CONNECT_FAILED",
+        )
+        if not self._connected(remaining()):
+            raise ScenarioExecutionError("RECONNECT_NOT_ESTABLISHED")
+        return {
+            "restart_verified": True,
+            "reconnect_bounded": time.monotonic() <= deadline,
+        }
 
     def _curl_metric(self, url: str, timeout: float, *, upload: bool) -> tuple[float, float]:
         if upload:
@@ -380,13 +372,37 @@ class HostedCLIAdapter:
             payload.chmod(0o600)
         return payload
 
+    def _disconnect_clean(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+
+        def remaining() -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise ScenarioExecutionError("DISCONNECT_TIMEOUT")
+            return value
+
+        self._command(("disconnect",), remaining(), "DISCONNECT_FAILED")
+        return self._cleanup_verified(remaining())
+
     def _cleanup_verified(self, timeout: float) -> bool:
-        result = self._command(("status", "--json"), timeout, "CLEANUP_STATUS_FAILED")
+        deadline = time.monotonic() + timeout
+
+        def remaining() -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise ScenarioExecutionError("CLEANUP_TIMEOUT")
+            return value
+
+        result = self._command(("status", "--json"), remaining(), "CLEANUP_STATUS_FAILED")
         try:
             value = json.loads(result.stdout_text)
         except (TypeError, ValueError) as error:
             raise ScenarioExecutionError("CLEANUP_STATUS_INVALID") from error
-        return isinstance(value, dict) and value.get("state") == "Disconnected"
+        if not isinstance(value, dict) or value.get("state") != "Disconnected":
+            return False
+        if self._baseline_ip is None:
+            return False
+        return self._external_ip(remaining()) == self._baseline_ip
 
 
 __all__ = ["CommandResult", "HostedAdapterError", "HostedCLIAdapter", "SubprocessRunner"]

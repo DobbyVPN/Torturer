@@ -25,16 +25,13 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertRegex(self.text, r"(?m)^on:\n  workflow_dispatch:")
         self.assertNotRegex(self.text, r"(?m)^  (?:push|pull_request|pull_request_target|schedule):")
         self.assertRegex(self.text, r"(?m)^    timeout-minutes: 30$")
-        self.assertIn("timeout --foreground --signal=TERM --kill-after=30s 1780s", self.text)
+        self.assertIn("timeout --foreground --signal=TERM --kill-after=30s 1120s", self.text)
         self.assertIn("PLATFORM: linux", self.text)
 
     def test_linux_lane_selects_only_the_feasible_canonical_subset(self) -> None:
         expected = (
-            "functional.configure",
-            "functional.connect-route-identity",
-            "functional.disconnect-cleanup",
+            "functional.core-connection",
             "functional.start-stop-start",
-            "functional.failed-repeated-reconnect",
         )
         for scenario_id in expected:
             self.assertIn(f"--scenario-id {scenario_id}", self.text)
@@ -52,7 +49,11 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("printf 'RESULT_PATH=%s\\n' \"$RUNNER_TEMP/dobbyvpn-render-handoff/functional-result.json\" >> \"$GITHUB_ENV\"", self.text)
 
     def test_permissions_and_external_actions_are_minimal_and_immutable(self) -> None:
-        self.assertRegex(self.text, r"(?m)^permissions:\n  contents: read\n  actions: write$")
+        self.assertRegex(self.text, r"(?m)^permissions:\n  contents: read$")
+        client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
+        controller = self.text[self.text.index("\n\n  controller:"):]
+        self.assertRegex(client, r"(?m)^    permissions:\n      contents: read\n      actions: read$")
+        self.assertRegex(controller, r"(?m)^    permissions:\n      contents: read\n      actions: write$")
         self.assertEqual(set(self.uses), EXPECTED_ACTIONS)
         for action in self.uses:
             self.assertRegex(action, r"^[^@\s]+@[0-9a-f]{40}$")
@@ -65,15 +66,17 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("persist-credentials: false", self.text)
         self.assertIn("submodules: recursive", self.text)
 
-    def test_control_token_is_used_only_after_candidate_preparation(self) -> None:
-        build = self.text.index("- name: Build the candidate Linux service and CLI")
-        dispatch = self.text.index("- name: Dispatch trusted Render lease wrapper")
-        start = self.text.index("- name: Start the candidate Linux service")
-        self.assertLess(build, dispatch)
-        self.assertLess(dispatch, start)
-        dispatch_block = self.text[dispatch:start]
-        self.assertIn("GH_TOKEN: ${{ github.token }}", dispatch_block)
-        self.assertIn("unset GH_TOKEN", dispatch_block)
+    def test_candidate_job_has_no_controller_token_and_controller_isolated(self) -> None:
+        client = self.text[: self.text.index("\n\n  controller:")]
+        controller = self.text[self.text.index("\n\n  controller:"):]
+        self.assertNotIn("actions: write", client)
+        self.assertNotIn("GH_TOKEN", client)
+        self.assertNotIn("github.token", client)
+        self.assertIn("actions: write", controller)
+        self.assertNotIn("actions/checkout", controller)
+        self.assertNotIn("candidate", controller.lower())
+        self.assertNotIn("desktop_build.py", controller)
+        self.assertIn("Dispatch exactly one trusted Render lease", controller)
 
     def test_only_ciphertext_crosses_the_job_boundary(self) -> None:
         request = self.text.index("- name: Upload public certificate and opaque request")
@@ -83,9 +86,12 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("request.json", request_block)
         self.assertNotIn("recipient.key", request_block)
         self.assertNotIn("profile.toml", request_block)
+        self.assertIn("PROFILE_HANDOFF_NOT_IMPLEMENTED", self.text)
         self.assertIn("--raw-log-dir", self.text)
         self.assertIn("--server-image-digest", self.text)
         self.assertIn("render-complete-${{ env.LEASE_RUN_ID }}-linux", self.text)
+        self.assertIn("actual_exe=", self.text)
+        self.assertIn("candidate service left child processes", self.text)
 
     def test_cleanup_marker_and_plaintext_removal_are_unconditional(self) -> None:
         stop = self.text.index("- name: Stop candidate service and verify process cleanup")

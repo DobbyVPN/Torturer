@@ -44,9 +44,12 @@ def _positive(observations: Mapping[str, object], key: str) -> bool:
 _ASSERTION_KEYS: dict[str, str] = {
     "configure.accepted": "configured",
     "tunnel.established": "tunnel_interface",
+    "tunnel.second_established": "second_tunnel_interface",
     "routing.identity_changed": "routing_identity_changed",
+    "routing.second_identity_changed": "second_routing_identity_changed",
     "traffic.stable": "stability_verified",
     "disconnect.clean": "disconnect_clean",
+    "disconnect.final_clean": "final_disconnect_clean",
     "cleanup.restored": "cleanup_verified",
     "lifecycle.restart": "restart_verified",
     "reconnect.bounded": "reconnect_bounded",
