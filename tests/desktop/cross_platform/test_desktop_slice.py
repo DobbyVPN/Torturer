@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import io
 import os
 from pathlib import Path
 import stat
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 
 
 TORTURER_ROOT = Path(__file__).resolve().parents[3]
@@ -25,6 +27,7 @@ from torturer_checks.desktop_slice import (
     candidate_path,
     cli_command,
     require_nonzero,
+    run_command,
     require_success,
     service_build_command,
     service_command,
@@ -188,6 +191,22 @@ class DesktopSliceHelperTest(unittest.TestCase):
         regular_path = _FakeSocketPath(mode=stat.S_IFREG | 0o600)
         with self.assertRaisesRegex(SliceFailure, "refusing to remove"):
             stop_service(_FakeProcess(returncode=0), regular_path)  # type: ignore[arg-type]
+
+    def test_run_command_streams_stdout_and_stderr(self) -> None:
+        captured_stdout = io.StringIO()
+        captured_stderr = io.StringIO()
+        command = (
+            sys.executable,
+            "-c",
+            "import sys; print('child stdout'); print('child stderr', file=sys.stderr)",
+        )
+        with redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
+            result = run_command(command, cwd=Path.cwd(), env=os.environ.copy())
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("child stdout", captured_stdout.getvalue())
+        self.assertIn("child stderr", captured_stderr.getvalue())
+        self.assertIn("stdout-begin", captured_stderr.getvalue())
+        self.assertIn("stderr-end", captured_stderr.getvalue())
 
     def test_result_assertions_report_command_output(self) -> None:
         failure = CommandResult(("tool",), 1, "out", "err")

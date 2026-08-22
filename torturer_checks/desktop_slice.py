@@ -197,6 +197,30 @@ def service_command(service: Path, target_platform: str, port: int | None) -> li
     return [str(service)]
 
 
+def emit_command_diagnostics(result: CommandResult) -> None:
+    """Expose every captured child stream while retaining it for assertions.
+
+    The slices need the captured text for machine-readable checks, but a
+    successful command must not become diagnostically silent in hosted CI.
+    Labels go to stderr; child stdout and stderr are written unchanged to their
+    corresponding parent streams.
+    """
+
+    rendered = " ".join(result.command)
+    print(
+        f"[torturer-command] argv={rendered} returncode={result.returncode} stdout-begin",
+        file=sys.stderr,
+    )
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+        sys.stdout.flush()
+    print("[torturer-command] stdout-end stderr-begin", file=sys.stderr)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+        sys.stderr.flush()
+    print("[torturer-command] stderr-end", file=sys.stderr)
+
+
 def run_command(command: Sequence[str], *, cwd: Path, env: dict[str, str]) -> CommandResult:
     """Execute an argument vector without invoking a shell."""
 
@@ -209,7 +233,9 @@ def run_command(command: Sequence[str], *, cwd: Path, env: dict[str, str]) -> Co
         stderr=subprocess.PIPE,
         check=False,
     )
-    return CommandResult(tuple(command), completed.returncode, completed.stdout, completed.stderr)
+    result = CommandResult(tuple(command), completed.returncode, completed.stdout, completed.stderr)
+    emit_command_diagnostics(result)
+    return result
 
 
 def require_success(result: CommandResult, description: str) -> None:
