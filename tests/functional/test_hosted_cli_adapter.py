@@ -8,7 +8,7 @@ import unittest
 from torturer_checks.hosted.android import AndroidHostedAdapter
 from torturer_checks.hosted.cli import CommandResult, HostedAdapterError, HostedCLIAdapter, SubprocessRunner
 from torturer_checks.hosted.linux import LinuxHostedAdapter
-from torturer_checks.hosted.run import build_parser
+from torturer_checks.hosted.run import _select_scenarios, build_parser
 from torturer_contract.functional.capabilities import Capability
 from torturer_contract.functional.engine import FunctionalEngine
 from torturer_contract.functional.scenarios import ScenarioStep, get_scenario
@@ -138,6 +138,20 @@ class HostedCLIAdapterTests(unittest.TestCase):
             "functional.configure", "--scenario-id", "functional.disconnect-cleanup",
         ])
         self.assertEqual(parsed.scenario_ids, ["functional.configure", "functional.disconnect-cleanup"])
+
+    def test_hosted_runner_rejects_a_scenario_set_over_the_lane_bound(self) -> None:
+        with self.assertRaisesRegex(ValueError, "30-minute lane bound"):
+            _select_scenarios(None)
+
+    def test_hosted_runner_accepts_all_feasible_cli_scenarios_in_one_lane(self) -> None:
+        selected = _select_scenarios([
+            "functional.configure",
+            "functional.connect-route-identity",
+            "functional.disconnect-cleanup",
+            "functional.start-stop-start",
+            "functional.failed-repeated-reconnect",
+        ])
+        self.assertEqual(len(selected), 5)
 
     def test_android_entrypoint_is_fail_closed_without_profile_session_api(self) -> None:
         adapter = AndroidHostedAdapter(cli=self.cli, profile=self.profile, runner=self.runner)

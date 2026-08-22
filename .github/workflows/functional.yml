@@ -293,7 +293,12 @@ jobs:
             --artifact "$GITHUB_WORKSPACE/candidate/kmp_module/services/dobby-cli" \
             --server-image-digest "$SERVER_IMAGE_DIGEST" \
             --output "$RESULT_PATH" \
-            --raw-log-dir "$HANDOFF_DIR/hosted-command-raw"
+            --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" \
+            --scenario-id functional.configure \
+            --scenario-id functional.connect-route-identity \
+            --scenario-id functional.disconnect-cleanup \
+            --scenario-id functional.start-stop-start \
+            --scenario-id functional.failed-repeated-reconnect
 
       - name: Stop candidate service and verify process cleanup
         if: always()

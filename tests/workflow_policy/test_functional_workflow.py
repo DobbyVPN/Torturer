@@ -27,6 +27,21 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertRegex(self.text, r"(?m)^    timeout-minutes: 30$")
         self.assertIn("PLATFORM: linux", self.text)
 
+    def test_linux_lane_selects_only_the_feasible_canonical_subset(self) -> None:
+        expected = (
+            "functional.configure",
+            "functional.connect-route-identity",
+            "functional.disconnect-cleanup",
+            "functional.start-stop-start",
+            "functional.failed-repeated-reconnect",
+        )
+        for scenario_id in expected:
+            self.assertIn(f"--scenario-id {scenario_id}", self.text)
+        self.assertNotIn("--scenario-id functional.bounded-endurance", self.text)
+        self.assertNotIn("--scenario-id functional.network-transition", self.text)
+        self.assertNotIn("--scenario-id functional.sleep-wake", self.text)
+        self.assertNotIn("--scenario-id functional.product-process-loss", self.text)
+
     def test_runner_local_paths_are_initialized_from_runner_environment(self) -> None:
         self.assertNotIn("${{ runner.temp }}", self.text)
         self.assertRegex(self.text, r"(?m)^      - name: Establish runner-local paths$")

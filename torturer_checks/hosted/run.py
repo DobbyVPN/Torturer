@@ -20,6 +20,8 @@ from .factory import adapter_for_platform
 
 ROOT = Path(__file__).resolve().parents[2]
 _SHA40 = set("0123456789abcdef")
+_MAX_LANE_SECONDS = 30 * 60
+_RESET_TIMEOUT_SECONDS = 30
 
 
 def _full_sha(value: str, name: str) -> str:
@@ -54,6 +56,17 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _select_scenarios(scenario_ids: list[str] | None) -> tuple:
+    scenarios = scenario_catalog() if not scenario_ids else tuple(get_scenario(value) for value in scenario_ids)
+    if len({scenario.id for scenario in scenarios}) != len(scenarios):
+        raise ValueError("scenario-id values must be unique")
+    worst_case_seconds = sum(scenario.max_duration_seconds for scenario in scenarios)
+    worst_case_seconds += max(0, len(scenarios) - 1) * _RESET_TIMEOUT_SECONDS
+    if worst_case_seconds > _MAX_LANE_SECONDS:
+        raise ValueError("selected scenarios exceed the 30-minute lane bound")
+    return scenarios
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
@@ -129,9 +142,7 @@ def main(argv: list[str] | None = None) -> int:
         engine = FunctionalEngine(scenario_set_digest=scenario_set_digest)
         results: list[dict[str, object]] = []
         reset_failures: list[str] = []
-        scenarios = scenario_catalog() if not args.scenario_ids else tuple(get_scenario(value) for value in args.scenario_ids)
-        if len({scenario.id for scenario in scenarios}) != len(scenarios):
-            raise ValueError("scenario-id values must be unique")
+        scenarios = _select_scenarios(args.scenario_ids)
         for scenario in scenarios:
             result = engine.run(scenario, adapter, provenance)
             payload = result.to_dict()
