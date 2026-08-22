@@ -82,7 +82,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                 self.assertNotIn("lease.example.onrender.com", json.dumps(lease))
                 self.assertEqual(
                     FakeAcquireAPI.specs[0].docker_command,
-                    "-config=/etc/secrets/config.yml",
+                    "/outline-ss-server -config=/etc/secrets/config.yml",
                 )
         finally:
             lease_cli.RenderAPI = original
