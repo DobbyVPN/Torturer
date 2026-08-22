@@ -225,7 +225,10 @@ Docker command arguments because the image already supplies
 `/outline-ss-server` as its ENTRYPOINT; the secret file is never baked into the
 image or emitted in a result.
 
-These entry points are unit-tested with fake adapters/provider responses. They
-do not claim live Render provisioning or complete hosted platform coverage
-until the server-image provenance, trusted workflow, and account-eligibility
-gates in the transition plan are complete.
+These entry points are unit-tested with fake adapters/provider responses. The
+manual `functional.yml` workflow currently enables only the Linux lane and
+hands off one encrypted profile to the separate `server-lease.yml` workflow;
+both workflows are bounded and fail closed when the immutable image variable or
+Render account eligibility is absent. They do not claim live Render provisioning
+or complete hosted platform coverage: Windows, macOS, and Android remain later
+adapter phases in the transition plan.
