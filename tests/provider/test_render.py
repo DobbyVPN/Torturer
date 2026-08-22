@@ -78,7 +78,7 @@ def image_spec_with_runtime_config() -> object:
         image_digest=IMAGE_DIGEST,
         health_check_path="/probe/tcp",
         secret_files=(("config.yml", "web:\n  servers: []\n"),),
-        docker_command="-config=/etc/secrets/config.yml",
+        docker_command="/outline-ss-server -config=/etc/secrets/config.yml",
     )
 
 
@@ -97,7 +97,7 @@ class RenderControllerTests(unittest.TestCase):
         self.assertEqual(value["secretFiles"], [{"name": "config.yml", "content": "web:\n  servers: []\n"}])
         self.assertEqual(
             value["serviceDetails"]["envSpecificDetails"]["dockerCommand"],
-            "-config=/etc/secrets/config.yml",
+            "/outline-ss-server -config=/etc/secrets/config.yml",
         )
 
     def test_outline_wss_spec_can_omit_fake_http_health_path(self) -> None:

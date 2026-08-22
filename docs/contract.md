@@ -223,10 +223,10 @@ random WSS profile and tagged service, writes the plaintext TOML profile only
 to owner-only storage, and emits an opaque lease record. Cleanup is idempotent
 and independently verifies the exact service is absent. Render credentials are
 read only from the protected workflow environment. For the selected Outline
-image, the trusted request passes only `-config=/etc/secrets/config.yml` as
-Docker command arguments because the image already supplies
-`/outline-ss-server` as its ENTRYPOINT; the secret file is never baked into the
-image or emitted in a result.
+image, the trusted request sets the complete Render Docker command to
+`/outline-ss-server -config=/etc/secrets/config.yml`. Render's override is a
+complete start command, not additional arguments for the image ENTRYPOINT. The
+secret file is never baked into the image or emitted in a result.
 
 These entry points are unit-tested with fake adapters/provider responses. The
 manual `functional.yml` workflow currently enables only the Linux lane and
