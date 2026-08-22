@@ -1,4 +1,5 @@
 name: Trusted Render lease
+run-name: Trusted Render lease ${{ inputs.lease_run_id }} ${{ inputs.platform }}
 
 on:
   workflow_dispatch:
@@ -198,34 +199,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p "$LEASE_DIR/request"
-          gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${REQUEST_ARTIFACT_NAME}" \
-            | tee "$LEASE_DIR/request/artifacts.json"
-          archive_url="$(python3 - "$LEASE_DIR/request/artifacts.json" "$ORIGIN_RUN_ID" "$REQUEST_ARTIFACT_NAME" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          wanted_run = int(sys.argv[2])
-          wanted_name = sys.argv[3]
-          for artifact in document.get("artifacts", []):
-              workflow_run = artifact.get("workflow_run") or {}
-              if artifact.get("name") != wanted_name or workflow_run.get("id") != wanted_run:
-                  continue
-              if artifact.get("expired") is True:
-                  continue
-              url = artifact.get("archive_download_url")
-              if isinstance(url, str) and url:
-                  print(url)
-                  break
-          PY
-          )"
-          test -n "$archive_url"
-          gh api "$archive_url" > "$LEASE_DIR/request/request.zip"
-          unzip -l "$LEASE_DIR/request/request.zip"
-          unzip -o "$LEASE_DIR/request/request.zip" -d "$LEASE_DIR/request/unpacked"
+          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.artifacts \
+            --repository "$GITHUB_REPOSITORY" \
+            --artifact-name "$REQUEST_ARTIFACT_NAME" \
+            --run-id "$ORIGIN_RUN_ID" \
+            --output-dir "$LEASE_DIR/request/unpacked" \
+            --metadata "$LEASE_DIR/request/artifacts.json" \
+            --archive "$LEASE_DIR/request/request.zip" \
+            --expect-file request.json \
+            --expect-file recipient.crt
+          unset GH_TOKEN
           python3 - "$LEASE_DIR/request/unpacked" <<'PY'
           import json
           import os
@@ -272,7 +255,7 @@ jobs:
             --lease-output "$LEASE_DIR/lease.json" \
             --journal "$LEASE_DIR/journal.json" \
             --region "$RENDER_REGION" \
-            --timeout-seconds 600 \
+            --timeout-seconds 300 \
             --poll-seconds 5
           test -f "$LEASE_DIR/profile.toml"
           test -f "$LEASE_DIR/lease.json"

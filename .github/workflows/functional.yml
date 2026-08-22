@@ -20,7 +20,105 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  build:
+    name: Build untrusted Linux candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+      SOURCE_SHA: ${{ inputs.commit_sha }}
+
+    steps:
+      - name: Validate exact public candidate identity
+        run: |
+          set -euo pipefail
+          test "$SOURCE_REPOSITORY" = "DobbyVPN/DobbyVPN"
+          case "$SOURCE_SHA" in
+            *[!0-9a-f]*|"") printf '%s\n' 'commit_sha must be lowercase hexadecimal' >&2; exit 1 ;;
+          esac
+          test "${#SOURCE_SHA}" -eq 40
+          printf 'source_repository=%s\nsource_sha=%s\n' "$SOURCE_REPOSITORY" "$SOURCE_SHA"
+
+      - name: Check out exact untrusted DobbyVPN candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.commit_sha }}
+          path: candidate
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Verify exact candidate checkout
+        run: |
+          set -euo pipefail
+          test "$(git -C candidate rev-parse HEAD)" = "$SOURCE_SHA"
+          git -C candidate status --porcelain=v1 --untracked-files=all
+          test -z "$(git -C candidate status --porcelain=v1 --untracked-files=all)"
+
+      - name: Build untrusted Linux service and CLI
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/desktop_build.py libs --platform linux --arch amd64
+          python3 .github/scripts/desktop_build.py app --platform linux --skip-libs
+          sha256sum kmp_module/services/ubuntu_grpcvpnserver kmp_module/services/dobby-cli
+
+      - name: Stage an allow-listed candidate runtime closure
+        run: |
+          set -euo pipefail
+          umask 077
+          stage="$RUNNER_TEMP/candidate-linux"
+          mkdir -p "$stage"
+          for name in ubuntu_grpcvpnserver dobby-cli libdobby_bridge.so libc++.so.1 libc++abi.so.1; do
+            source="candidate/kmp_module/services/$name"
+            test -f "$source"
+            test ! -L "$source"
+            install -m 0700 "$source" "$stage/$name"
+          done
+          python3 - "$stage" "$SOURCE_SHA" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+
+          root = Path(sys.argv[1])
+          names = {
+              "ubuntu_grpcvpnserver", "dobby-cli", "libdobby_bridge.so",
+              "libc++.so.1", "libc++abi.so.1",
+          }
+          actual = {path.name for path in root.iterdir()}
+          if actual != names:
+              raise SystemExit(f"candidate closure mismatch: {sorted(actual)}")
+          files = {}
+          for name in sorted(names):
+              path = root / name
+              info = path.lstat()
+              if not stat.S_ISREG(info.st_mode) or path.is_symlink() or not (info.st_mode & stat.S_IXUSR):
+                  raise SystemExit(f"unsafe candidate member: {name}")
+              files[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+          manifest = {"schema": 1, "platform": "linux", "source_sha": sys.argv[2], "files": files}
+          path = root / "manifest.json"
+          path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          path.chmod(0o600)
+          print(json.dumps(manifest, sort_keys=True))
+          PY
+
+      - name: Upload isolated candidate runtime
+        id: candidate_upload
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: candidate-linux-${{ inputs.commit_sha }}
+          path: ${{ runner.temp }}/candidate-linux
+          if-no-files-found: error
+          retention-days: 1
+          include-hidden-files: false
+
   client:
+    needs: build
     name: Trusted functional Linux
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -126,40 +224,182 @@ jobs:
           path: torturer
           persist-credentials: false
 
-      - name: Check out exact DobbyVPN candidate
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Download isolated candidate runtime without executing it
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
         with:
-          repository: ${{ inputs.source_repository }}
-          ref: ${{ inputs.commit_sha }}
+          name: candidate-linux-${{ inputs.commit_sha }}
           path: candidate
-          persist-credentials: false
-          submodules: recursive
 
-      - name: Verify exact source identities and clean Torturer checkout
+      - name: Verify trusted Torturer and exact candidate runtime closure
         run: |
           set -euo pipefail
           test "$(git -C torturer rev-parse HEAD)" = "$TORTURER_SHA"
+          git -C torturer status --porcelain=v1 --untracked-files=all
           test -z "$(git -C torturer status --porcelain=v1 --untracked-files=all)"
-          test "$(git -C candidate rev-parse HEAD)" = "$SOURCE_SHA"
+          python3 - "$GITHUB_WORKSPACE/candidate" "$SOURCE_SHA" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import stat
+          import sys
 
-      - name: Build the candidate Linux service and CLI
-        working-directory: candidate
+          root = Path(sys.argv[1])
+          binary_names = {
+              "ubuntu_grpcvpnserver", "dobby-cli", "libdobby_bridge.so",
+              "libc++.so.1", "libc++abi.so.1",
+          }
+          expected = binary_names | {"manifest.json"}
+          actual = {path.name for path in root.iterdir()}
+          if actual != expected:
+              raise SystemExit(f"candidate artifact members mismatch: {sorted(actual)}")
+          manifest_path = root / "manifest.json"
+          manifest_info = manifest_path.lstat()
+          if not stat.S_ISREG(manifest_info.st_mode) or manifest_path.is_symlink():
+              raise SystemExit("candidate manifest is not a regular file")
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          if manifest.get("schema") != 1 or manifest.get("platform") != "linux":
+              raise SystemExit("candidate manifest contract mismatch")
+          if manifest.get("source_sha") != sys.argv[2]:
+              raise SystemExit("candidate manifest source SHA mismatch")
+          if set(manifest.get("files", {})) != binary_names:
+              raise SystemExit("candidate manifest file allow-list mismatch")
+          for name in sorted(binary_names):
+              path = root / name
+              info = path.lstat()
+              if not stat.S_ISREG(info.st_mode) or path.is_symlink():
+                  raise SystemExit(f"unsafe candidate artifact member: {name}")
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              if manifest["files"].get(name) != digest:
+                  raise SystemExit(f"candidate artifact digest mismatch: {name}")
+              path.chmod(0o700)
+              print(f"{digest}  {name}")
+          PY
+
+      - name: Establish the hard thirty-minute workflow deadline
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 .github/scripts/desktop_build.py libs --platform linux --arch amd64
-          python3 .github/scripts/desktop_build.py app --platform linux --skip-libs
-          test -x kmp_module/services/ubuntu_grpcvpnserver
-          test -x kmp_module/services/dobby-cli
-          sha256sum kmp_module/services/ubuntu_grpcvpnserver kmp_module/services/dobby-cli
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" |
+            tee "$HANDOFF_DIR/origin-run.json"
+          python3 - "$HANDOFF_DIR/origin-run.json" <<'PY'
+          import datetime
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          run = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if run.get("id") != int(os.environ["GITHUB_RUN_ID"]):
+              raise SystemExit("workflow run identity mismatch")
+          started = datetime.datetime.fromisoformat(run["run_started_at"].replace("Z", "+00:00"))
+          deadline = int(started.timestamp()) + 30 * 60
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as output:
+              output.write(f"RUN_DEADLINE_EPOCH={deadline}\n")
+          print(f"run_deadline_epoch={deadline}")
+          PY
+          unset GH_TOKEN
+
+      - name: Wait for and download the exact encrypted lease response
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          response_name="render-lease-${LEASE_RUN_ID}-${PLATFORM}"
+          expected_title="Trusted Render lease ${LEASE_RUN_ID} ${PLATFORM}"
+          found=false
+          for attempt in $(seq 1 120); do
+            remaining=$((RUN_DEADLINE_EPOCH - $(date +%s)))
+            if [ "$remaining" -le 180 ]; then
+              printf 'lease response wait reached the workflow cleanup reserve: remaining=%s\n' "$remaining" >&2
+              break
+            fi
+            attempt_dir="$HANDOFF_DIR/lease-response-attempt-$attempt"
+            mkdir -p "$attempt_dir"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${response_name}" |
+              tee "$attempt_dir/poll.json"
+            if lease_workflow_run_id="$(python3 - "$attempt_dir/poll.json" "$response_name" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          matches = [
+              item for item in document.get("artifacts", [])
+              if item.get("name") == sys.argv[2] and item.get("expired") is not True
+          ]
+          if not matches:
+              raise SystemExit(1)
+          if len(matches) != 1:
+              print("encrypted response artifact identity is ambiguous", file=sys.stderr)
+              raise SystemExit(2)
+          workflow_run = matches[0].get("workflow_run")
+          run_id = workflow_run.get("id") if isinstance(workflow_run, dict) else None
+          if not isinstance(run_id, int) or run_id <= 0:
+              print("encrypted response workflow run identity is invalid", file=sys.stderr)
+              raise SystemExit(2)
+          print(run_id)
+          PY
+            )"
+            then
+              gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${lease_workflow_run_id}" |
+                tee "$attempt_dir/lease-workflow-run.json"
+              python3 - "$attempt_dir/lease-workflow-run.json" "$lease_workflow_run_id" "$expected_title" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          run = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected = {
+              "id": int(sys.argv[2]),
+              "event": "workflow_dispatch",
+              "head_branch": os.environ["GITHUB_REF_NAME"],
+              "head_sha": os.environ["TORTURER_SHA"],
+              "path": ".github/workflows/server-lease.yml",
+              "display_title": sys.argv[3],
+          }
+          for key, value in expected.items():
+              if run.get(key) != value:
+                  raise SystemExit(f"lease workflow {key} mismatch")
+          if run.get("repository", {}).get("full_name") != os.environ["GITHUB_REPOSITORY"]:
+              raise SystemExit("lease workflow repository mismatch")
+          print("lease_workflow_run=validated")
+          PY
+              if PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.artifacts \
+                --repository "$GITHUB_REPOSITORY" \
+                --artifact-name "$response_name" \
+                --run-id "$lease_workflow_run_id" \
+                --output-dir "$attempt_dir/unpacked" \
+                --metadata "$attempt_dir/artifacts.json" \
+                --archive "$attempt_dir/response.zip" \
+                --expect-file lease.json \
+                --expect-file profile.cms
+              then
+                printf 'LEASE_RESPONSE_DIR=%s\n' "$attempt_dir/unpacked" >> "$GITHUB_ENV"
+                found=true
+                break
+              fi
+            else
+              status=$?
+              if [ "$status" -ne 1 ]; then
+                exit "$status"
+              fi
+            fi
+            printf 'lease_response_attempt=%s status=pending\n' "$attempt"
+            sleep 5
+          done
+          unset GH_TOKEN
+          test "$found" = true
 
       - name: Validate and decrypt the encrypted profile
         run: |
           set -euo pipefail
-          if [ ! -f "$HANDOFF_DIR/lease-response/unpacked/lease.json" ] || [ ! -f "$HANDOFF_DIR/lease-response/unpacked/profile.cms" ]; then
-            printf '%s\n' 'PROFILE_HANDOFF_NOT_IMPLEMENTED: no safe candidate-readable Render response relay is present' >&2
-            exit 1
-          fi
-          python3 - "$HANDOFF_DIR/lease-response/unpacked/lease.json" <<'PY'
+          test -n "${LEASE_RESPONSE_DIR:-}"
+          test -f "$LEASE_RESPONSE_DIR/lease.json"
+          test -f "$LEASE_RESPONSE_DIR/profile.cms"
+          python3 - "$LEASE_RESPONSE_DIR/lease.json" <<'PY'
           import json
           import os
           import re
@@ -183,7 +423,7 @@ jobs:
           print("lease_record=validated")
           PY
           openssl cms -decrypt -binary -inform DER \
-            -in "$HANDOFF_DIR/lease-response/unpacked/profile.cms" \
+            -in "$LEASE_RESPONSE_DIR/profile.cms" \
             -recip "$HANDOFF_DIR/recipient.crt" \
             -inkey "$HANDOFF_DIR/recipient.key" \
             -out "$HANDOFF_DIR/profile.toml"
@@ -200,19 +440,12 @@ jobs:
           sudo -n env \
             DOBBYVPN_CONTROL_SOCKET="$control_socket" \
             DOBBYVPN_CONTROL_PEER_UID="$(id -u)" \
-            LD_LIBRARY_PATH="$GITHUB_WORKSPACE/candidate/go_module" \
-            "$GITHUB_WORKSPACE/candidate/kmp_module/services/ubuntu_grpcvpnserver" \
+            LD_LIBRARY_PATH="$GITHUB_WORKSPACE/candidate" \
+            "$GITHUB_WORKSPACE/candidate/ubuntu_grpcvpnserver" \
             > "$service_log" 2>&1 &
           service_pid=$!
-          expected_service="$GITHUB_WORKSPACE/candidate/kmp_module/services/ubuntu_grpcvpnserver"
+          expected_service="$GITHUB_WORKSPACE/candidate/ubuntu_grpcvpnserver"
           expected_exe="$(readlink -f "$expected_service")"
-          actual_exe="$(readlink -f "/proc/$service_pid/exe")"
-          if [ "$actual_exe" != "$expected_exe" ]; then
-            printf 'service_pid_executable_mismatch expected=%s actual=%s\n' "$expected_exe" "$actual_exe" >&2
-            ps -o pid,ppid,args -p "$service_pid"
-            cat "$service_log"
-            exit 1
-          fi
           printf 'SERVICE_PID=%s\n' "$service_pid" >> "$GITHUB_ENV"
           printf 'SERVICE_SOCKET=%s\n' "$control_socket" >> "$GITHUB_ENV"
           printf 'DOBBYVPN_CONTROL_SOCKET=%s\n' "$control_socket" >> "$GITHUB_ENV"
@@ -225,6 +458,13 @@ jobs:
               exit 1
             fi
             if [ -S "$control_socket" ]; then
+              actual_exe="$(readlink -f "/proc/$service_pid/exe")"
+              if [ "$actual_exe" != "$expected_exe" ]; then
+                printf 'service_pid_executable_mismatch expected=%s actual=%s\n' "$expected_exe" "$actual_exe" >&2
+                ps -o pid,ppid,args -p "$service_pid"
+                cat "$service_log"
+                exit 1
+              fi
               ready=true
               break
             fi
@@ -241,19 +481,33 @@ jobs:
         working-directory: torturer
         run: |
           set -euo pipefail
-          timeout --foreground --signal=TERM --kill-after=30s 1120s \
+          remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 120))
+          if [ "$remaining" -lt 950 ]; then
+            printf 'insufficient full-catalog budget before cleanup reserve: seconds=%s\n' "$remaining" >&2
+            exit 1
+          fi
+          if [ "$remaining" -gt 1260 ]; then
+            remaining=1260
+          fi
+          printf 'canonical_lane_timeout_seconds=%s\n' "$remaining"
+          timeout --foreground --signal=TERM --kill-after=30s "${remaining}s" \
             env PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.run \
             --platform linux \
-            --cli "$GITHUB_WORKSPACE/candidate/kmp_module/services/dobby-cli" \
+            --cli "$GITHUB_WORKSPACE/candidate/dobby-cli" \
             --profile "$HANDOFF_DIR/profile.toml" \
             --source-repository "$SOURCE_REPOSITORY" \
             --source-sha "$SOURCE_SHA" \
-            --artifact "$GITHUB_WORKSPACE/candidate/kmp_module/services/dobby-cli" \
+            --artifact "$GITHUB_WORKSPACE/candidate/dobby-cli" \
             --server-image-digest "$SERVER_IMAGE_DIGEST" \
             --output "$RESULT_PATH" \
             --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" \
-            --scenario-id functional.core-connection \
-            --scenario-id functional.start-stop-start
+            --download-url "https://speed.cloudflare.com/__down?bytes=1000000" \
+            --upload-url "https://speed.cloudflare.com/__up" \
+            --service-pid "$SERVICE_PID" \
+            --service-binary "$GITHUB_WORKSPACE/candidate/ubuntu_grpcvpnserver" \
+            --service-socket "$SERVICE_SOCKET" \
+            --service-library-path "$GITHUB_WORKSPACE/candidate" \
+            --service-pid-file "$SERVICE_DIR/service.pid"
 
       - name: Stop candidate service and verify process cleanup
         if: always()
@@ -329,7 +583,7 @@ jobs:
   controller:
     name: Dispatch isolated Render lease controller
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 16
     permissions:
       contents: read
       actions: write
@@ -369,7 +623,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/controller"
           found=false
-          for attempt in $(seq 1 120); do
+          for attempt in $(seq 1 180); do
             response="$RUNNER_TEMP/controller/request-${attempt}.json"
             gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${REQUEST_ARTIFACT_NAME}" | tee "$response"
             if python3 - "$response" "$GITHUB_RUN_ID" "$REQUEST_ARTIFACT_NAME" <<'PY'

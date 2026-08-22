@@ -4,29 +4,36 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from torturer_checks.hosted.android import AndroidHostedAdapter
 from torturer_checks.hosted.cli import CommandResult, HostedAdapterError, HostedCLIAdapter, SubprocessRunner
 from torturer_checks.hosted.linux import LinuxHostedAdapter
 from torturer_checks.hosted.macos import MacOSHostedAdapter
 from torturer_checks.hosted.windows import WindowsHostedAdapter
-from torturer_checks.hosted.run import _run_scenarios, _select_scenarios, build_parser
+from torturer_checks.hosted.run import (
+    _partition_applicable,
+    _run_scenarios,
+    _select_scenarios,
+    build_parser,
+)
 from torturer_contract.functional.capabilities import Capability
 from torturer_contract.functional.engine import FunctionalEngine
-from torturer_contract.functional.scenarios import ScenarioStep, get_scenario
+from torturer_contract.functional.scenarios import ScenarioStep, get_scenario, scenario_catalog
 
 
 class FakeRunner:
     def __init__(self) -> None:
         self.calls: list[tuple[str, ...]] = []
+        self.timeouts: list[float] = []
         self.connected = False
         self.external_calls = 0
         self.restore_identity = True
 
     def run(self, command, *, timeout_seconds):
-        del timeout_seconds
         argv = tuple(command)
         self.calls.append(argv)
+        self.timeouts.append(float(timeout_seconds))
         if argv[0] == "curl":
             return CommandResult(argv, 0, b"0.25\t1000000\n", b"curl diagnostic\n")
         if argv[0] == "sudo":
@@ -188,9 +195,27 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertEqual(reset_count, 2)
         self.assertEqual(reset_failures, [])
 
-    def test_hosted_runner_rejects_a_scenario_set_over_the_lane_bound(self) -> None:
-        with self.assertRaisesRegex(ValueError, "30-minute lane bound"):
-            _select_scenarios(None)
+    def test_hosted_runner_runs_the_complete_catalog_inside_the_lane_bound(self) -> None:
+        selected = _select_scenarios(None)
+        self.assertEqual(selected, scenario_catalog())
+        total_seconds = sum(item.max_duration_seconds for item in selected) + 5 * len(selected)
+        self.assertEqual(total_seconds, 1160)
+
+    def test_default_lane_partitions_all_applicable_and_unsupported_scenarios(self) -> None:
+        selected = _select_scenarios(None)
+        applicable, unsupported = _partition_applicable(selected, self.adapter.capabilities)
+        self.assertEqual(
+            len(applicable) + len(unsupported),
+            len(selected),
+        )
+        self.assertIn(
+            "functional.connect-route-identity",
+            {scenario.id for scenario in applicable},
+        )
+        unsupported_ids = {item["scenario_id"] for item in unsupported}
+        self.assertIn("functional.sleep-wake", unsupported_ids)
+        self.assertIn("functional.network-transition", unsupported_ids)
+        self.assertIn("functional.bounded-endurance", unsupported_ids)
 
     def test_hosted_runner_accepts_all_feasible_cli_scenarios_in_one_lane(self) -> None:
         selected = _select_scenarios([
@@ -234,6 +259,51 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertIn("--upload-file", curl_calls[1])
         self.assertIn("--request", curl_calls[1])
         self.assertEqual(curl_calls[1][curl_calls[1].index("--request") + 1], "POST")
+
+    def test_connect_commands_share_one_step_deadline(self) -> None:
+        with mock.patch(
+            "torturer_checks.hosted.cli.time.monotonic",
+            side_effect=[100.0, 101.0, 102.0],
+        ):
+            self.adapter.execute(
+                ScenarioStep(id="connect", operation="connect", timeout_seconds=10)
+            )
+        self.assertEqual(self.runner.timeouts, [9.0, 8.0])
+
+    def test_throughput_commands_share_one_step_deadline(self) -> None:
+        adapter = HostedCLIAdapter(
+            cli=self.cli,
+            profile=self.profile,
+            runner=self.runner,
+            download_url="https://download.example.test/blob",
+            upload_url="https://upload.example.test/blob",
+        )
+        with mock.patch(
+            "torturer_checks.hosted.cli.time.monotonic",
+            side_effect=[100.0, 101.0, 102.0],
+        ):
+            adapter._throughput(10)
+        self.assertEqual(self.runner.timeouts, [9.0, 8.0])
+
+    def test_linux_process_loss_commands_share_one_step_deadline(self) -> None:
+        class FakeService:
+            def __init__(self) -> None:
+                self.timeouts: list[float] = []
+
+            def restart_after_loss(self, timeout: float) -> None:
+                self.timeouts.append(timeout)
+
+        adapter = LinuxHostedAdapter(cli=self.cli, profile=self.profile, runner=self.runner)
+        service = FakeService()
+        adapter.service = service  # type: ignore[assignment]
+        with mock.patch(
+            "torturer_checks.hosted.linux.time.monotonic",
+            side_effect=[100.0, 101.0, 102.0, 103.0],
+        ):
+            result = adapter._process_loss(10)
+        self.assertEqual(result, {"process_loss_verified": True})
+        self.assertEqual(service.timeouts, [9.0])
+        self.assertEqual(self.runner.timeouts, [8.0, 7.0])
 
     def test_subprocess_runner_retains_complete_stdout_and_stderr_bytes(self) -> None:
         raw = Path(self.directory.name) / "raw"
