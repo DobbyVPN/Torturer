@@ -206,9 +206,12 @@ owner-only profile file, an immutable server-image digest, and a full source
 SHA. It invokes the product's existing `dobby-cli` operations (`check-config`,
 `connect-profile`, `status --json`, `external-ip`, `disconnect`) as argument
 vectors. The adapter's canonical `reconnect` operation composes the existing
-disconnect/connect-profile/status commands within one bounded step and leaves
-the session disconnected before the cleanup observation. It never imports
-DobbyVPN source or defines product behavior.
+disconnect/connect-profile/status commands within one bounded step and leaves the
+session disconnected before the cleanup observation. On Linux, optional trusted
+runner controls add a bounded interface down/up transition, exact service-process
+restart after a recorded loss, and timed status/identity/traffic endurance
+sampling. Those controls require explicit paths and are not inferred from a
+normal CLI exit. It never imports DobbyVPN source or defines product behavior.
 
 Each command's original stdout and stderr bytes are retained under the trusted
 runner's owner-only temporary evidence directory. The emitted result contains
@@ -229,11 +232,19 @@ complete start command, not additional arguments for the image ENTRYPOINT. The
 secret file is never baked into the image or emitted in a result.
 
 These entry points are unit-tested with fake adapters/provider responses. The
-manual `functional.yml` workflow currently enables only the Linux lane and
+manual `functional.yml` workflow currently enables only the common Linux lane and
 hands off one encrypted profile to the separate `server-lease.yml` workflow;
 the lease wrapper binds the originating run's exact Torturer `head_sha` to its
 own checkout before it can acquire a service. Both workflows are bounded and
 fail closed when the immutable image variable or Render account eligibility is
-absent. They do not claim live Render provisioning
-or complete hosted platform coverage: Windows, macOS, and Android remain later
-adapter phases in the transition plan.
+absent. A hosted Linux result is not a claim that sleep/wake is covered; that
+operation remains unavailable on a runner that cannot suspend and resume itself.
+The optional network-transition seam currently interrupts the named whole
+runner interface, so it is not enabled until endpoint-only interruption or a
+runner-recovery proof is wired. The process-loss seam requires the actual Go
+service PID and independently checked child cleanup; a sudo launcher PID is
+not accepted. Windows and macOS still need their trusted workflow to
+install/start the platform service and hand off the profile/control
+credentials. Android still needs a candidate-owned automation API that accepts
+a test profile and exposes consent, routing identity, and cleanup observations;
+its current APK contract intentionally supplies none of those.

@@ -143,6 +143,44 @@ class FunctionalContractTests(unittest.TestCase):
         self.assertEqual(result.metrics, {})
         validate_result_payload(result.to_dict())
 
+    def test_private_provenance_can_omit_render_image_digest(self):
+        private = RunProvenance(
+            source_repository="DobbyVPN/DobbyVPN",
+            source_sha="a" * 40,
+            torturer_sha="b" * 40,
+            artifact_sha256="c" * 64,
+            server_image_digest=None,
+            platform="linux",
+            adapter_id="private-harness-linux",
+            adapter_version="v1",
+            capabilities=frozenset({"configure"}),
+            provider_kind="private",
+        )
+        result = FunctionalEngine("e" * 64).run(
+            get_scenario("functional.configure"),
+            FakeAdapter(capabilities=frozenset({Capability.CONFIGURE})),
+            private,
+        )
+        self.assertEqual(result.outcome, "passed")
+        payload = result.to_dict()
+        self.assertEqual(payload["provenance"]["provider_kind"], "private")
+        self.assertNotIn("server_image_digest", payload["provenance"])
+        validate_result_payload(payload)
+
+    def test_render_provenance_without_image_digest_is_rejected(self):
+        with self.assertRaises(ResultValidationError):
+            RunProvenance(
+                source_repository="DobbyVPN/DobbyVPN",
+                source_sha="a" * 40,
+                torturer_sha="b" * 40,
+                artifact_sha256="c" * 64,
+                server_image_digest=None,
+                platform="linux",
+                adapter_id="fake-linux",
+                adapter_version="v1",
+                capabilities=frozenset({"configure"}),
+            )
+
     def test_engine_reports_missing_capability_as_unavailable(self):
         adapter = FakeAdapter(capabilities=frozenset({Capability.CONFIGURE}))
         result = FunctionalEngine("e" * 64).run(

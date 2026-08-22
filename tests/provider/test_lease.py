@@ -151,10 +151,41 @@ class RenderLeaseTests(unittest.TestCase):
             holder = tempfile.TemporaryDirectory(dir=directory)
             try:
                 lease = make_lease(api, holder)
-                with self.assertRaises(LeaseCleanupError):
+                with self.assertRaisesRegex(RenderAPIError, "INVALID_SERVICE_ID"):
                     lease.acquire(timeout_seconds=5, poll_seconds=1)
-                self.assertIs(lease.state, LeaseState.DELETING)
-                self.assertEqual(lease.journal.records()[-1].cleanup_result, "unverified-no-service-id")
+                self.assertIs(lease.state, LeaseState.ABSENT)
+                self.assertEqual(lease.journal.records()[-1].cleanup_result, "verified-namespace")
+            finally:
+                holder.cleanup()
+
+    def test_lost_create_response_reaps_only_this_run_namespace(self) -> None:
+        api = FakeLeaseAPI(fail_create=True)
+        old = datetime.fromtimestamp(time.time() - 5, timezone.utc).isoformat().replace("+00:00", "Z")
+        api.records = (
+            RenderServiceRecord(
+                "srv-orphan123",
+                f"dobby-torturer-{RUN_ID}-linux",
+                "tea-test123",
+                "web_service",
+                old,
+            ),
+            RenderServiceRecord(
+                "srv-other123",
+                "dobby-torturer-" + "b" * 32 + "-linux",
+                "tea-test123",
+                "web_service",
+                old,
+            ),
+        )
+        with tempfile.TemporaryDirectory(prefix="render-lease-lost-response-test.") as directory:
+            holder = tempfile.TemporaryDirectory(dir=directory)
+            try:
+                lease = make_lease(api, holder)
+                with self.assertRaisesRegex(RenderAPIError, "INVALID_SERVICE_ID"):
+                    lease.acquire(timeout_seconds=5, poll_seconds=1)
+                self.assertEqual(api.delete_calls, ["srv-orphan123"])
+                self.assertIs(lease.state, LeaseState.ABSENT)
+                self.assertEqual(lease.journal.records()[-1].cleanup_result, "verified-namespace")
             finally:
                 holder.cleanup()
 

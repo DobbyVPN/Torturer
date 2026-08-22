@@ -5,7 +5,9 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from torturer_checks.hosted.android import AndroidHostedAdapter
 from torturer_checks.hosted.cli import CommandResult, HostedAdapterError, HostedCLIAdapter, SubprocessRunner
+from torturer_checks.hosted.linux import LinuxHostedAdapter
 from torturer_contract.functional.capabilities import Capability
 from torturer_contract.functional.engine import FunctionalEngine
 from torturer_contract.functional.scenarios import ScenarioStep, get_scenario
@@ -23,6 +25,8 @@ class FakeRunner:
         self.calls.append(argv)
         if argv[0] == "curl":
             return CommandResult(argv, 0, b"0.25\t1000000\n", b"curl diagnostic\n")
+        if argv[0] == "sudo":
+            return CommandResult(argv, 0, b"sudo diagnostic\n", b"")
         operation = argv[1]
         if operation == "check-config":
             return CommandResult(argv, 0, b"profiles=1 source=file\n", b"")
@@ -53,6 +57,7 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.profile.write_text("[[Outline]]\nPassword = \"synthetic\"\n", encoding="utf-8")
         os.chmod(self.profile, 0o600)
         self.runner = FakeRunner()
+        self.runner.raw_directory = root / "runner-raw"
         self.adapter = HostedCLIAdapter(cli=self.cli, profile=self.profile, runner=self.runner)
         self.addCleanup(self.directory.cleanup)
 
@@ -99,6 +104,39 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertEqual(result.outcome, "passed")
         self.assertTrue(result.cleanup["verified"])
 
+    def test_linux_network_transition_requires_and_uses_explicit_interface(self) -> None:
+        adapter = LinuxHostedAdapter(
+            cli=self.cli, profile=self.profile, runner=self.runner, network_interface="eth0"
+        )
+        self.assertIn(Capability.NETWORK_TRANSITION, adapter.capabilities)
+        adapter.execute(ScenarioStep(id="connect", operation="connect", timeout_seconds=5))
+        adapter.execute(ScenarioStep(id="tunnel", operation="observe_tunnel", timeout_seconds=5))
+        adapter.execute(ScenarioStep(id="routing", operation="observe_routing_identity", timeout_seconds=5))
+        result = adapter.execute(ScenarioStep(id="network", operation="network_transition", timeout_seconds=5))
+        self.assertEqual(result, {"network_transition_verified": True})
+
+    def test_linux_endurance_is_url_gated_and_bounded(self) -> None:
+        adapter = LinuxHostedAdapter(
+            cli=self.cli, profile=self.profile, runner=self.runner,
+            download_url="https://download.example.test/blob",
+            upload_url="https://upload.example.test/blob",
+        )
+        self.assertIn(Capability.ENDURANCE, adapter.capabilities)
+        adapter.execute(ScenarioStep(id="connect", operation="connect", timeout_seconds=5))
+        result = adapter.execute(ScenarioStep(id="endurance", operation="measure_endurance", timeout_seconds=1))
+        self.assertTrue(result["endurance_verified"])
+        self.assertGreater(float(result["download_mbps"]), 0)
+        self.assertGreater(float(result["upload_mbps"]), 0)
+
+    def test_android_entrypoint_is_fail_closed_without_profile_session_api(self) -> None:
+        adapter = AndroidHostedAdapter(cli=self.cli, profile=self.profile, runner=self.runner)
+        self.assertEqual(adapter.capabilities, frozenset())
+        result = FunctionalEngine("e" * 64).run(
+            get_scenario("functional.configure"), adapter, _provenance(adapter)
+        )
+        self.assertEqual(result.outcome, "unavailable")
+        self.assertEqual(result.reason_code, "CAPABILITY_UNAVAILABLE")
+
     def test_unsupported_capabilities_are_explicitly_unavailable(self) -> None:
         scenario = get_scenario("functional.sleep-wake")
         engine = FunctionalEngine(scenario_set_digest="c" * 64)
@@ -118,11 +156,13 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertEqual(metrics["latency_ms"], 250.0)
         curl_calls = [call for call in self.runner.calls if call[0] == "curl"]
         self.assertEqual(len(curl_calls), 2)
-        for call in curl_calls:
-            self.assertNotIn("--silent", call)
-            self.assertIn("--show-error", call)
-            self.assertIn("--output", call)
-            self.assertEqual(call[call.index("--output") + 1], os.devnull)
+        self.assertNotIn("--silent", curl_calls[0])
+        self.assertIn("--show-error", curl_calls[0])
+        self.assertIn("--output", curl_calls[0])
+        self.assertEqual(curl_calls[0][curl_calls[0].index("--output") + 1], os.devnull)
+        self.assertIn("--upload-file", curl_calls[1])
+        self.assertIn("--request", curl_calls[1])
+        self.assertEqual(curl_calls[1][curl_calls[1].index("--request") + 1], "POST")
 
     def test_subprocess_runner_retains_complete_stdout_and_stderr_bytes(self) -> None:
         raw = Path(self.directory.name) / "raw"
@@ -135,6 +175,10 @@ class HostedCLIAdapterTests(unittest.TestCase):
         retained = (raw / "command-001.raw.log").read_bytes()
         self.assertIn(b"out\n", retained)
         self.assertIn(b"err\n", retained)
+        evidence = runner.safe_evidence()
+        self.assertEqual(evidence[0]["returncode"], 0)
+        self.assertEqual(evidence[0]["stdout_bytes"], 4)
+        self.assertNotIn("python3", repr(evidence[0]))
 
     def test_profile_must_be_owner_only(self) -> None:
         os.chmod(self.profile, 0o640)

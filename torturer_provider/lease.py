@@ -315,11 +315,18 @@ class RenderLease:
 
     def _cleanup_after_failure(self) -> None:
         if self.handle is None:
-            if self.state is LeaseState.DELETING:
+            if self.state is not LeaseState.DELETING:
+                self._transition(LeaseState.DELETING)
+            try:
+                # A create response can be lost after Render has accepted the
+                # request. The run-scoped random namespace is the only safe
+                # fallback selector when no exact service ID exists.
+                self.reap_orphans(older_than_seconds=0)
+            except Exception as error:
                 self._append("unverified-no-service-id")
-            else:
-                self._transition(LeaseState.DELETING, "unverified-no-service-id")
-            raise LeaseCleanupError("no exact service ID was returned")
+                raise LeaseCleanupError("namespace cleanup was not verified") from error
+            self._transition(LeaseState.ABSENT, "verified-namespace")
+            return
         if self.state is not LeaseState.DELETING:
             self._transition(LeaseState.DELETING)
         self.api.delete_service(self.handle.service_id)

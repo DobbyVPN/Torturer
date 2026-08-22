@@ -81,6 +81,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--raw-log-dir", type=Path)
     parser.add_argument("--download-url")
     parser.add_argument("--upload-url")
+    parser.add_argument("--service-pid", type=int)
+    parser.add_argument("--service-binary", type=Path)
+    parser.add_argument("--service-socket", type=Path)
+    parser.add_argument("--service-library-path", type=Path)
+    parser.add_argument("--service-pid-file", type=Path)
+    parser.add_argument("--network-interface")
     return parser
 
 
@@ -98,6 +104,12 @@ def main(argv: list[str] | None = None) -> int:
             runner=SubprocessRunner(raw_dir),
             download_url=args.download_url,
             upload_url=args.upload_url,
+            service_pid=args.service_pid,
+            service_binary=args.service_binary,
+            service_socket=args.service_socket,
+            service_library_path=args.service_library_path,
+            service_pid_file=args.service_pid_file,
+            network_interface=args.network_interface,
         )
         provenance = RunProvenance(
             source_repository=args.source_repository,
@@ -138,6 +150,7 @@ def main(argv: list[str] | None = None) -> int:
             "scenario_set_digest": engine.scenario_set_digest,
             "reset_failures": len(reset_failures),
             "results": results,
+            "safe_command_evidence": list(getattr(adapter.runner, "safe_evidence", lambda: ())()),
         }
         _write_json(args.output, document)
         failed = [item for item in results if item["outcome"] == "failed"]

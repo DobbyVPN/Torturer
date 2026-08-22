@@ -22,6 +22,7 @@ _REPOSITORY = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9._-]{2,95}$")
 _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,95}$")
 _REASON = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_PROVIDER_KIND = re.compile(r"^(?:render|private)$")
 
 
 def _require_string(value: object, name: str, pattern: re.Pattern[str]) -> str:
@@ -59,20 +60,26 @@ class RunProvenance:
     source_sha: str
     torturer_sha: str
     artifact_sha256: str
-    server_image_digest: str
+    server_image_digest: str | None
     platform: str
     adapter_id: str
     adapter_version: str
     capabilities: frozenset[str]
     harness_sha: str | None = None
     provider_generation: str | None = None
+    provider_kind: str = "render"
 
     def __post_init__(self) -> None:
         _require_string(self.source_repository, "source_repository", _REPOSITORY)
         _require_string(self.source_sha, "source_sha", _SHA)
         _require_string(self.torturer_sha, "torturer_sha", _SHA)
         _require_digest(self.artifact_sha256, "artifact_sha256")
-        _require_string(self.server_image_digest, "server_image_digest", _IMAGE_DIGEST)
+        if self.server_image_digest is not None:
+            _require_string(self.server_image_digest, "server_image_digest", _IMAGE_DIGEST)
+        if not isinstance(self.provider_kind, str) or not _PROVIDER_KIND.fullmatch(self.provider_kind):
+            raise ResultValidationError("provider_kind is invalid")
+        if self.provider_kind == "render" and self.server_image_digest is None:
+            raise ResultValidationError("Render provenance requires server_image_digest")
         _require_string(self.platform, "platform", _IDENTIFIER)
         _require_string(self.adapter_id, "adapter_id", _IDENTIFIER)
         _require_string(self.adapter_version, "adapter_version", _VERSION)
@@ -146,12 +153,15 @@ class ScenarioResult:
             "source_sha": self.provenance.source_sha,
             "torturer_sha": self.provenance.torturer_sha,
             "artifact_sha256": self.provenance.artifact_sha256,
-            "server_image_digest": self.provenance.server_image_digest,
             "platform": self.provenance.platform,
             "adapter_id": self.provenance.adapter_id,
             "adapter_version": self.provenance.adapter_version,
             "capabilities": sorted(self.provenance.capabilities),
         }
+        if self.provenance.server_image_digest is not None:
+            provenance["server_image_digest"] = self.provenance.server_image_digest
+        if self.provenance.provider_kind != "render":
+            provenance["provider_kind"] = self.provenance.provider_kind
         if self.provenance.harness_sha is not None:
             provenance["harness_sha"] = self.provenance.harness_sha
         if self.provenance.provider_generation is not None:
@@ -212,6 +222,7 @@ def validate_result_payload(payload: Mapping[str, object]) -> None:
             "harness_sha",
             "artifact_sha256",
             "server_image_digest",
+            "provider_kind",
             "provider_generation",
             "platform",
             "adapter_id",
@@ -225,7 +236,6 @@ def validate_result_payload(payload: Mapping[str, object]) -> None:
         "source_sha",
         "torturer_sha",
         "artifact_sha256",
-        "server_image_digest",
         "platform",
         "adapter_id",
         "adapter_version",
@@ -233,6 +243,9 @@ def validate_result_payload(payload: Mapping[str, object]) -> None:
     }
     if not required_provenance.issubset(provenance_value):
         raise ResultValidationError("provenance is incomplete")
+    provider_kind = provenance_value.get("provider_kind", "render")
+    if provider_kind != "private" and "server_image_digest" not in provenance_value:
+        raise ResultValidationError("Render provenance is missing server_image_digest")
     assertions_value = payload.get("assertions")
     if not isinstance(assertions_value, Sequence) or isinstance(assertions_value, (str, bytes)):
         raise ResultValidationError("assertions must be an array")
@@ -255,12 +268,16 @@ def validate_result_payload(payload: Mapping[str, object]) -> None:
             torturer_sha=str(provenance_value["torturer_sha"]),
             harness_sha=(str(provenance_value["harness_sha"]) if "harness_sha" in provenance_value else None),
             artifact_sha256=str(provenance_value["artifact_sha256"]),
-            server_image_digest=str(provenance_value["server_image_digest"]),
+            server_image_digest=(
+                str(provenance_value["server_image_digest"])
+                if "server_image_digest" in provenance_value else None
+            ),
             provider_generation=(str(provenance_value["provider_generation"]) if "provider_generation" in provenance_value else None),
             platform=str(provenance_value["platform"]),
             adapter_id=str(provenance_value["adapter_id"]),
             adapter_version=str(provenance_value["adapter_version"]),
             capabilities=frozenset(str(item) for item in provenance_value["capabilities"]),
+            provider_kind=str(provenance_value.get("provider_kind", "render")),
         )
         ScenarioResult(
             scenario_id=str(payload.get("scenario_id")),
