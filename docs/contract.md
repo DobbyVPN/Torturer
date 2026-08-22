@@ -228,7 +228,9 @@ image or emitted in a result.
 These entry points are unit-tested with fake adapters/provider responses. The
 manual `functional.yml` workflow currently enables only the Linux lane and
 hands off one encrypted profile to the separate `server-lease.yml` workflow;
-both workflows are bounded and fail closed when the immutable image variable or
-Render account eligibility is absent. They do not claim live Render provisioning
+the lease wrapper binds the originating run's exact Torturer `head_sha` to its
+own checkout before it can acquire a service. Both workflows are bounded and
+fail closed when the immutable image variable or Render account eligibility is
+absent. They do not claim live Render provisioning
 or complete hosted platform coverage: Windows, macOS, and Android remain later
 adapter phases in the transition plan.
