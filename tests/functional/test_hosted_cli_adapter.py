@@ -21,6 +21,8 @@ class FakeRunner:
         del timeout_seconds
         argv = tuple(command)
         self.calls.append(argv)
+        if argv[0] == "curl":
+            return CommandResult(argv, 0, b"0.25\t1000000\n", b"curl diagnostic\n")
         operation = argv[1]
         if operation == "check-config":
             return CommandResult(argv, 0, b"profiles=1 source=file\n", b"")
@@ -79,6 +81,24 @@ class HostedCLIAdapterTests(unittest.TestCase):
         result = engine.run(scenario, self.adapter, _provenance(self.adapter))
         self.assertEqual(result.outcome, "unavailable")
         self.assertEqual(result.reason_code, "CAPABILITY_UNAVAILABLE")
+
+    def test_throughput_probe_keeps_curl_diagnostics_visible(self) -> None:
+        adapter = HostedCLIAdapter(
+            cli=self.cli,
+            profile=self.profile,
+            runner=self.runner,
+            download_url="https://download.example.test/blob",
+            upload_url="https://upload.example.test/blob",
+        )
+        metrics = adapter._throughput(5)
+        self.assertEqual(metrics["latency_ms"], 250.0)
+        curl_calls = [call for call in self.runner.calls if call[0] == "curl"]
+        self.assertEqual(len(curl_calls), 2)
+        for call in curl_calls:
+            self.assertNotIn("--silent", call)
+            self.assertIn("--show-error", call)
+            self.assertIn("--output", call)
+            self.assertEqual(call[call.index("--output") + 1], os.devnull)
 
     def test_subprocess_runner_retains_complete_stdout_and_stderr_bytes(self) -> None:
         raw = Path(self.directory.name) / "raw"

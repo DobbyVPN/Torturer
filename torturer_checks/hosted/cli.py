@@ -262,7 +262,7 @@ class HostedCLIAdapter:
     def _curl_metric(self, url: str, timeout: float) -> tuple[float, float]:
         result = self.runner.run(
             (
-                "curl", "--fail", "--location", "--silent", "--show-error",
+                "curl", "--fail", "--location", "--show-error",
                 "--max-time", str(max(1, int(timeout))), "--output", os.devnull,
                 "--write-out", "%{time_total}\\t%{size_download}", url,
             ),
