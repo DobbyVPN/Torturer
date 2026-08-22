@@ -13,6 +13,10 @@ on:
         description: Numeric ID of the trusted functional workflow run.
         required: true
         type: string
+      origin_torturer_sha:
+        description: Exact Torturer commit used by the originating workflow run.
+        required: true
+        type: string
       lease_run_id:
         description: Exact 32-hex opaque lease correlation ID.
         required: true
@@ -49,6 +53,7 @@ jobs:
     env:
       MODE: ${{ inputs.mode }}
       ORIGIN_RUN_ID: ${{ inputs.origin_run_id }}
+      ORIGIN_TORTURER_SHA: ${{ inputs.origin_torturer_sha }}
       LEASE_RUN_ID: ${{ inputs.lease_run_id }}
       PLATFORM: ${{ inputs.platform }}
       REQUEST_ARTIFACT_NAME: ${{ inputs.request_artifact_name }}
@@ -79,6 +84,8 @@ jobs:
               raise SystemExit("only the implemented Linux adapter is enabled")
           if not re.fullmatch(r"[0-9]+", os.environ["ORIGIN_RUN_ID"]):
               raise SystemExit("origin_run_id is invalid")
+          if not re.fullmatch(r"[0-9a-f]{40}", os.environ["ORIGIN_TORTURER_SHA"]):
+              raise SystemExit("origin_torturer_sha is invalid")
           if not re.fullmatch(r"[0-9a-f]{32}", os.environ["LEASE_RUN_ID"]):
               raise SystemExit("lease_run_id is invalid")
           if not re.fullmatch(r"render-request-[0-9a-f]{32}-linux", os.environ["REQUEST_ARTIFACT_NAME"]):
@@ -135,6 +142,10 @@ jobs:
               raise SystemExit("origin run trigger is not trusted manual dispatch")
           if value.get("head_branch") != os.environ["TRUSTED_REF"]:
               raise SystemExit("origin run branch mismatch")
+          if value.get("head_sha") != os.environ["ORIGIN_TORTURER_SHA"]:
+              raise SystemExit("origin Torturer commit mismatch")
+          if value.get("head_sha") != os.environ["TORTURER_SHA"]:
+              raise SystemExit("provider Torturer commit drifted from origin")
           if value.get("path") != ".github/workflows/functional.yml":
               raise SystemExit("origin run workflow mismatch")
           print("origin_run=validated")
