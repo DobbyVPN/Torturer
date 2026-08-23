@@ -22,6 +22,11 @@ on:
         description: Exact Torturer commit used by the originating workflow run.
         required: true
         type: string
+      origin_workflow_path:
+        description: Exact trusted functional workflow path that requested this lease.
+        required: false
+        default: .github/workflows/functional.yml
+        type: string
       lease_run_id:
         description: Exact 32-hex opaque lease correlation ID.
         required: true
@@ -32,6 +37,9 @@ on:
         type: choice
         options:
           - linux
+          - windows
+          - macos
+          - android
       request_artifact_name:
         description: Opaque request artifact name from the origin run.
         required: true
@@ -60,6 +68,7 @@ jobs:
       ORIGIN_RUN_ID: ${{ inputs.origin_run_id }}
       ORIGIN_RUN_ATTEMPT: ${{ inputs.origin_run_attempt }}
       ORIGIN_TORTURER_SHA: ${{ inputs.origin_torturer_sha }}
+      ORIGIN_WORKFLOW_PATH: ${{ inputs.origin_workflow_path }}
       LEASE_RUN_ID: ${{ inputs.lease_run_id }}
       PLATFORM: ${{ inputs.platform }}
       REQUEST_ARTIFACT_NAME: ${{ inputs.request_artifact_name }}
@@ -93,22 +102,35 @@ jobs:
 
           if os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
               raise SystemExit("lease must be manually dispatched")
-          if os.environ.get("PLATFORM") != "linux":
-              raise SystemExit("only the implemented Linux adapter is enabled")
+          platform = os.environ["PLATFORM"]
+          if platform not in {"linux", "windows", "macos", "android"}:
+              raise SystemExit("hosted platform is not enabled")
           if not re.fullmatch(r"[0-9]+", os.environ["ORIGIN_RUN_ID"]):
               raise SystemExit("origin_run_id is invalid")
           if not re.fullmatch(r"[0-9]+", os.environ["ORIGIN_RUN_ATTEMPT"]):
               raise SystemExit("origin_run_attempt is invalid")
           if not re.fullmatch(r"[0-9a-f]{40}", os.environ["ORIGIN_TORTURER_SHA"]):
               raise SystemExit("origin_torturer_sha is invalid")
+          origin_platforms = {
+              ".github/workflows/functional.yml": "linux",
+              ".github/workflows/functional-windows.yml": "windows",
+              ".github/workflows/functional-macos.yml": "macos",
+              ".github/workflows/functional-android.yml": "android",
+          }
+          origin_workflow_path = os.environ["ORIGIN_WORKFLOW_PATH"]
+          if origin_workflow_path not in origin_platforms:
+              raise SystemExit("origin workflow path is not allow-listed")
+          if origin_platforms[origin_workflow_path] != platform:
+              raise SystemExit("origin workflow path does not match platform")
           origin_id = os.environ["ORIGIN_RUN_ID"]
           origin_attempt = os.environ["ORIGIN_RUN_ATTEMPT"]
           expected_lease = hashlib.sha256(
-              f"{origin_id}:{origin_attempt}:linux:{os.environ['ORIGIN_TORTURER_SHA']}".encode()
+              f"{origin_id}:{origin_attempt}:{platform}:{os.environ['ORIGIN_TORTURER_SHA']}".encode()
           ).hexdigest()[:32]
           if os.environ["LEASE_RUN_ID"] != expected_lease:
               raise SystemExit("lease_run_id does not match origin correlation")
-          if not re.fullmatch(r"render-request-[0-9a-f]{32}-linux", os.environ["REQUEST_ARTIFACT_NAME"]):
+          expected_artifact = f"render-request-{os.environ['LEASE_RUN_ID']}-{platform}"
+          if os.environ["REQUEST_ARTIFACT_NAME"] != expected_artifact:
               raise SystemExit("request_artifact_name is invalid")
           digest = os.environ["RENDER_IMAGE_DIGEST"]
           image_path = os.environ["RENDER_IMAGE_PATH"]
@@ -166,7 +188,7 @@ jobs:
               raise SystemExit("origin Torturer commit mismatch")
           if value.get("head_sha") != os.environ["TORTURER_SHA"]:
               raise SystemExit("provider Torturer commit drifted from origin")
-          if value.get("path") != ".github/workflows/functional.yml":
+          if value.get("path") != os.environ["ORIGIN_WORKFLOW_PATH"]:
               raise SystemExit("origin run workflow mismatch")
           print("origin_run=validated")
           PY
@@ -225,7 +247,7 @@ jobs:
               "schema": 1,
               "kind": "dobbyvpn.render-lease-request",
               "run_id": os.environ["LEASE_RUN_ID"],
-              "platform": "linux",
+              "platform": os.environ["PLATFORM"],
               "image_digest": os.environ["RENDER_IMAGE_DIGEST"],
           }
           if request != expected:
@@ -276,19 +298,26 @@ jobs:
       - name: Upload encrypted profile and safe lease record
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
-          name: render-lease-${{ inputs.lease_run_id }}-linux
+          name: render-lease-${{ inputs.lease_run_id }}-${{ inputs.platform }}
           path: |
             ${{ env.LEASE_DIR }}/profile.cms
             ${{ env.LEASE_DIR }}/lease.json
           if-no-files-found: error
           retention-days: 1
 
+      - name: Mark the issued lease as actively testing
+        run: |
+          set -euo pipefail
+          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_provider.lease_cli begin-testing \
+            --lease "$LEASE_DIR/lease.json" \
+            --journal "$LEASE_DIR/journal.json"
+
       - name: Wait for opaque functional completion marker
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          marker_name="render-complete-${LEASE_RUN_ID}-linux"
+          marker_name="render-complete-${LEASE_RUN_ID}-${PLATFORM}"
           marker_found=false
           for attempt in $(seq 1 180); do
             response="$LEASE_DIR/completion-${attempt}.json"
@@ -330,12 +359,20 @@ jobs:
           RENDER_API_TOKEN: ${{ secrets.RENDER_API_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -f "$LEASE_DIR/lease.json" ]; then
+          if [ -f "$LEASE_DIR/journal.json" ]; then
             test -n "$RENDER_API_TOKEN"
-            PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_provider.lease_cli cleanup \
-              --lease "$LEASE_DIR/lease.json"
+            cleanup_args=(
+              --journal "$LEASE_DIR/journal.json"
+              --request "$LEASE_DIR/request/unpacked/request.json"
+              --owner-id "$RENDER_OWNER_ID"
+            )
+            if [ -f "$LEASE_DIR/lease.json" ]; then
+              cleanup_args+=(--lease "$LEASE_DIR/lease.json")
+            fi
+            PYTHONPATH="$GITHUB_WORKSPACE/torturer" \
+              python3 -m torturer_provider.lease_cli cleanup "${cleanup_args[@]}"
           else
-            printf '%s\n' 'no issued lease record exists; acquisition failure owns cleanup'
+            printf '%s\n' 'no lease journal exists; no provider request reached service creation'
           fi
 
       - name: Remove plaintext lease material
@@ -348,7 +385,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
-          name: render-lease-journal-${{ inputs.lease_run_id }}-linux
+          name: render-lease-journal-${{ inputs.lease_run_id }}-${{ inputs.platform }}
           path: |
             ${{ env.LEASE_DIR }}/lease.json
             ${{ env.LEASE_DIR }}/journal.json

@@ -109,7 +109,7 @@ class IOSSimulatorAppContractTest(unittest.TestCase):
         self.root = Path(self.temporary_directory.name)
         self.candidate = self.root / "candidate"
         self.candidate.mkdir()
-        subprocess.run(["git", "init", "-q", str(self.candidate)], check=True)
+        subprocess.run(["git", "init", str(self.candidate)], check=True)
         subprocess.run(["git", "-C", str(self.candidate), "config", "user.name", "Torturer"], check=True)
         subprocess.run(
             ["git", "-C", str(self.candidate), "config", "user.email", "torturer@example.invalid"],
@@ -117,11 +117,13 @@ class IOSSimulatorAppContractTest(unittest.TestCase):
         )
         (self.candidate / "tracked.txt").write_text("fixture\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(self.candidate), "add", "tracked.txt"], check=True)
-        subprocess.run(["git", "-C", str(self.candidate), "commit", "-qm", "fixture"], check=True)
-        self.commit = subprocess.run(
+        subprocess.run(["git", "-C", str(self.candidate), "commit", "-m", "fixture"], check=True)
+        commit_result = subprocess.run(
             ["git", "-C", str(self.candidate), "rev-parse", "HEAD"],
-            check=True, text=True, capture_output=True,
-        ).stdout.strip()
+            check=True, text=True, stdout=subprocess.PIPE, stderr=None,
+        )
+        print(commit_result.stdout, end="")
+        self.commit = commit_result.stdout.strip()
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()

@@ -191,15 +191,18 @@ class ArtifactContractTest(unittest.TestCase):
     def test_source_identity_requires_exact_resolved_sha(self) -> None:
         repository = self.directory / "source"
         repository.mkdir()
-        subprocess.run(["git", "init", "-q", str(repository)], check=True)
+        subprocess.run(["git", "init", str(repository)], check=True)
         subprocess.run(["git", "-C", str(repository), "config", "user.email", "test@example.invalid"], check=True)
         subprocess.run(["git", "-C", str(repository), "config", "user.name", "Test"], check=True)
         (repository / "source.txt").write_text("public source", encoding="utf-8")
         subprocess.run(["git", "-C", str(repository), "add", "source.txt"], check=True)
-        subprocess.run(["git", "-C", str(repository), "commit", "-qm", "source"], check=True)
-        resolved = subprocess.run(
-            ["git", "-C", str(repository), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
-        ).stdout.strip()
+        subprocess.run(["git", "-C", str(repository), "commit", "-m", "source"], check=True)
+        resolved_result = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"], check=True,
+            stdout=subprocess.PIPE, stderr=None, text=True,
+        )
+        print(resolved_result.stdout, end="")
+        resolved = resolved_result.stdout.strip()
 
         identity = source_identity_from_checkout(
             repository, repository="DobbyVPN/DobbyVPN", expected_commit=resolved

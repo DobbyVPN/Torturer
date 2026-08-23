@@ -23,7 +23,12 @@ def _valid() -> dict[str, object]:
         "latency_ms": 12.5,
         "download_mbps": 20.0,
         "upload_mbps": 10.0,
-        "disconnected": True,
+        "disconnect_clean": True,
+        "restart_verified": True,
+        "reconnect_bounded": True,
+        "second_tunnel_interface": True,
+        "second_routing_identity_changed": True,
+        "final_disconnect_clean": True,
         "cleanup_verified": True,
     }
 

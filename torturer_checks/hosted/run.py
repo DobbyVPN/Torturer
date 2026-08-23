@@ -117,14 +117,17 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--platform", choices=("linux", "windows", "macos", "android"), required=True)
-    parser.add_argument("--cli", type=Path, required=True)
+    parser.add_argument("--cli", type=Path)
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--source-repository", required=True)
     parser.add_argument("--source-sha", required=True)
-    parser.add_argument("--artifact", type=Path, required=True)
+    parser.add_argument("--candidate-manifest", type=Path, required=True)
     parser.add_argument("--server-image-digest", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--raw-log-dir", type=Path)
+    parser.add_argument("--adb", type=Path)
+    parser.add_argument("--identity-url")
+    parser.add_argument("--latency-url")
     parser.add_argument("--download-url")
     parser.add_argument("--upload-url")
     parser.add_argument("--scenario-id", action="append", dest="scenario_ids", help="Run one canonical scenario; repeat to select a bounded subset.")
@@ -142,13 +145,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         source_sha = _full_sha(args.source_sha, "source SHA")
         torturer_sha = _git_head()
-        artifact_sha = _sha256(args.artifact)
+        candidate_manifest_sha = _sha256(args.candidate_manifest)
         raw_dir = args.raw_log_dir or args.output.parent / "hosted-command-raw"
         adapter = adapter_for_platform(
             args.platform,
             cli=args.cli,
             profile=args.profile,
             runner=SubprocessRunner(raw_dir),
+            adb=args.adb,
+            source_sha=source_sha,
+            identity_url=args.identity_url,
+            latency_url=args.latency_url,
             download_url=args.download_url,
             upload_url=args.upload_url,
             service_pid=args.service_pid,
@@ -162,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
             source_repository=args.source_repository,
             source_sha=source_sha,
             torturer_sha=torturer_sha,
-            artifact_sha256=artifact_sha,
+            artifact_sha256=candidate_manifest_sha,
             server_image_digest=args.server_image_digest,
             platform=args.platform,
             adapter_id=adapter.adapter_id,
@@ -192,7 +199,8 @@ def main(argv: list[str] | None = None) -> int:
             "platform": args.platform,
             "source_sha": source_sha,
             "torturer_sha": torturer_sha,
-            "artifact_sha256": artifact_sha,
+            "artifact_sha256": candidate_manifest_sha,
+            "candidate_manifest_sha256": candidate_manifest_sha,
             "server_image_digest": args.server_image_digest,
             "adapter_id": adapter.adapter_id,
             "adapter_version": adapter.adapter_version,

@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 import time
 from typing import Protocol, Sequence
 
@@ -84,6 +85,11 @@ class SubprocessCommandRunner:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
+        print(f"[ios-simulator-command] returncode={completed.returncode} output-begin")
+        if completed.stdout:
+            sys.stdout.write(completed.stdout)
+            sys.stdout.flush()
+        print("[ios-simulator-command] output-end")
         return CommandResult(returncode=completed.returncode, stdout=completed.stdout)
 
 
