@@ -92,7 +92,7 @@
       },
       "oneOf": [
         {"required": ["server_image_digest"], "properties": {"provider_kind": {"const": "render"}}},
-        {"required": ["provider_kind"], "properties": {"provider_kind": {"const": "private"}}}
+        {"required": ["provider_kind"], "properties": {"provider_kind": {"const": "private"}}, "not": {"required": ["server_image_digest"]}}
       ]
     }
   }

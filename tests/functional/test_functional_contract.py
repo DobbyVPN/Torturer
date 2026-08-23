@@ -433,6 +433,48 @@ class FunctionalContractTests(unittest.TestCase):
                 ),
             )
 
+    def test_private_provenance_rejects_render_image_digest(self):
+        with self.assertRaisesRegex(
+            ResultValidationError, "private provenance must not contain server_image_digest"
+        ):
+            RunProvenance(
+                source_repository="DobbyVPN/DobbyVPN",
+                source_sha="a" * 40,
+                torturer_sha="b" * 40,
+                artifact_sha256="c" * 64,
+                artifact_manifest_sha256="d" * 64,
+                server_image_digest="sha256:" + "e" * 64,
+                platform="linux",
+                adapter_id="private-harness-linux",
+                adapter_version="v1",
+                capabilities=frozenset({"configure"}),
+                provider_kind="private",
+                platform_version="private",
+                architecture="amd64",
+                artifact_kind="manifest",
+            )
+
+    def test_v2_phase_durations_cannot_exceed_total_duration(self):
+        with self.assertRaisesRegex(
+            ResultValidationError, "phase durations cannot exceed duration_ms"
+        ):
+            ScenarioResult(
+                scenario_id="functional.configure",
+                scenario_version=1,
+                scenario_set_digest="e" * 64,
+                provenance=provenance(),
+                outcome="passed",
+                assertions=(AssertionOutcome("configure.accepted", True),),
+                cleanup={"required": False, "verified": True},
+                metrics={},
+                duration_ms=10,
+                evidence_refs=(EvidenceReference("command-001", 17, "f" * 64),),
+                schema_version=2,
+                monotonic_start_ns=1,
+                monotonic_end_ns=11,
+                phase_durations_ms={"execution": 7, "evidence": 4},
+            )
+
     def test_restart_second_cycle_failure_cannot_be_masked(self):
         class SecondCycleFailureAdapter(FakeAdapter):
             def execute(self, step):
