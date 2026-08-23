@@ -17,6 +17,7 @@ from .cli import CommandRunner, HostedAdapterError, HostedCLIAdapter
 
 _PID = re.compile(r"^[1-9][0-9]{0,9}$")
 _INTERFACE = re.compile(r"^[A-Za-z0-9_.:-]{1,32}$")
+_MIN_ENDURANCE_SAMPLE_SECONDS = 5.0
 _SERVICE_LAUNCH_SCRIPT = """\
 set -eu
 binary=$1
@@ -285,6 +286,15 @@ class LinuxHostedAdapter(HostedCLIAdapter):
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if not last_metrics:
+                    raise ScenarioExecutionError("ENDURANCE_NO_COMPLETE_SAMPLE")
+                return {"endurance_verified": True, **last_metrics}
+            # A download/upload pair needs a meaningful transfer window. Once
+            # at least one complete sample exists, preserve the final partial
+            # interval instead of starting a curl pair that is guaranteed to
+            # be terminated by the endurance deadline.
+            if last_metrics and remaining < _MIN_ENDURANCE_SAMPLE_SECONDS:
+                time.sleep(remaining)
                 return {"endurance_verified": True, **last_metrics}
             if not self._connected(min(30.0, remaining)):
                 raise ScenarioExecutionError("ENDURANCE_DISCONNECTED")

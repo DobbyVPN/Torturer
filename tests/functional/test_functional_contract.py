@@ -100,6 +100,26 @@ class FunctionalContractTests(unittest.TestCase):
                 scenario.max_duration_seconds,
             )
 
+        endurance = get_scenario("functional.bounded-endurance")
+        self.assertIn(
+            "traffic.metrics_positive",
+            endurance.assertion_ids,
+        )
+
+    def test_cleanup_assertions_have_an_explicit_disconnect_step(self):
+        for scenario in scenario_catalog():
+            if "cleanup.restored" not in scenario.assertion_ids:
+                continue
+            operations = [step.operation for step in scenario.steps]
+            cleanup_index = operations.index("inspect_cleanup")
+            self.assertGreater(cleanup_index, 0, scenario.id)
+            self.assertEqual(operations[cleanup_index - 1], "disconnect", scenario.id)
+            self.assertIn(Capability.DISCONNECT, scenario.required_capabilities, scenario.id)
+            self.assertTrue(
+                {"disconnect.clean", "disconnect.final_clean"} & set(scenario.assertion_ids),
+                scenario.id,
+            )
+
     def test_catalog_document_matches_schema_fixture_shape(self):
         document = catalog_document()
         schema_path = Path(__file__).parents[2] / "torturer_contract/functional/schema/scenario-v1.schema.json"
