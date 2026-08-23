@@ -4,6 +4,8 @@ import os
 import socket
 from pathlib import Path
 import tempfile
+import sys
+import time
 import unittest
 from unittest import mock
 
@@ -179,8 +181,8 @@ class HostedCLIAdapterTests(unittest.TestCase):
         result = adapter.execute(ScenarioStep(id="network", operation="network_transition", timeout_seconds=5))
         self.assertEqual(result, {"network_transition_verified": True})
 
-    def test_linux_endurance_is_url_gated_and_bounded(self) -> None:
-        adapter = LinuxHostedAdapter(
+    def test_shared_desktop_endurance_is_url_gated_and_bounded(self) -> None:
+        adapter = HostedCLIAdapter(
             cli=self.cli, profile=self.profile, runner=self.runner,
             download_url="https://download.example.test/blob",
             upload_url="https://upload.example.test/blob",
@@ -191,9 +193,17 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertTrue(result["endurance_verified"])
         self.assertGreater(float(result["download_mbps"]), 0)
         self.assertGreater(float(result["upload_mbps"]), 0)
+        for adapter_class in (LinuxHostedAdapter, WindowsHostedAdapter, MacOSHostedAdapter):
+            with self.subTest(adapter=adapter_class.__name__):
+                desktop = adapter_class(
+                    cli=self.cli, profile=self.profile, runner=FakeRunner(),
+                    download_url="https://download.example.test/blob",
+                    upload_url="https://upload.example.test/blob",
+                )
+                self.assertIn(Capability.ENDURANCE, desktop.capabilities)
 
-    def test_linux_endurance_does_not_start_a_partial_tail_transfer(self) -> None:
-        adapter = LinuxHostedAdapter(
+    def test_shared_desktop_endurance_does_not_start_a_partial_tail_transfer(self) -> None:
+        adapter = HostedCLIAdapter(
             cli=self.cli, profile=self.profile, runner=self.runner,
             download_url="https://download.example.test/blob",
             upload_url="https://upload.example.test/blob",
@@ -204,7 +214,7 @@ class HostedCLIAdapterTests(unittest.TestCase):
             mock.patch.object(adapter, "_routing_identity_changed", return_value=True),
             mock.patch.object(adapter, "_throughput", return_value=metrics) as throughput,
             mock.patch(
-                "torturer_checks.hosted.linux.time.monotonic",
+                "torturer_checks.hosted.cli.time.monotonic",
                 side_effect=[100.0, 100.0, 101.0, 159.0, 159.5],
             ),
             mock.patch("torturer_checks.hosted.linux.time.sleep") as sleep,
@@ -215,13 +225,13 @@ class HostedCLIAdapterTests(unittest.TestCase):
         throughput.assert_called_once_with(30.0)
         self.assertEqual(sleep.call_args_list, [mock.call(1.0), mock.call(0.5)])
 
-    def test_linux_endurance_rejects_zero_complete_samples(self) -> None:
-        adapter = LinuxHostedAdapter(
+    def test_shared_desktop_endurance_rejects_zero_complete_samples(self) -> None:
+        adapter = HostedCLIAdapter(
             cli=self.cli, profile=self.profile, runner=self.runner,
             download_url="https://download.example.test/blob",
             upload_url="https://upload.example.test/blob",
         )
-        with mock.patch("torturer_checks.hosted.linux.time.monotonic", side_effect=[100.0, 100.0]):
+        with mock.patch("torturer_checks.hosted.cli.time.monotonic", side_effect=[100.0, 100.0]):
             with self.assertRaisesRegex(ScenarioExecutionError, "ENDURANCE_NO_COMPLETE_SAMPLE"):
                 adapter._endurance(0.0)
 
@@ -229,7 +239,7 @@ class HostedCLIAdapterTests(unittest.TestCase):
         parsed = build_parser().parse_args([
             "--platform", "linux", "--cli", str(self.cli), "--profile", str(self.profile),
             "--source-repository", "DobbyVPN/DobbyVPN", "--source-sha", "a" * 40,
-            "--artifact", str(self.cli), "--server-image-digest", "sha256:" + "b" * 64,
+            "--candidate-manifest", str(self.cli), "--server-image-digest", "sha256:" + "b" * 64,
             "--output", str(self.directory.name + "/result.json"), "--scenario-id",
             "functional.configure", "--scenario-id", "functional.disconnect-cleanup",
         ])
@@ -434,17 +444,89 @@ class HostedCLIAdapterTests(unittest.TestCase):
             timeout_seconds=5,
         )
         self.assertEqual(result.returncode, 0)
-        retained = (raw / "command-001.raw.log").read_bytes()
+        retained_path = next(raw.glob("command-001*.raw.log"))
+        retained = retained_path.read_bytes()
         self.assertIn(b"198.51.100.10\n", retained)
         self.assertIn(b"err\n", retained)
         evidence = runner.safe_evidence()
         self.assertEqual(evidence[0]["returncode"], 0)
+        self.assertEqual(evidence[0]["evidence_file"], retained_path.name)
         self.assertEqual(evidence[0]["stdout_bytes"], 14)
         self.assertNotIn("198.51.100.10", repr(evidence[0]))
         self.assertNotIn("stdout_sha256", evidence[0])
         self.assertNotIn("stderr_sha256", evidence[0])
         self.assertNotIn("python3", repr(evidence[0]))
 
+    def test_subprocess_runner_never_overwrites_another_runner_sequence(self) -> None:
+        raw = Path(self.directory.name) / "shared-raw"
+        first = SubprocessRunner(raw)
+        second = SubprocessRunner(raw)
+        first.run(
+            (sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'first\\n')"),
+            timeout_seconds=5,
+        )
+        second.run(
+            (sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'second\\n')"),
+            timeout_seconds=5,
+        )
+        retained = sorted(raw.glob("command-001*.raw.log"))
+        self.assertEqual(len(retained), 2)
+        contents = {path.read_bytes() for path in retained}
+        self.assertEqual(sum(b"first\\n" in item for item in contents), 1)
+        self.assertEqual(sum(b"second\\n" in item for item in contents), 1)
+        self.assertEqual(
+            {first.safe_evidence()[0]["evidence_file"], second.safe_evidence()[0]["evidence_file"]},
+            {path.name for path in retained},
+        )
+        self.assertTrue(all((path.stat().st_mode & 0o777) == 0o600 for path in retained))
+
+    @unittest.skipUnless(os.name == "posix", "process-group assertion requires POSIX")
+    def test_subprocess_runner_kills_child_process_group_on_timeout(self) -> None:
+        raw = Path(self.directory.name) / "timeout-raw"
+        runner = SubprocessRunner(raw)
+        child_script = "import time; time.sleep(60)"
+        parent_script = (
+            "import subprocess,sys,time; "
+            "child=subprocess.Popen([sys.executable, '-c', sys.argv[1]]); "
+            "print(child.pid, flush=True); time.sleep(60)"
+        )
+        with self.assertRaisesRegex(HostedAdapterError, "COMMAND_TIMEOUT"):
+            runner.run(
+                (sys.executable, "-c", parent_script, child_script),
+                timeout_seconds=0.2,
+            )
+
+        retained = next(raw.glob("command-001*.raw.log"))
+        child_pid = int(
+            retained.read_text().split("stdout-begin\n", 1)[1].split("\nstdout-end", 1)[0].strip()
+        )
+        for _ in range(40):
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            stat_path = Path(f"/proc/{child_pid}/stat")
+            if stat_path.exists() and stat_path.read_text(encoding="ascii").split(") ", 1)[1].split()[0] == "Z":
+                break
+            time.sleep(0.05)
+        else:
+            self.fail(f"timed-out child process {child_pid} survived the process-group kill")
+
+    def test_throughput_urls_reject_query_fragment_and_userinfo(self) -> None:
+        for invalid in (
+            "https://download.example.test/blob?token=x",
+            "https://download.example.test/blob#fragment",
+            "https://user:password@download.example.test/blob",
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(HostedAdapterError, "THROUGHPUT_URL_INVALID"):
+                    HostedCLIAdapter(
+                        cli=self.cli,
+                        profile=self.profile,
+                        runner=self.runner,
+                        download_url=invalid,
+                        upload_url="https://upload.example.test/blob",
+                    )
     def test_profile_must_be_owner_only(self) -> None:
         os.chmod(self.profile, 0o640)
         with self.assertRaisesRegex(HostedAdapterError, "PROFILE_NOT_OWNER_ONLY"):

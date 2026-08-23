@@ -43,15 +43,19 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         ):
             self.assertIn(option, block)
         self.assertNotIn("--network-interface", block)
+        self.assertIn('--download-url "https://proof.ovh.net/files/1Mb.dat"', block)
+        self.assertNotRegex(block, r'--(?:download|upload)-url\s+"[^"\n]*[?#]')
+        self.assertNotIn("speed.cloudflare.com/__down?", block)
 
     def test_runner_local_paths_are_initialized_from_runner_environment(self) -> None:
         client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
         self.assertNotIn("${{ runner.temp }}", client)
         self.assertRegex(client, r"(?m)^      - name: Establish runner-local paths$")
-        self.assertIn("printf 'HANDOFF_DIR=%s\\n' \"$RUNNER_TEMP/dobbyvpn-render-handoff\" >> \"$GITHUB_ENV\"", client)
-        self.assertIn("printf 'SERVICE_DIR=%s\\n' \"$RUNNER_TEMP/dobbyvpn-service\" >> \"$GITHUB_ENV\"", client)
-        self.assertIn("printf 'DOBBYVPN_CONTROL_SOCKET=%s\\n' \"$control_socket\" >> \"$GITHUB_ENV\"", client)
-        self.assertIn("printf 'RESULT_PATH=%s\\n' \"$RUNNER_TEMP/dobbyvpn-render-handoff/functional-result.json\" >> \"$GITHUB_ENV\"", client)
+        self.assertIn("printf 'HANDOFF_DIR=%s\\n' \"$RUNNER_TEMP/dobbyvpn-render-handoff\"", client)
+        self.assertIn("printf 'SERVICE_DIR=%s\\n' \"$RUNNER_TEMP/dobbyvpn-service\"", client)
+        self.assertIn("printf 'DOBBYVPN_CONTROL_SOCKET=%s\\n' \"$control_socket\"", client)
+        self.assertIn("printf 'RESULT_PATH=%s\\n' \"$RUNNER_TEMP/dobbyvpn-render-handoff/functional-result.json\"", client)
+        self.assertGreaterEqual(client.count('} >> "$GITHUB_ENV"'), 2)
 
     def test_permissions_and_external_actions_are_minimal_and_immutable(self) -> None:
         self.assertRegex(self.text, r"(?m)^permissions:\n  contents: read$")
@@ -76,6 +80,10 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("submodules: recursive", build)
         self.assertIn("Stage an allow-listed candidate runtime closure", build)
         self.assertIn("Upload isolated candidate runtime", build)
+        self.assertIn("torturer_checks.hosted.candidate stage", build)
+        self.assertIn("--platform linux --architecture amd64", build)
+        self.assertIn("torturer_checks.hosted.candidate verify", self.text)
+        self.assertIn("Check out exact trusted Torturer helper revision", build)
 
     def test_tokens_end_before_any_candidate_execution(self) -> None:
         client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
@@ -88,6 +96,20 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertNotIn("actions/checkout", controller)
         self.assertNotIn("desktop_build.py", controller)
         self.assertIn("Dispatch exactly one trusted Render lease", controller)
+
+    def test_render_provisioning_starts_only_after_verified_client_readiness(self) -> None:
+        verify = self.text.index("- name: Verify trusted Torturer and exact candidate runtime closure")
+        deadline = self.text.index("- name: Establish the hard thirty-minute workflow deadline")
+        request = self.text.index("- name: Upload public certificate and opaque request after verified client readiness")
+        wait = self.text.index("- name: Wait for and download the exact encrypted lease response")
+        start = self.text.index("- name: Start the candidate Linux service")
+        functional = self.text.index("- name: Run canonical Linux functional scenarios")
+        self.assertLess(verify, deadline)
+        self.assertLess(deadline, request)
+        self.assertLess(request, wait)
+        self.assertLess(wait, start)
+        self.assertLess(start, functional)
+        self.assertNotIn("GH_TOKEN", self.text[start:functional])
 
     def test_only_public_request_and_ciphertext_cross_job_boundaries(self) -> None:
         request = self.text.index("- name: Upload public certificate and opaque request")
@@ -108,6 +130,7 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertIn('"head_sha": os.environ["TORTURER_SHA"]', self.text)
         self.assertIn("--raw-log-dir", self.text)
         self.assertIn("--server-image-digest", self.text)
+        self.assertIn('--candidate-manifest "$GITHUB_WORKSPACE/candidate/manifest.json"', self.text)
         self.assertIn("render-complete-${{ env.LEASE_RUN_ID }}-linux", self.text)
         self.assertIn("actual_exe=", self.text)
         self.assertIn("candidate service left child processes", self.text)

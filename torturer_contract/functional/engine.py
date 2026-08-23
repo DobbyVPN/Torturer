@@ -34,6 +34,12 @@ class ScenarioAdapter(Protocol):
     def execute(self, step: ScenarioStep) -> Mapping[str, object]: ...
 
 
+class BulkScenarioAdapter(Protocol):
+    """Optional one-session canonical scenario boundary."""
+
+    def execute_scenario(self, scenario: ScenarioDefinition) -> Mapping[str, object]: ...
+
+
 @dataclass(frozen=True)
 class FunctionalEngine:
     """Execute a definition without owning platform commands or evidence."""
@@ -64,17 +70,30 @@ class FunctionalEngine:
         started = time.monotonic()
         observations: dict[str, object] = {}
         try:
-            for step in scenario.steps:
+            bulk_execute = getattr(adapter, "execute_scenario", None)
+            if callable(bulk_execute):
                 if time.monotonic() - started > scenario.max_duration_seconds:
                     return self._failure(
                         scenario, provenance, "SCENARIO_TIMEOUT", observations, started
                     )
-                result = adapter.execute(step)
+                result = bulk_execute(scenario)
                 if not isinstance(result, Mapping):
                     return self._failure(
                         scenario, provenance, "ADAPTER_RESULT_INVALID", observations, started
                     )
                 observations.update(result)
+            else:
+                for step in scenario.steps:
+                    if time.monotonic() - started > scenario.max_duration_seconds:
+                        return self._failure(
+                            scenario, provenance, "SCENARIO_TIMEOUT", observations, started
+                        )
+                    result = adapter.execute(step)
+                    if not isinstance(result, Mapping):
+                        return self._failure(
+                            scenario, provenance, "ADAPTER_RESULT_INVALID", observations, started
+                        )
+                    observations.update(result)
             if time.monotonic() - started > scenario.max_duration_seconds:
                 return self._failure(
                     scenario, provenance, "SCENARIO_TIMEOUT", observations, started

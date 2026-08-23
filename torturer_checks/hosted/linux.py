@@ -17,7 +17,6 @@ from .cli import CommandRunner, HostedAdapterError, HostedCLIAdapter
 
 _PID = re.compile(r"^[1-9][0-9]{0,9}$")
 _INTERFACE = re.compile(r"^[A-Za-z0-9_.:-]{1,32}$")
-_MIN_ENDURANCE_SAMPLE_SECONDS = 5.0
 _SERVICE_LAUNCH_SCRIPT = """\
 set -eu
 binary=$1
@@ -227,8 +226,6 @@ class LinuxHostedAdapter(HostedCLIAdapter):
             result.add(Capability.NETWORK_TRANSITION)
         if self.service is not None:
             result.add(Capability.PROCESS_LOSS)
-        if self.download_url is not None and self.upload_url is not None:
-            result.add(Capability.ENDURANCE)
         return frozenset(result)
 
     def execute(self, step: ScenarioStep) -> dict[str, object]:
@@ -236,8 +233,6 @@ class LinuxHostedAdapter(HostedCLIAdapter):
             return self._network_transition(float(step.timeout_seconds))
         if step.operation == "process_loss":
             return self._process_loss(float(step.timeout_seconds))
-        if step.operation == "measure_endurance":
-            return self._endurance(float(step.timeout_seconds))
         return super().execute(step)
 
     def _network_transition(self, timeout: float) -> dict[str, object]:
@@ -280,33 +275,5 @@ class LinuxHostedAdapter(HostedCLIAdapter):
         if not self._routing_identity_changed(self._remaining(deadline, "PROCESS_LOSS_TIMEOUT")):
             raise ScenarioExecutionError("PROCESS_LOSS_ROUTING_NOT_RECOVERED")
         return {"process_loss_verified": True}
-
-    def _endurance(self, timeout: float) -> dict[str, object]:
-        if self.download_url is None or self.upload_url is None:
-            raise CapabilityUnavailable()
-        deadline = time.monotonic() + timeout
-        last_metrics: dict[str, object] = {}
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                if not last_metrics:
-                    raise ScenarioExecutionError("ENDURANCE_NO_COMPLETE_SAMPLE")
-                return {"endurance_verified": True, **last_metrics}
-            # A download/upload pair needs a meaningful transfer window. Once
-            # at least one complete sample exists, preserve the final partial
-            # interval instead of starting a curl pair that is guaranteed to
-            # be terminated by the endurance deadline.
-            if last_metrics and remaining < _MIN_ENDURANCE_SAMPLE_SECONDS:
-                time.sleep(remaining)
-                return {"endurance_verified": True, **last_metrics}
-            if not self._connected(min(30.0, remaining)):
-                raise ScenarioExecutionError("ENDURANCE_DISCONNECTED")
-            if not self._routing_identity_changed(min(30.0, remaining)):
-                raise ScenarioExecutionError("ENDURANCE_ROUTING_LOST")
-            last_metrics = self._throughput(min(30.0, remaining))
-            if time.monotonic() >= deadline:
-                return {"endurance_verified": True, **last_metrics}
-            time.sleep(min(5.0, max(0.0, deadline - time.monotonic())))
-
 
 __all__ = ["LinuxHostedAdapter", "LinuxServiceProcessController"]

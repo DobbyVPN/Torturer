@@ -12,7 +12,7 @@ class SourceCheckoutTest(unittest.TestCase):
     def test_accepts_exact_clean_commit_and_rejects_tracked_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(["git", "init", str(root)], check=True)
             subprocess.run(["git", "-C", str(root), "config", "user.name", "Torturer"], check=True)
             subprocess.run(
                 ["git", "-C", str(root), "config", "user.email", "torturer@example.invalid"],
@@ -21,13 +21,16 @@ class SourceCheckoutTest(unittest.TestCase):
             tracked = root / "tracked.txt"
             tracked.write_text("clean\n", encoding="utf-8")
             subprocess.run(["git", "-C", str(root), "add", "tracked.txt"], check=True)
-            subprocess.run(["git", "-C", str(root), "commit", "-qm", "fixture"], check=True)
-            commit = subprocess.run(
+            subprocess.run(["git", "-C", str(root), "commit", "-m", "fixture"], check=True)
+            commit_result = subprocess.run(
                 ["git", "-C", str(root), "rev-parse", "HEAD"],
                 check=True,
                 text=True,
                 stdout=subprocess.PIPE,
-            ).stdout.strip()
+                stderr=None,
+            )
+            print(commit_result.stdout, end="")
+            commit = commit_result.stdout.strip()
 
             verify_source_checkout(root, commit)
             (root / "untracked.txt").write_text("allowed\n", encoding="utf-8")

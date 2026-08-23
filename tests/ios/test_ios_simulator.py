@@ -202,7 +202,7 @@ class IOSSimulatorContractTest(unittest.TestCase):
     def test_source_identity_wrapper_requires_an_exact_clean_checkout(self) -> None:
         candidate = self.root / "candidate"
         candidate.mkdir()
-        subprocess.run(["git", "init", "-q", str(candidate)], check=True)
+        subprocess.run(["git", "init", str(candidate)], check=True)
         subprocess.run(["git", "-C", str(candidate), "config", "user.name", "Torturer"], check=True)
         subprocess.run(
             ["git", "-C", str(candidate), "config", "user.email", "torturer@example.invalid"],
@@ -210,11 +210,13 @@ class IOSSimulatorContractTest(unittest.TestCase):
         )
         (candidate / "tracked.txt").write_text("clean\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(candidate), "add", "tracked.txt"], check=True)
-        subprocess.run(["git", "-C", str(candidate), "commit", "-qm", "fixture"], check=True)
-        commit = subprocess.run(
+        subprocess.run(["git", "-C", str(candidate), "commit", "-m", "fixture"], check=True)
+        commit_result = subprocess.run(
             ["git", "-C", str(candidate), "rev-parse", "HEAD"],
-            check=True, text=True, capture_output=True,
-        ).stdout.strip()
+            check=True, text=True, stdout=subprocess.PIPE, stderr=None,
+        )
+        print(commit_result.stdout, end="")
+        commit = commit_result.stdout.strip()
 
         identity = source_identity_from_simulator_checkout(
             candidate, repository="DobbyVPN/DobbyVPN", expected_commit=commit

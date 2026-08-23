@@ -5,9 +5,10 @@ Independent public black-box verification for
 
 Torturer exercises exact candidate commits and their source-built
 applications on GitHub-hosted Linux, Windows, macOS, and Android runners. Its
-tests use only public synthetic inputs and product-facing interfaces. It
-contains no private profiles, credentials, signing material, or release
-secrets.
+repository contains only public synthetic inputs and product-facing
+interfaces. Trusted functional jobs create a short-lived synthetic VPN profile
+at runtime; no profile, provider credential, signing material, or release
+secret is stored in this repository or emitted in a public result.
 
 ## Why this is separate
 
@@ -20,11 +21,44 @@ co-located unit, package-private, source-set, or seam tests.
 
 ## Public coverage
 
-- Linux, Windows, macOS ARM, and macOS Intel source-build/CLI/service contracts;
+The secretless reusable `verify.yml` workflow covers:
+
+- Linux, Windows, macOS ARM, and macOS Intel source-build, CLI, and service
+  contracts;
 - Android dual-ABI APK layout, installation, package-facing behavior, and
-  candidate-owned lifecycle instrumentation;
+  candidate-owned lifecycle instrumentation; and
 - portable Windows/macOS ZIP identity, layout, architecture, digest, and
-  obvious-credential-marker inspection helpers.
+  obvious-credential-marker inspection.
+
+The manually dispatched trusted functional workflows cover Linux, Windows,
+macOS, and Android against one disposable Outline WebSocket server per
+platform. A secretless build job produces and hashes an allow-listed candidate
+closure. The client job proves that closure and its platform is ready before it
+publishes an opaque lease request. A separate controller dispatches the
+provider workflow, which creates the Render service and encrypts the generated
+profile to the client's ephemeral certificate. Candidate execution begins only
+after token-bearing GitHub operations finish; it never receives the Render
+credential or a repository-control token.
+
+Linux, Windows, and macOS use the product's public service and CLI. Android uses
+a headless KVM emulator and the candidate-owned
+`AndroidHostedProfileInstrumentationTest` driver. Every adapter executes the
+same canonical scenario catalog and assertions, runs every scenario supported
+by its proved capabilities, and reports the remainder explicitly as
+unsupported. Current hosted desktop lanes prove configuration, connection,
+tunnel and routing identity, traffic metrics, disconnect/cleanup, reconnect,
+bounded endurance, and exact product-process recovery. Android proves the
+common connection, traffic, reconnect, disconnect, and cleanup set. Hosted
+network-transition and sleep/wake operations remain unavailable because no
+workflow supplies a safe runner control for them; they are never inferred as
+passes.
+
+Each platform workflow has one total 30-minute deadline measured from the
+workflow run start, including source build, client readiness, lease
+coordination, scenarios, evidence, and cleanup. Android requires `/dev/kvm` and
+always launches its emulator headlessly. The provider workflow cleans and
+independently verifies deletion of the exact tagged Render service even when a
+client fails or never publishes its completion marker.
 
 The repository contains a pinned public iOS Simulator core lane. It proves the
 exact clean candidate identity, verifies the H1 evidence helper, runs tests
@@ -33,55 +67,33 @@ and tests shared KMP code on an Apple-silicon Simulator. It also source-builds,
 inspects, installs, launches, and terminates the fixed unsigned Simulator app
 without credentials. The named app XCTest evidence remains a separate later
 stage until DobbyVPN exposes that target. None of these checks claims
-NetworkExtension, routing, DNS, or physical-device coverage.
+NetworkExtension, routing, or DNS coverage.
 
-Real VPN endpoints, external-IP assertions, speed tests, prolonged soak tests,
-and physical-device tests are outside Torturer's public test contract.
-
-The provider package also contains a pure, secret-safe Outline WSS input
+The provider package contains a pure, secret-safe Outline WSS input
 contract (`torturer_provider.outline`). It creates one run-scoped shared path
 prefix and key, emits both canonical `websocket-stream` (`/tcp`) and
 `websocket-packet` (`/udp`) listener definitions for the pinned image, and
 builds the in-memory DobbyVPN profile only after a trusted service URL is
 known. The key and generated config are provider handoff data; they are never
-public result data. This contract is tested locally and does not claim that a
-live Render service has been provisioned.
+public result data. The protected `python -m torturer_provider.lease_cli`
+boundary creates and cleans one tagged Render lease, writes the profile only to
+owner-only storage for immediate encryption, and starts the immutable Outline
+image with `/outline-ss-server -config=/etc/secrets/config.yml`.
 
-The trusted-runner package `torturer_checks.hosted` provides one narrow
-CLI adapter for the desktop entry points (Linux, Windows, and macOS), plus an
-Android entry point that is retained only for explicit capability gating. The
-CLI adapter drives only DobbyVPN's existing public CLI, records complete
-command bytes in a private runner-local directory, translates independently
-observed connection facts, and leaves scenario assertions and outcomes to the
-canonical engine.
-The Linux adapter now has real, bounded seams for network transition (an
-explicit runner interface), product-service process loss (an exact service
-PID/binary/socket control set), and timed endurance sampling when an approved
-public download/upload URL pair is supplied. Sleep/wake remains explicitly
-`unavailable` on hosted runners because suspending the runner would terminate
-the job; traffic and endurance remain unavailable without the URL pair. Missing
-capabilities are never inferred as passes. Every command keeps its complete raw
-stdout/stderr in the private runner directory and emits only safe return-code,
-size, duration, and digest metadata. The protected
-`python -m torturer_provider.lease_cli` boundary creates/cleans one tagged
-Render lease and writes the profile only to owner-only storage for immediate
-encryption. The trusted image request sets the complete Render Docker command
-to `/outline-ss-server -config=/etc/secrets/config.yml`. The manual trusted
-workflow currently wires only the common Linux lane; the advanced Linux seams
-are opt-in inputs until their runner-control wiring is reviewed. In particular,
-network transition currently operates on the explicitly named whole runner
-interface, and the process-loss controller must be given the actual candidate
-PID rather than a sudo launcher PID; neither is enabled by the workflow until
-that safety and cleanup proof exists. Windows, macOS, and Android hosted
-functional lanes still lack their platform-specific profile/control handoff in
-a trusted workflow and are not silently claimed coverage. Android's existing
-public emulator test proves consented TUN and packet routing internally, but it
-does not accept an Outline profile or prove an external server identity, so it
-cannot be substituted for the canonical hosted VPN scenarios.
+The trusted-runner package `torturer_checks.hosted` records complete command
+bytes in its private runner-local directory, converts independently observed
+facts to the canonical vocabulary, and leaves every assertion and outcome to
+the canonical engine. Public results contain only stable outcomes, provenance,
+safe metrics, and bounded evidence metadata; they never contain a profile,
+endpoint, key, URL, command argument, or observed public identity.
 
 ## Security promises
 
-- Candidate code runs with no secrets and minimum read-only permissions.
+- Untrusted candidate builds receive no secrets and have read-only repository
+  permissions.
+- A trusted functional client receives only its short-lived synthetic VPN
+  profile, after exact closure verification and after GitHub token operations
+  finish; it never receives the provider credential or a write-capable token.
 - The exact source repository and full 40-character commit SHA are recorded.
 - Workflow and third-party action references are pinned to immutable commits.
 - Candidate-controlled values are passed through environment variables and

@@ -125,6 +125,11 @@ def _run(
         timeout=timeout,
         check=False,
     )
+    print(f"[android-contract-command] returncode={completed.returncode} output-begin")
+    if completed.stdout:
+        sys.stdout.write(completed.stdout)
+        sys.stdout.flush()
+    print("[android-contract-command] output-end")
     if completed.returncode and not allow_nonzero:
         raise AndroidContractError(
             f"command failed ({completed.returncode}): {rendered!r}\n{completed.stdout}"

@@ -29,6 +29,7 @@ jobs:
     env:
       SOURCE_REPOSITORY: ${{ inputs.source_repository }}
       SOURCE_SHA: ${{ inputs.commit_sha }}
+      TORTURER_SHA: ${{ github.sha }}
 
     steps:
       - name: Validate exact public candidate identity
@@ -40,6 +41,21 @@ jobs:
           esac
           test "${#SOURCE_SHA}" -eq 40
           printf 'source_repository=%s\nsource_sha=%s\n' "$SOURCE_REPOSITORY" "$SOURCE_SHA"
+
+      - name: Check out exact trusted Torturer helper revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: DobbyVPN/Torturer
+          ref: ${{ github.sha }}
+          path: torturer
+          persist-credentials: false
+
+      - name: Verify exact trusted Torturer helper checkout
+        run: |
+          set -euo pipefail
+          test "$(git -C torturer rev-parse HEAD)" = "$TORTURER_SHA"
+          git -C torturer status --porcelain=v1 --untracked-files=all
+          test -z "$(git -C torturer status --porcelain=v1 --untracked-files=all)"
 
       - name: Check out exact untrusted DobbyVPN candidate
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
@@ -69,43 +85,9 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          stage="$RUNNER_TEMP/candidate-linux"
-          mkdir -p "$stage"
-          for name in ubuntu_grpcvpnserver dobby-cli libdobby_bridge.so libc++.so.1 libc++abi.so.1; do
-            source="candidate/kmp_module/services/$name"
-            test -f "$source"
-            test ! -L "$source"
-            install -m 0700 "$source" "$stage/$name"
-          done
-          python3 - "$stage" "$SOURCE_SHA" <<'PY'
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
-          import stat
-          import sys
-
-          root = Path(sys.argv[1])
-          names = {
-              "ubuntu_grpcvpnserver", "dobby-cli", "libdobby_bridge.so",
-              "libc++.so.1", "libc++abi.so.1",
-          }
-          actual = {path.name for path in root.iterdir()}
-          if actual != names:
-              raise SystemExit(f"candidate closure mismatch: {sorted(actual)}")
-          files = {}
-          for name in sorted(names):
-              path = root / name
-              info = path.lstat()
-              if not stat.S_ISREG(info.st_mode) or path.is_symlink() or not (info.st_mode & stat.S_IXUSR):
-                  raise SystemExit(f"unsafe candidate member: {name}")
-              files[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-          manifest = {"schema": 1, "platform": "linux", "source_sha": sys.argv[2], "files": files}
-          path = root / "manifest.json"
-          path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
-          path.chmod(0o600)
-          print(json.dumps(manifest, sort_keys=True))
-          PY
+          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.candidate stage \
+            --root "$GITHUB_WORKSPACE/candidate" --output "$RUNNER_TEMP/candidate-linux" \
+            --platform linux --architecture amd64 --source-sha "$SOURCE_SHA"
 
       - name: Upload isolated candidate runtime
         id: candidate_upload
@@ -136,9 +118,11 @@ jobs:
       - name: Establish runner-local paths
         run: |
           set -euo pipefail
-          printf 'HANDOFF_DIR=%s\n' "$RUNNER_TEMP/dobbyvpn-render-handoff" >> "$GITHUB_ENV"
-          printf 'SERVICE_DIR=%s\n' "$RUNNER_TEMP/dobbyvpn-service" >> "$GITHUB_ENV"
-          printf 'RESULT_PATH=%s\n' "$RUNNER_TEMP/dobbyvpn-render-handoff/functional-result.json" >> "$GITHUB_ENV"
+          {
+            printf 'HANDOFF_DIR=%s\n' "$RUNNER_TEMP/dobbyvpn-render-handoff"
+            printf 'SERVICE_DIR=%s\n' "$RUNNER_TEMP/dobbyvpn-service"
+            printf 'RESULT_PATH=%s\n' "$RUNNER_TEMP/dobbyvpn-render-handoff/functional-result.json"
+          } >> "$GITHUB_ENV"
 
       - name: Validate trusted functional inputs
         run: |
@@ -205,17 +189,6 @@ jobs:
               env.write(f"REQUEST_ARTIFACT_NAME={artifact_name}\n")
           PY
 
-      - name: Upload public certificate and opaque request
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
-        with:
-          name: ${{ env.REQUEST_ARTIFACT_NAME }}
-          path: |
-            ${{ env.HANDOFF_DIR }}/request.json
-            ${{ env.HANDOFF_DIR }}/recipient.crt
-          if-no-files-found: error
-          retention-days: 1
-
-
       - name: Check out exact Torturer workflow revision
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
@@ -236,44 +209,8 @@ jobs:
           test "$(git -C torturer rev-parse HEAD)" = "$TORTURER_SHA"
           git -C torturer status --porcelain=v1 --untracked-files=all
           test -z "$(git -C torturer status --porcelain=v1 --untracked-files=all)"
-          python3 - "$GITHUB_WORKSPACE/candidate" "$SOURCE_SHA" <<'PY'
-          import hashlib
-          import json
-          from pathlib import Path
-          import stat
-          import sys
-
-          root = Path(sys.argv[1])
-          binary_names = {
-              "ubuntu_grpcvpnserver", "dobby-cli", "libdobby_bridge.so",
-              "libc++.so.1", "libc++abi.so.1",
-          }
-          expected = binary_names | {"manifest.json"}
-          actual = {path.name for path in root.iterdir()}
-          if actual != expected:
-              raise SystemExit(f"candidate artifact members mismatch: {sorted(actual)}")
-          manifest_path = root / "manifest.json"
-          manifest_info = manifest_path.lstat()
-          if not stat.S_ISREG(manifest_info.st_mode) or manifest_path.is_symlink():
-              raise SystemExit("candidate manifest is not a regular file")
-          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-          if manifest.get("schema") != 1 or manifest.get("platform") != "linux":
-              raise SystemExit("candidate manifest contract mismatch")
-          if manifest.get("source_sha") != sys.argv[2]:
-              raise SystemExit("candidate manifest source SHA mismatch")
-          if set(manifest.get("files", {})) != binary_names:
-              raise SystemExit("candidate manifest file allow-list mismatch")
-          for name in sorted(binary_names):
-              path = root / name
-              info = path.lstat()
-              if not stat.S_ISREG(info.st_mode) or path.is_symlink():
-                  raise SystemExit(f"unsafe candidate artifact member: {name}")
-              digest = hashlib.sha256(path.read_bytes()).hexdigest()
-              if manifest["files"].get(name) != digest:
-                  raise SystemExit(f"candidate artifact digest mismatch: {name}")
-              path.chmod(0o700)
-              print(f"{digest}  {name}")
-          PY
+          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.candidate verify \
+            --root "$GITHUB_WORKSPACE/candidate" --platform linux --architecture amd64 --source-sha "$SOURCE_SHA"
 
       - name: Establish the hard thirty-minute workflow deadline
         env:
@@ -299,6 +236,16 @@ jobs:
           print(f"run_deadline_epoch={deadline}")
           PY
           unset GH_TOKEN
+
+      - name: Upload public certificate and opaque request after verified client readiness
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: ${{ env.REQUEST_ARTIFACT_NAME }}
+          path: |
+            ${{ env.HANDOFF_DIR }}/request.json
+            ${{ env.HANDOFF_DIR }}/recipient.crt
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Wait for and download the exact encrypted lease response
         env:
@@ -468,13 +415,15 @@ jobs:
           service_pid_file="$HANDOFF_DIR/service.pid"
           printf '%s\n' "$service_pid" > "$service_pid_file"
           chmod 600 "$service_pid_file"
-          printf 'SERVICE_PID=%s\n' "$service_pid" >> "$GITHUB_ENV"
-          printf 'SERVICE_PID_FILE=%s\n' "$service_pid_file" >> "$GITHUB_ENV"
-          printf 'SERVICE_SOCKET=%s\n' "$control_socket" >> "$GITHUB_ENV"
-          printf 'DOBBYVPN_CONTROL_SOCKET=%s\n' "$control_socket" >> "$GITHUB_ENV"
-          printf 'SERVICE_LOG=%s\n' "$service_log" >> "$GITHUB_ENV"
+          {
+            printf 'SERVICE_PID=%s\n' "$service_pid"
+            printf 'SERVICE_PID_FILE=%s\n' "$service_pid_file"
+            printf 'SERVICE_SOCKET=%s\n' "$control_socket"
+            printf 'DOBBYVPN_CONTROL_SOCKET=%s\n' "$control_socket"
+            printf 'SERVICE_LOG=%s\n' "$service_log"
+          } >> "$GITHUB_ENV"
           ready=false
-          for attempt in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             if ! sudo -n kill -0 "$service_pid"; then
               printf '%s\n' 'candidate service exited before readiness' >&2
               sudo -n cat "$service_log"
@@ -526,11 +475,11 @@ jobs:
             --profile "$HANDOFF_DIR/profile.toml" \
             --source-repository "$SOURCE_REPOSITORY" \
             --source-sha "$SOURCE_SHA" \
-            --artifact "$GITHUB_WORKSPACE/candidate/dobby-cli" \
+            --candidate-manifest "$GITHUB_WORKSPACE/candidate/manifest.json" \
             --server-image-digest "$SERVER_IMAGE_DIGEST" \
             --output "$RESULT_PATH" \
             --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" \
-            --download-url "https://speed.cloudflare.com/__down?bytes=1000000" \
+            --download-url "https://proof.ovh.net/files/1Mb.dat" \
             --upload-url "https://speed.cloudflare.com/__up" \
             --service-pid "$SERVICE_PID" \
             --service-binary "$GITHUB_WORKSPACE/candidate/ubuntu_grpcvpnserver" \
@@ -553,7 +502,7 @@ jobs:
           if [ -n "$service_pid" ] && sudo -n kill -0 "$service_pid"; then
             sudo -n kill -TERM "$service_pid"
             stopped=false
-            for attempt in $(seq 1 30); do
+            for _ in $(seq 1 30); do
               if ! sudo -n kill -0 "$service_pid"; then
                 stopped=true
                 break
@@ -562,7 +511,7 @@ jobs:
             done
             if [ "$stopped" != true ]; then
               sudo -n kill -KILL "$service_pid"
-              for attempt in $(seq 1 10); do
+              for _ in $(seq 1 10); do
                 if ! sudo -n kill -0 "$service_pid"; then
                   stopped=true
                   break

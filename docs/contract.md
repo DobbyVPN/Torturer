@@ -180,13 +180,18 @@ the record but is not copied into scenario observation facts.
 
 ## Public test scope
 
-Public synthetic tests may verify package layout, process and service
-lifecycle, public CLI behaviour, malformed inputs, cleanup, file permissions,
-network-denial behaviour, and absence of obvious embedded credentials.
+Secretless reusable tests verify package layout, process and service lifecycle,
+public CLI behaviour, malformed inputs, cleanup, file permissions,
+network-denial behaviour, and absence of obvious embedded credentials. They
+never receive a VPN profile or provider credential.
 
-Provider profiles, external-IP expectations, throughput, protocol performance,
-real failover, soak runs, and physical iOS testing are outside this public
-contract.
+The separately dispatched trusted functional workflows may create one
+short-lived synthetic Outline WebSocket profile and disposable Render service
+for Linux, Windows, macOS, or Android. Those workflows verify external routing
+identity, bounded traffic measurements, reconnect, cleanup, and every other
+canonical capability the selected adapter can actually observe. Their public
+result schema excludes profiles, endpoints, URLs, keys, tokens, raw logs, and
+literal observed identities.
 
 ## iOS Simulator contract
 
@@ -242,7 +247,7 @@ vectors. The adapter's canonical `reconnect` operation composes the existing
 connect-profile/status commands after the scenario-owned disconnect within one
 bounded step and leaves that generation connected for independent second
 tunnel/identity observations; the scenario owns the final disconnect and cleanup.
-runner controls add a bounded interface down/up transition, exact service-process
+Runner controls add a bounded interface down/up transition, exact service-process
 restart after a recorded loss, and timed status/identity/traffic endurance
 sampling. Those controls require explicit paths and are not inferred from a
 normal CLI exit. It never imports DobbyVPN source or defines product behavior.
@@ -265,39 +270,40 @@ image, the trusted request sets the complete Render Docker command to
 complete start command, not additional arguments for the image ENTRYPOINT. The
 secret file is never baked into the image or emitted in a result.
 
-These entry points are unit-tested with fake adapters/provider responses. The
-manual `functional.yml` workflow currently targets only the common Linux lane and
-uses a separate least-privilege controller for the Render dispatch; the
-candidate job has no dispatch permission or repository-control token. The
-controller binds the originating run's exact Torturer `head_sha` to the lease
-request before the provider can acquire a service. Both workflows are bounded
-and fail closed when the immutable image variable or Render account eligibility
-is absent. The encrypted profile handoff into the candidate job is not yet
-wired in this revision, so no hosted functional pass is claimed. A hosted
-Linux result is not a claim that sleep/wake is covered; that
-operation remains unavailable on a runner that cannot suspend and resume itself.
-The current Linux lane selects the canonical `functional.core-connection`
-scenario and `functional.start-stop-start`. The core scenario has a 600-second
-maximum and the restart scenario has a 480-second maximum; two independently
-bounded 20-second resets give a declared functional budget of 1,120 seconds.
-The runner records the actual reset count and rejects any selected set whose
-declared worst-case execution plus all reset windows exceeds 1,800 seconds.
-The functional subprocess is wrapped in the same 1,120-second hard bound,
-leaving the rest of the 30-minute job for checkout, build, lease coordination,
-service startup, diagnostics, result upload, and unconditional cleanup.
-The optional network-transition seam currently interrupts the named whole
-runner interface, so it is not enabled until endpoint-only interruption or a
-runner-recovery proof is wired. The process-loss seam requires the actual Go
-service PID and independently checked child cleanup; a sudo launcher PID is
-not accepted. Throughput/endurance additionally require explicit fixed HTTPS
-measurement endpoints and are not silently inferred from the Outline TCP
-service. Windows and macOS still need their trusted workflow to
-install/start the platform service and hand off the profile/control
-credentials. Android's product has an internal `AndroidSessionController`,
-but the current Torturer entrypoint only invokes the candidate's profileless
-`DobbyVpnServiceInstrumentationTest`. That instrumentation proves consent,
-production TUN creation, VPN route state, and documentation-range packet
-routing; it does not accept the Render profile or emit real external
-identity/throughput observations. A stable candidate-owned test-facing driver
-(intent, instrumentation command, or equivalent) is still required; Torturer
-does not convert the internal controller into a false hosted profile result.
+The four manual functional workflows target Linux, Windows, macOS, and Android.
+Each uses a secretless source-build job, a trusted client job with read-only
+repository permissions, and a separate least-privilege controller for Render
+dispatch. The controller binds the origin run ID, attempt, exact Torturer
+`head_sha`, workflow path, platform, and opaque lease ID before the provider may
+acquire a service. The client verifies the exact allow-listed candidate closure
+and platform readiness before publishing its request. GitHub token-bearing
+operations finish before untrusted candidate execution. The client receives
+only the encrypted profile handoff, never the Render credential or a
+write-capable repository token.
+
+Every platform deadline is measured from the workflow run start and ends after
+at most 30 minutes, including build, readiness, lease coordination, scenarios,
+diagnostics, evidence, and cleanup. The canonical runner selects the complete
+scenario catalog, partitions it by the adapter's proved capabilities, and
+records every unsupported scenario explicitly. It rejects a selected set whose
+declared scenario maxima plus one bounded reset per scenario exceed the active
+functional budget. A final cleanup reserve remains outside the functional
+subprocess.
+
+Linux, Windows, and macOS start the exact source-built product service and drive
+the public CLI. Their workflows provide the exact service PID, binary, control
+socket or address, PID file, and fixed query-free HTTPS measurement endpoints,
+so process-loss recovery and bounded endurance are real capabilities. The
+optional network-transition seam is not enabled because interrupting the whole
+runner interface would also destroy the job's control path. Sleep/wake is not
+advertised on hosted runners.
+
+Android requires usable `/dev/kvm`, starts an API-35 x86_64 emulator with
+`-no-window` and hardware acceleration, installs the exact staged application
+and instrumentation APKs, and proves readiness before requesting its lease.
+The candidate-owned `AndroidHostedProfileInstrumentationTest` accepts an
+owner-only command file and profile, executes one complete canonical scenario,
+and emits only the fixed safe observation schema. Torturer validates those
+facts and owns the assertions and outcome. Android advertises no process-loss,
+network-transition, sleep/wake, or endurance capability that its driver cannot
+prove.

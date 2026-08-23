@@ -56,10 +56,14 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("torturer_provider.lease_cli cleanup", self.text)
 
     def test_provider_input_is_trusted_and_image_is_immutable(self) -> None:
+        for platform in ("linux", "windows", "macos", "android"):
+            self.assertRegex(self.text, rf"(?m)^          - {platform}$")
+        self.assertIn('platform = os.environ["PLATFORM"]', self.text)
+        self.assertIn('f"{origin_id}:{origin_attempt}:{platform}:', self.text)
+        self.assertIn('expected_artifact = f"render-request-{os.environ[\'LEASE_RUN_ID\']}-{platform}"', self.text)
         self.assertIn('test "$MODE" = acquire', self.text)
         self.assertIn("RENDER_IMAGE_PATH must end in configured digest", self.text.replace("the configured", "configured"))
         self.assertIn('if not image_path.endswith("@" + digest):', self.text)
-        self.assertRegex(self.text, r"render-request-\[0-9a-f\]\{32\}-linux")
         self.assertNotRegex(self.text, r"(?m)^      (?:image_path|image_digest):")
 
     def test_origin_and_request_artifacts_are_bound_to_the_same_run(self) -> None:
@@ -72,9 +76,18 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         self.assertNotIn("actions/runs/${ORIGIN_RUN_ID}/artifacts", self.text)
         self.assertIn("one Render lease already exists for this origin/platform", self.text)
         self.assertIn("ORIGIN_TORTURER_SHA: ${{ inputs.origin_torturer_sha }}", self.text)
+        self.assertIn("origin_workflow_path:", self.text)
+        self.assertIn("ORIGIN_WORKFLOW_PATH: ${{ inputs.origin_workflow_path }}", self.text)
+        self.assertIn("origin workflow path is not allow-listed", self.text)
+        self.assertIn("origin workflow path does not match platform", self.text)
         self.assertIn('value.get("head_sha") != os.environ["ORIGIN_TORTURER_SHA"]', self.text)
+        for workflow, platform in (
+            ("functional.yml", "linux"), ("functional-windows.yml", "windows"),
+            ("functional-macos.yml", "macos"), ("functional-android.yml", "android"),
+        ):
+            self.assertIn(f'".github/workflows/{workflow}": "{platform}"', self.text)
         self.assertIn('value.get("head_sha") != os.environ["TORTURER_SHA"]', self.text)
-        self.assertIn('value.get("path") != ".github/workflows/functional.yml"', self.text)
+        self.assertIn('value.get("path") != os.environ["ORIGIN_WORKFLOW_PATH"]', self.text)
         self.assertIn('workflow_run.get("id") != wanted_run', self.text)
         self.assertIn('files != {"request.json", "recipient.crt"}', self.text)
         self.assertIn('"kind": "dobbyvpn.render-lease-request"', self.text)
@@ -83,6 +96,9 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("--expect-file recipient.crt", self.text)
         self.assertNotIn("unzip -o", self.text)
         self.assertIn("--timeout-seconds 300", self.text)
+        self.assertIn('"platform": os.environ["PLATFORM"]', self.text)
+        self.assertIn('render-lease-${{ inputs.lease_run_id }}-${{ inputs.platform }}', self.text)
+        self.assertIn('render-lease-journal-${{ inputs.lease_run_id }}-${{ inputs.platform }}', self.text)
 
     def test_plaintext_never_enters_an_uploaded_artifact(self) -> None:
         upload = self.text.index("- name: Upload encrypted profile and safe lease record")
@@ -98,7 +114,15 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         cleanup = self.text.index("- name: Delete the exact Render service and verify absence")
         journal = self.text.index("- name: Upload safe lease journal")
         self.assertIn("if: always()", self.text[cleanup:journal])
-        self.assertIn("torturer_provider.lease_cli cleanup", self.text[cleanup:journal])
+        cleanup_step = self.text[cleanup:journal]
+        self.assertIn("torturer_provider.lease_cli cleanup", cleanup_step)
+        self.assertIn("Mark the issued lease as actively testing", self.text)
+        self.assertIn("torturer_provider.lease_cli begin-testing", self.text)
+        self.assertIn('if [ -f "$LEASE_DIR/journal.json" ]', cleanup_step)
+        self.assertIn('--journal "$LEASE_DIR/journal.json"', cleanup_step)
+        self.assertIn('--request "$LEASE_DIR/request/unpacked/request.json"', cleanup_step)
+        self.assertIn('--owner-id "$RENDER_OWNER_ID"', cleanup_step)
+        self.assertIn('cleanup_args+=(--lease "$LEASE_DIR/lease.json")', cleanup_step)
         self.assertIn("if api.exists(service_id)", (ROOT / "torturer_provider" / "lease_cli.py").read_text(encoding="utf-8"))
         self.assertIn("for attempt in $(seq 1 180)", self.text)
         self.assertIn("completion marker deadline expired", self.text)

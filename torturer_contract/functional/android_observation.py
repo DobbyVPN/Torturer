@@ -28,17 +28,28 @@ class AndroidProfileObservation:
     latency_ms: float
     download_mbps: float
     upload_mbps: float
-    disconnected: bool
+    disconnect_clean: bool
+    restart_verified: bool
+    reconnect_bounded: bool
+    second_tunnel_interface: bool
+    second_routing_identity_changed: bool
+    final_disconnect_clean: bool
     cleanup_verified: bool
     error_code: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.source_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", self.source_sha):
+        if (
+            not isinstance(self.source_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", self.source_sha) is None
+            or self.source_sha == "0" * 40
+        ):
             raise AndroidObservationError("source_sha is invalid")
         for name in (
             "configured", "connected", "tunnel_interface",
-            "routing_identity_changed", "stability_verified",
-            "disconnected", "cleanup_verified",
+            "routing_identity_changed", "stability_verified", "disconnect_clean",
+            "restart_verified", "reconnect_bounded", "second_tunnel_interface",
+            "second_routing_identity_changed", "final_disconnect_clean",
+            "cleanup_verified",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise AndroidObservationError(f"{name} must be boolean")
@@ -60,7 +71,9 @@ class AndroidProfileObservation:
             "schema", "kind", "platform", "source_sha", "configured", "connected",
             "tunnel_interface", "routing_identity_changed",
             "stability_verified", "latency_ms", "download_mbps",
-            "upload_mbps", "disconnected", "cleanup_verified",
+            "upload_mbps", "disconnect_clean", "restart_verified", "reconnect_bounded",
+            "second_tunnel_interface", "second_routing_identity_changed",
+            "final_disconnect_clean", "cleanup_verified",
         }
         optional = {"error_code"}
         if not isinstance(value, Mapping) or set(value) - (expected | optional) or not expected <= set(value):
@@ -82,12 +95,20 @@ class AndroidProfileObservation:
             latency_ms=value["latency_ms"],
             download_mbps=value["download_mbps"],
             upload_mbps=value["upload_mbps"],
-            disconnected=value["disconnected"],
+            disconnect_clean=value["disconnect_clean"],
+            restart_verified=value["restart_verified"],
+            reconnect_bounded=value["reconnect_bounded"],
+            second_tunnel_interface=value["second_tunnel_interface"],
+            second_routing_identity_changed=value["second_routing_identity_changed"],
+            final_disconnect_clean=value["final_disconnect_clean"],
             cleanup_verified=value["cleanup_verified"],
             error_code=error_code,
         )
         if expected_source_sha is not None:
-            if re.fullmatch(r"[0-9a-f]{40}", expected_source_sha) is None:
+            if (
+                re.fullmatch(r"[0-9a-f]{40}", expected_source_sha) is None
+                or expected_source_sha == "0" * 40
+            ):
                 raise AndroidObservationError("expected source_sha is invalid")
             if observation.source_sha != expected_source_sha:
                 raise AndroidObservationError("source_sha does not match candidate")
@@ -107,6 +128,11 @@ class AndroidProfileObservation:
             "latency_ms": self.latency_ms,
             "download_mbps": self.download_mbps,
             "upload_mbps": self.upload_mbps,
-            "disconnect_clean": self.disconnected,
+            "disconnect_clean": self.disconnect_clean,
+            "restart_verified": self.restart_verified,
+            "reconnect_bounded": self.reconnect_bounded,
+            "second_tunnel_interface": self.second_tunnel_interface,
+            "second_routing_identity_changed": self.second_routing_identity_changed,
+            "final_disconnect_clean": self.final_disconnect_clean,
             "cleanup_verified": self.cleanup_verified,
         }

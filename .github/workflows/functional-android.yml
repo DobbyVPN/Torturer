@@ -1,0 +1,577 @@
+name: Trusted functional Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repository:
+        description: Public DobbyVPN owner/repository containing the candidate.
+        required: true
+        type: string
+      commit_sha:
+        description: Exact lowercase 40-character candidate commit SHA.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trusted-functional-android-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build untrusted Android candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+      SOURCE_SHA: ${{ inputs.commit_sha }}
+
+    steps:
+      - name: Validate exact public candidate identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$SOURCE_REPOSITORY" = "DobbyVPN/DobbyVPN"
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$SOURCE_SHA" != "0000000000000000000000000000000000000000"
+          printf 'source_repository=%s\nsource_sha=%s\n' "$SOURCE_REPOSITORY" "$SOURCE_SHA"
+
+      - name: Check out exact untrusted DobbyVPN candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.commit_sha }}
+          path: candidate
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Check out exact trusted Torturer revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: DobbyVPN/Torturer
+          ref: ${{ github.sha }}
+          path: torturer
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699
+
+      - name: Install exact Android build toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --foreground --signal=TERM --kill-after=10s 300s sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;36.0.0"
+          timeout --foreground --signal=TERM --kill-after=10s 30s sdkmanager --list_installed
+
+      - name: Verify checkout and build Android candidate
+        shell: bash
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          status="$(git status --porcelain=v1 --untracked-files=all)"
+          printf "%s\n" "$status"
+          test -z "$status"
+          timeout --foreground --signal=TERM --kill-after=10s 480s ./kmp_module/gradlew -p kmp_module --no-daemon --stacktrace \
+            :app:assembleDebug :app:assembleDebugAndroidTest \
+            -PprojectRepositoryCommit="$SOURCE_SHA" \
+            -PprojectRepositoryCommitLink="https://github.com/$SOURCE_REPOSITORY/tree/$SOURCE_SHA"
+          sha256sum kmp_module/app/build/outputs/apk/debug/app-debug.apk \
+            kmp_module/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+
+      - name: Stage exact allow-listed Android candidate closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 torturer/torturer_checks/hosted/candidate.py stage \
+            --root "$GITHUB_WORKSPACE/candidate" \
+            --output "$RUNNER_TEMP/candidate-android" \
+            --platform android --architecture x86_64 --source-sha "$SOURCE_SHA"
+
+      - name: Upload isolated Android candidate runtime
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: candidate-android-${{ inputs.commit_sha }}
+          path: ${{ runner.temp }}/candidate-android
+          if-no-files-found: error
+          retention-days: 1
+          include-hidden-files: false
+
+  client:
+    needs: build
+    name: Trusted functional Android
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    env:
+      SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+      SOURCE_SHA: ${{ inputs.commit_sha }}
+      PLATFORM: android
+      TORTURER_SHA: ${{ github.sha }}
+      SERVER_IMAGE_DIGEST: ${{ vars.RENDER_IMAGE_DIGEST }}
+
+    steps:
+      - name: Establish runner-local paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          handoff="$RUNNER_TEMP/dobbyvpn-render-handoff"
+          service="$RUNNER_TEMP/dobbyvpn-service"
+          mkdir -p "$handoff" "$service"
+          printf 'HANDOFF_DIR=%s\nSERVICE_DIR=%s\nRESULT_PATH=%s\n' \
+            "$handoff" "$service" "$handoff/functional-result.json" >> "$GITHUB_ENV"
+
+      - name: Validate trusted functional inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REPOSITORY" = "DobbyVPN/DobbyVPN" ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$TORTURER_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SERVER_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          image_digest="${SERVER_IMAGE_DIGEST#sha256:}"
+          test -n "${image_digest//0/}"
+          printf 'source_repository=%s\nsource_sha=%s\nplatform=%s\ntorturer_sha=%s\nserver_image_digest=%s\n' \
+            "$SOURCE_REPOSITORY" "$SOURCE_SHA" "$PLATFORM" "$TORTURER_SHA" "$SERVER_IMAGE_DIGEST"
+
+      - name: Set up JDK 17 for Android client
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK for hosted client
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699
+
+      - name: Install Android emulator and prove KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -e /dev/kvm
+          timeout --foreground --signal=TERM --kill-after=10s 30s sudo chmod a+rw /dev/kvm
+          ls -l /dev/kvm
+          timeout --foreground --signal=TERM --kill-after=10s 300s sdkmanager --install "platform-tools" "emulator" "platforms;android-35" "build-tools;36.0.0" "system-images;android-35;google_apis;x86_64"
+          timeout --foreground --signal=TERM --kill-after=10s 30s sdkmanager --list_installed
+          accel_check_log="$SERVICE_DIR/emulator-accel-check.raw.log"
+          if ! timeout --foreground --signal=TERM --kill-after=10s 60s "$ANDROID_SDK_ROOT/emulator/emulator" -accel-check | tee "$accel_check_log"; then
+            printf 'android_kvm_acceleration_check=failed\n' >&2
+            exit 1
+          fi
+          if ! grep -Eiq 'KVM .*usable|KVM.*installed and usable' "$accel_check_log"; then
+            printf 'android_kvm_acceleration_check=not-usable\n' >&2
+            cat "$accel_check_log"
+            exit 1
+          fi
+          printf 'android_kvm_acceleration_check=usable\n'
+
+      - name: Establish hard thirty-minute workflow deadline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --foreground --signal=TERM --kill-after=10s 30s gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" | tee "$HANDOFF_DIR/origin-run.json"
+          python3 - "$HANDOFF_DIR/origin-run.json" <<'PY'
+          import datetime, json, os, sys
+          from pathlib import Path
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if value.get("id") != int(os.environ["GITHUB_RUN_ID"]):
+              raise SystemExit("workflow run identity mismatch")
+          started = datetime.datetime.fromisoformat(value["run_started_at"].replace("Z", "+00:00"))
+          deadline = int(started.timestamp()) + 30 * 60
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as output:
+              output.write(f"RUN_DEADLINE_EPOCH={deadline}\n")
+          print(f"run_deadline_epoch={deadline}")
+          PY
+
+      - name: Create ephemeral recipient and opaque Render lease request
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          timeout --foreground --signal=TERM --kill-after=10s 60s openssl req -x509 -newkey rsa:3072 -nodes -days 1 \
+            -subj "/CN=dobbyvpn-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            -keyout "$HANDOFF_DIR/recipient.key" -out "$HANDOFF_DIR/recipient.crt"
+          lease_run_id="$(python3 -c 'import hashlib,os; print(hashlib.sha256(":".join(os.environ[name] for name in ("GITHUB_RUN_ID","GITHUB_RUN_ATTEMPT","PLATFORM","TORTURER_SHA")).encode()).hexdigest()[:32])')"
+          request_name="render-request-${lease_run_id}-${PLATFORM}"
+          python3 - "$HANDOFF_DIR/request.json" "$lease_run_id" "$request_name" <<'PY'
+          import json, os, re, sys
+          from pathlib import Path
+          path, run_id, name = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+          if not re.fullmatch(r"[0-9a-f]{32}", run_id) or name != f"render-request-{run_id}-android":
+              raise SystemExit("lease request identity is invalid")
+          path.write_text(json.dumps({"schema": 1, "kind": "dobbyvpn.render-lease-request", "run_id": run_id, "platform": "android", "image_digest": os.environ["SERVER_IMAGE_DIGEST"]}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          path.chmod(0o600)
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as env:
+              env.write(f"LEASE_RUN_ID={run_id}\nREQUEST_ARTIFACT_NAME={name}\n")
+          print(f"lease_run_id={run_id}\nrequest_artifact_name={name}")
+          PY
+
+      - name: Check out exact trusted Torturer revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: DobbyVPN/Torturer
+          ref: ${{ github.sha }}
+          path: torturer
+          persist-credentials: false
+
+      - name: Download and verify exact Android candidate closure
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: candidate-android-${{ inputs.commit_sha }}
+          path: candidate
+
+      - name: Verify trusted Torturer checkout and candidate closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C torturer rev-parse HEAD)" = "$TORTURER_SHA"
+          git -C torturer status --porcelain=v1 --untracked-files=all
+          test -z "$(git -C torturer status --porcelain=v1 --untracked-files=all)"
+          python3 torturer/torturer_checks/hosted/candidate.py verify \
+            --root "$GITHUB_WORKSPACE/candidate" --platform android --architecture x86_64 --source-sha "$SOURCE_SHA"
+
+      - name: Start exact Android emulator and install candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          avd_name=dobby-functional-api35
+          timeout --foreground --signal=TERM --kill-after=10s 120s avdmanager create avd --force --name "$avd_name" --package "system-images;android-35;google_apis;x86_64" --device pixel
+          emulator_log="$SERVICE_DIR/emulator.raw.log"
+          setsid timeout --foreground --signal=TERM --kill-after=10s 1500s "$ANDROID_SDK_ROOT/emulator/emulator" -avd "$avd_name" -port 5554 -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -accel on -no-snapshot -wipe-data > >(tee "$emulator_log") 2>&1 &
+          emulator_pid=$!
+          printf '%s\n' "$emulator_pid" > "$HANDOFF_DIR/emulator.pid"
+          printf 'EMULATOR_PID=%s\nADB_PATH=%s\nEMULATOR_LOG=%s\n' "$emulator_pid" "$ANDROID_SDK_ROOT/platform-tools/adb" "$emulator_log" >> "$GITHUB_ENV"
+          adb="$ANDROID_SDK_ROOT/platform-tools/adb"
+          adb_bounded() {
+            timeout --foreground --signal=TERM --kill-after=10s 120s "$adb" "$@"
+          }
+          adb_bounded start-server
+          device_ready=false
+          for attempt in $(seq 1 90); do
+            if ! kill -0 "$emulator_pid"; then
+              printf 'android emulator exited before device readiness\n' >&2
+              cat "$emulator_log"
+              exit 1
+            fi
+            devices_log="$SERVICE_DIR/adb-devices-${attempt}.raw.log"
+            if adb_bounded devices -l | tee "$devices_log"; then
+              if grep -Eq '^emulator-5554[[:space:]]+device' "$devices_log"; then
+                device_ready=true
+                break
+              fi
+            else
+              printf 'android adb device probe failed attempt=%s\n' "$attempt" >&2
+            fi
+            sleep 2
+          done
+          test "$device_ready" = true
+          booted=false
+          for attempt in $(seq 1 90); do
+            if ! kill -0 "$emulator_pid"; then
+              printf 'android emulator exited before boot readiness\n' >&2
+              cat "$emulator_log"
+              exit 1
+            fi
+            boot_state_log="$SERVICE_DIR/adb-boot-state-${attempt}.raw.log"
+            if ! adb_bounded shell getprop sys.boot_completed | tee "$boot_state_log"; then
+              printf 'android adb boot probe failed attempt=%s\n' "$attempt" >&2
+              exit 1
+            fi
+            boot_state="$(tr -d '\r' < "$boot_state_log")"
+            printf 'android_boot_probe_attempt=%s state=%s\n' "$attempt" "$boot_state"
+            if [ "$boot_state" = 1 ]; then booted=true; break; fi
+            sleep 2
+          done
+          test "$booted" = true
+          adb_bounded devices -l
+          adb_bounded shell getprop ro.build.version.release
+          adb_bounded shell getprop ro.product.cpu.abi
+          adb_bounded install -r "$GITHUB_WORKSPACE/candidate/app-debug.apk"
+          adb_bounded install -r "$GITHUB_WORKSPACE/candidate/app-debug-androidTest.apk"
+          adb_bounded shell pm list packages -e com.dobby.vpn
+          adb_bounded shell dumpsys package com.dobby.vpn
+          adb_bounded shell am force-stop com.dobby.vpn
+          adb_bounded shell am force-stop com.dobby.vpn.test
+          app_pid_log="$SERVICE_DIR/android-app-pid.raw.log"
+          if adb_bounded shell pidof com.dobby.vpn | tee "$app_pid_log"; then
+            printf 'android_app_pid_probe=complete\n'
+          else
+            printf 'android_app_pid_probe=failed\n' >&2
+          fi
+          test_pid_log="$SERVICE_DIR/android-test-pid.raw.log"
+          if adb_bounded shell pidof com.dobby.vpn.test | tee "$test_pid_log"; then
+            printf 'android_test_pid_probe=complete\n'
+          else
+            printf 'android_test_pid_probe=failed\n' >&2
+          fi
+
+      - name: Upload public certificate and opaque request
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: ${{ env.REQUEST_ARTIFACT_NAME }}
+          path: |
+            ${{ env.HANDOFF_DIR }}/request.json
+            ${{ env.HANDOFF_DIR }}/recipient.crt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Wait for and download exact encrypted Render lease response
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          response_name="render-lease-${LEASE_RUN_ID}-${PLATFORM}"
+          expected_title="Trusted Render lease ${LEASE_RUN_ID} ${PLATFORM}"
+          found=false
+          for attempt in $(seq 1 120); do
+            remaining=$((RUN_DEADLINE_EPOCH - $(date +%s)))
+            if [ "$remaining" -le 180 ]; then
+              printf 'lease response wait reached cleanup reserve: remaining=%s\n' "$remaining" >&2
+              break
+            fi
+            attempt_dir="$HANDOFF_DIR/lease-response-attempt-$attempt"
+            mkdir -p "$attempt_dir"
+            timeout --foreground --signal=TERM --kill-after=10s 30s gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${response_name}" | tee "$attempt_dir/poll.json"
+            if lease_workflow_run_id="$(python3 - "$attempt_dir/poll.json" "$response_name" <<'PY'
+          import json, sys
+          from pathlib import Path
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          matches = [item for item in value.get("artifacts", []) if item.get("name") == sys.argv[2] and item.get("expired") is not True]
+          if len(matches) != 1: raise SystemExit(1 if not matches else 2)
+          run_id = (matches[0].get("workflow_run") or {}).get("id")
+          if not isinstance(run_id, int) or run_id <= 0: raise SystemExit(2)
+          print(run_id)
+          PY
+            )"; then
+              timeout --foreground --signal=TERM --kill-after=10s 30s gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${lease_workflow_run_id}" | tee "$attempt_dir/lease-workflow-run.json"
+              python3 - "$attempt_dir/lease-workflow-run.json" "$lease_workflow_run_id" "$expected_title" <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected = {"id": int(sys.argv[2]), "event": "workflow_dispatch", "head_branch": os.environ["GITHUB_REF_NAME"], "head_sha": os.environ["TORTURER_SHA"], "path": ".github/workflows/server-lease.yml", "display_title": sys.argv[3]}
+          for key, wanted in expected.items():
+              if value.get(key) != wanted: raise SystemExit(f"lease workflow {key} mismatch")
+          if value.get("repository", {}).get("full_name") != os.environ["GITHUB_REPOSITORY"]: raise SystemExit("lease workflow repository mismatch")
+          print("lease_workflow_run=validated")
+          PY
+              if PYTHONPATH="$GITHUB_WORKSPACE/torturer" timeout --foreground --signal=TERM --kill-after=10s 120s python3 -m torturer_checks.hosted.artifacts \
+                --repository "$GITHUB_REPOSITORY" --artifact-name "$response_name" --run-id "$lease_workflow_run_id" \
+                --output-dir "$attempt_dir/unpacked" --metadata "$attempt_dir/artifacts.json" --archive "$attempt_dir/response.zip" \
+                --expect-file lease.json --expect-file profile.cms; then
+                printf 'LEASE_RESPONSE_DIR=%s\n' "$attempt_dir/unpacked" >> "$GITHUB_ENV"
+                found=true
+                break
+              fi
+            else
+              status=$?
+              test "$status" -eq 1
+            fi
+            printf 'lease_response_attempt=%s status=pending\n' "$attempt"
+            sleep 5
+          done
+          test "$found" = true
+
+      - name: Validate and decrypt encrypted profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$LEASE_RESPONSE_DIR/lease.json" && test -f "$LEASE_RESPONSE_DIR/profile.cms"
+          python3 - "$LEASE_RESPONSE_DIR/lease.json" <<'PY'
+          import json, os, re, sys
+          from pathlib import Path
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected = {"schema": 1, "kind": "dobbyvpn.render-lease", "run_id": os.environ["LEASE_RUN_ID"], "platform": "android", "image_digest": os.environ["SERVER_IMAGE_DIGEST"], "state": "issued"}
+          for key, wanted in expected.items():
+              if value.get(key) != wanted: raise SystemExit(f"lease field {key} is invalid")
+          if not re.fullmatch(r"srv-[A-Za-z0-9][A-Za-z0-9_-]{1,99}", str(value.get("service_id"))): raise SystemExit("lease service id is invalid")
+          print("lease_record=validated")
+          PY
+          timeout --foreground --signal=TERM --kill-after=10s 60s openssl cms -decrypt -binary -inform DER -in "$LEASE_RESPONSE_DIR/profile.cms" \
+            -recip "$HANDOFF_DIR/recipient.crt" -inkey "$HANDOFF_DIR/recipient.key" -out "$HANDOFF_DIR/profile.toml"
+          chmod 600 "$HANDOFF_DIR/profile.toml"
+          test -s "$HANDOFF_DIR/profile.toml"
+
+      - name: Run canonical Android functional scenarios
+        id: functional
+        shell: bash
+        working-directory: torturer
+        run: |
+          set -euo pipefail
+          remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 120))
+          # Android's six applicable canonical scenarios plus resets have a 621-second declared maximum.
+          if [ "$remaining" -lt 650 ]; then printf 'insufficient Android canonical budget before cleanup reserve: seconds=%s\n' "$remaining" >&2; exit 1; fi
+          if [ "$remaining" -gt 1260 ]; then remaining=1260; fi
+          printf 'canonical_lane_timeout_seconds=%s\n' "$remaining"
+          python3 -m torturer_checks.hosted.deadline --timeout-seconds "$remaining" --kill-grace-seconds 30 \
+            python3 -m torturer_checks.hosted.run --platform android \
+            --profile "$HANDOFF_DIR/profile.toml" --source-repository "$SOURCE_REPOSITORY" --source-sha "$SOURCE_SHA" \
+            --candidate-manifest "$GITHUB_WORKSPACE/candidate/manifest.json" --server-image-digest "$SERVER_IMAGE_DIGEST" --output "$RESULT_PATH" \
+            --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" --identity-url "https://api.ipify.org" \
+            --latency-url "https://proof.ovh.net/files/1Mb.dat" \
+            --download-url "https://proof.ovh.net/files/1Mb.dat" --upload-url "https://speed.cloudflare.com/__up" \
+            --adb "$ADB_PATH"
+
+      - name: Stop Android emulator and verify cleanup
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          adb="${ADB_PATH:-${ANDROID_SDK_ROOT:-}/platform-tools/adb}"
+          adb_bounded() {
+            timeout --foreground --signal=TERM --kill-after=10s 60s "$adb" "$@"
+          }
+          if [ -x "$adb" ]; then
+            if ! adb_bounded shell am force-stop com.dobby.vpn; then printf 'android_cleanup_force_stop_app=failed\n' >&2; fi
+            if ! adb_bounded shell am force-stop com.dobby.vpn.test; then printf 'android_cleanup_force_stop_test=failed\n' >&2; fi
+            if adb_bounded uninstall com.dobby.vpn.test; then printf 'android_test_package_removed=true\n'; else printf 'android_test_package_removal=not-installed-or-failed\n'; fi
+            if adb_bounded uninstall com.dobby.vpn; then printf 'android_package_removed=true\n'; else printf 'android_package_removal=not-installed-or-failed\n'; fi
+            if adb_bounded emu kill; then printf 'android_emulator_shutdown_requested=true\n'; else printf 'android_emulator_shutdown_request=failed-or-already-stopped\n'; fi
+            if ! adb_bounded devices -l; then printf 'android_cleanup_devices_probe=failed\n' >&2; fi
+          else
+            printf 'adb_missing_during_cleanup=%s\n' "$adb" >&2
+          fi
+          emulator_pid="${EMULATOR_PID:-}"
+          if [ -f "${HANDOFF_DIR:-}/emulator.pid" ]; then emulator_pid="$(cat "$HANDOFF_DIR/emulator.pid")"; fi
+          process_group_alive() {
+            kill -0 "$emulator_pid" || kill -0 -- "-$emulator_pid"
+          }
+          case "$emulator_pid" in
+            "") printf 'android_emulator_pid=not-recorded\n';;
+            0|*[!0-9]*) printf 'invalid emulator pid=%s\n' "$emulator_pid" >&2; exit 1;;
+            *)
+              stopped=false
+              for attempt in $(seq 1 30); do
+                if ! process_group_alive; then stopped=true; break; fi
+                printf 'android_emulator_cleanup_attempt=%s pid=%s\n' "$attempt" "$emulator_pid"
+                sleep 1
+              done
+              if [ "$stopped" != true ]; then
+                printf 'android_emulator_term_group=%s\n' "$emulator_pid"
+                kill -TERM -- "-$emulator_pid"
+                for attempt in $(seq 1 10); do
+                  if ! process_group_alive; then stopped=true; break; fi
+                  sleep 1
+                done
+              fi
+              if [ "$stopped" != true ]; then
+                printf 'android_emulator_kill_group=%s\n' "$emulator_pid"
+                kill -KILL -- "-$emulator_pid"
+                for attempt in $(seq 1 10); do
+                  if ! process_group_alive; then stopped=true; printf 'android_emulator_post_kill_verified=true\n'; break; fi
+                  printf 'android_emulator_post_kill_check=%s\n' "$attempt"
+                  sleep 1
+                done
+              fi
+              test "$stopped" = true
+              if [ -f "${EMULATOR_LOG:-}" ]; then cat "$EMULATOR_LOG"; fi
+              ;;
+          esac
+
+      - name: Upload safe Android functional result
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: functional-result-${{ env.LEASE_RUN_ID }}-android
+          path: ${{ env.RESULT_PATH }}
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Publish opaque Android completion marker
+        if: always()
+        shell: bash
+        env:
+          FUNCTIONAL_OUTCOME: ${{ steps.functional.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HANDOFF_DIR/completion"
+          printf 'schema=1\nrun_id=%s\nplatform=android\nfunctional_outcome=%s\n' "$LEASE_RUN_ID" "$FUNCTIONAL_OUTCOME" > "$HANDOFF_DIR/completion/completion.marker"
+
+      - name: Upload opaque Android completion marker
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: render-complete-${{ env.LEASE_RUN_ID }}-android
+          path: ${{ env.HANDOFF_DIR }}/completion/completion.marker
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove plaintext handoff material
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/recipient.key"
+
+  controller:
+    name: Dispatch isolated Android Render lease controller
+    runs-on: ubuntu-24.04
+    timeout-minutes: 16
+    permissions:
+      contents: read
+      actions: write
+    env:
+      PLATFORM: android
+      TORTURER_SHA: ${{ github.sha }}
+      SERVER_IMAGE_DIGEST: ${{ vars.RENDER_IMAGE_DIGEST }}
+
+    steps:
+      - name: Validate controller inputs
+        run: |
+          set -euo pipefail
+          [[ "$TORTURER_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SERVER_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'controller_inputs=validated platform=%s\n' "$PLATFORM"
+
+      - name: Derive one origin and Android lease correlation
+        run: |
+          set -euo pipefail
+          lease_run_id="$(printf '%s:%s:%s:%s' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PLATFORM" "$TORTURER_SHA" | sha256sum | cut -c1-32)"
+          printf 'LEASE_RUN_ID=%s\nREQUEST_ARTIFACT_NAME=render-request-%s-%s\n' "$lease_run_id" "$lease_run_id" "$PLATFORM" >> "$GITHUB_ENV"
+
+      - name: Wait for Android client request artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/controller"
+          found=false
+          for attempt in $(seq 1 180); do
+            response="$RUNNER_TEMP/controller/request-${attempt}.json"
+            timeout --foreground --signal=TERM --kill-after=10s 30s gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${REQUEST_ARTIFACT_NAME}" | tee "$response"
+            if python3 - "$response" "$GITHUB_RUN_ID" "$REQUEST_ARTIFACT_NAME" <<'PY'
+          import json, sys
+          from pathlib import Path
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if any(item.get("name") == sys.argv[3] and item.get("expired") is not True and (item.get("workflow_run") or {}).get("id") == int(sys.argv[2]) for item in value.get("artifacts", [])): raise SystemExit(0)
+          raise SystemExit(1)
+          PY
+            then found=true; break; fi
+            printf 'request_artifact_attempt=%s status=pending\n' "$attempt"
+            sleep 5
+          done
+          test "$found" = true
+
+      - name: Dispatch exactly one trusted Android Render lease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          timeout --foreground --signal=TERM --kill-after=10s 30s gh api --method POST "repos/${GITHUB_REPOSITORY}/actions/workflows/server-lease.yml/dispatches" \
+            -f "ref=${GITHUB_REF_NAME}" -f "inputs[mode]=acquire" -f "inputs[origin_run_id]=${GITHUB_RUN_ID}" \
+            -f "inputs[origin_run_attempt]=${GITHUB_RUN_ATTEMPT}" -f "inputs[origin_torturer_sha]=${TORTURER_SHA}" \
+            -f "inputs[origin_workflow_path]=.github/workflows/functional-android.yml" -f "inputs[lease_run_id]=${LEASE_RUN_ID}" \
+            -f "inputs[platform]=${PLATFORM}" -f "inputs[request_artifact_name]=${REQUEST_ARTIFACT_NAME}" -f "inputs[trusted_ref]=${GITHUB_REF_NAME}"
