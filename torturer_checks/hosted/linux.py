@@ -258,7 +258,8 @@ class LinuxHostedAdapter(HostedCLIAdapter):
                     raise ScenarioExecutionError("NETWORK_UP_FAILED")
         if not self._connected(max(0.2, deadline - time.monotonic())):
             raise ScenarioExecutionError("NETWORK_TUNNEL_NOT_RESTORED")
-        self._external_ip(max(0.2, deadline - time.monotonic()))
+        if not self._routing_identity_changed(max(0.2, deadline - time.monotonic())):
+            raise ScenarioExecutionError("NETWORK_ROUTING_NOT_RESTORED")
         return {"network_transition_verified": time.monotonic() <= deadline}
 
     def _privileged(self, args: tuple[str, ...], timeout: float, failure: str):
@@ -276,6 +277,8 @@ class LinuxHostedAdapter(HostedCLIAdapter):
                       self._remaining(deadline, "PROCESS_LOSS_TIMEOUT"), "PROCESS_LOSS_CONNECT_FAILED")
         if not self._connected(self._remaining(deadline, "PROCESS_LOSS_TIMEOUT")):
             raise ScenarioExecutionError("PROCESS_LOSS_NOT_RECOVERED")
+        if not self._routing_identity_changed(self._remaining(deadline, "PROCESS_LOSS_TIMEOUT")):
+            raise ScenarioExecutionError("PROCESS_LOSS_ROUTING_NOT_RECOVERED")
         return {"process_loss_verified": True}
 
     def _endurance(self, timeout: float) -> dict[str, object]:
@@ -298,7 +301,8 @@ class LinuxHostedAdapter(HostedCLIAdapter):
                 return {"endurance_verified": True, **last_metrics}
             if not self._connected(min(30.0, remaining)):
                 raise ScenarioExecutionError("ENDURANCE_DISCONNECTED")
-            self._external_ip(min(30.0, remaining))
+            if not self._routing_identity_changed(min(30.0, remaining)):
+                raise ScenarioExecutionError("ENDURANCE_ROUTING_LOST")
             last_metrics = self._throughput(min(30.0, remaining))
             if time.monotonic() >= deadline:
                 return {"endurance_verified": True, **last_metrics}
