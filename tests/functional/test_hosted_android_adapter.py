@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 
 from torturer_checks.hosted.android import (
@@ -14,6 +15,7 @@ from torturer_checks.hosted.android import (
 from torturer_checks.hosted.cli import CommandResult, HostedAdapterError
 from torturer_checks.hosted.factory import adapter_for_platform
 from torturer_contract.functional.engine import FunctionalEngine
+from torturer_contract.functional.capabilities import Capability
 from torturer_contract.functional.results import RunProvenance
 from torturer_contract.functional.scenarios import get_scenario
 
@@ -32,6 +34,9 @@ def _observation(error_code: str | None = None) -> bytes:
         "tunnel_interface": True,
         "routing_identity_changed": True,
         "stability_verified": True,
+        "network_transition_verified": True,
+        "sleep_wake_verified": True,
+        "process_loss_verified": True,
         "latency_ms": 12.5,
         "download_mbps": 20.0,
         "upload_mbps": 10.0,
@@ -80,6 +85,43 @@ class FakeAndroidRunner:
         ):
             return CommandResult(argv, 1, b"adb cleanup stdout diagnostic\n", b"adb cleanup stderr diagnostic\n")
         return CommandResult(argv, 0, b"adb stdout diagnostic\n", b"adb stderr diagnostic\n")
+
+
+class ExternalControlRunner(FakeAndroidRunner):
+    def __init__(self, raw_directory: Path) -> None:
+        super().__init__(raw_directory)
+        self.airplane = False
+        self.awake = True
+        self.app_alive = True
+
+    def run(self, command, *, timeout_seconds):
+        argv = tuple(command)
+        self.calls.append(argv)
+        self.timeouts.append(float(timeout_seconds))
+        tail = argv[1:]
+        if tail == ("shell", "input", "keyevent", "223"):
+            self.awake = False
+            return CommandResult(argv, 0, b"sleep\n", b"")
+        if tail == ("shell", "input", "keyevent", "224"):
+            self.awake = True
+            return CommandResult(argv, 0, b"wake\n", b"")
+        if tail == ("shell", "dumpsys", "power"):
+            state = b"mWakefulness=Awake\nDisplay Power: state=ON\n" if self.awake else b"mWakefulness=Asleep\nDisplay Power: state=OFF\n"
+            return CommandResult(argv, 0, state, b"")
+        if tail == ("shell", "dumpsys", "connectivity"):
+            return CommandResult(argv, 0, b"VPN connected\n", b"")
+        if tail == ("shell", "ip", "-o", "link"):
+            return CommandResult(argv, 0, b"7: tun0: <POINTOPOINT>\n", b"")
+        if tail == ("shell", "ip", "route"):
+            return CommandResult(argv, 0, b"default dev tun0\n", b"")
+        if tail == ("shell", "pidof", "com.dobby.vpn"):
+            if self.app_alive:
+                return CommandResult(argv, 0, b"1234\n", b"")
+            return CommandResult(argv, 1, b"", b"no process\n")
+        if tail == ("shell", "am", "force-stop", "com.dobby.vpn"):
+            self.app_alive = False
+            return CommandResult(argv, 0, b"", b"")
+        return super().run(command, timeout_seconds=timeout_seconds)
 
 
 def _provenance(adapter: AndroidHostedAdapter) -> RunProvenance:
@@ -173,6 +215,83 @@ class HostedAndroidAdapterTests(unittest.TestCase):
         self.assertEqual(first.read_bytes(), first_bytes)
         self.assertEqual(first.stat().st_mode & 0o777, 0o600)
         self.assertEqual(second.stat().st_mode & 0o777, 0o600)
+
+    def test_advanced_android_operations_have_unique_token_bound_controls(self) -> None:
+        scenario = get_scenario("functional.network-transition")
+        command_file, _profile, _output = self.adapter._write_command(scenario)
+        payload = json.loads(command_file.read_text(encoding="utf-8"))
+        operation = next(
+            item for item in payload["operations"]
+            if item["operation"] == "network_transition"
+        )
+        self.assertRegex(operation["control_file"], r"^[A-Za-z0-9][A-Za-z0-9._-]+$")
+        self.assertEqual(len(operation["control_token"]), 64)
+        self.assertEqual(len(self.adapter._active_controls), 1)
+
+    def test_process_loss_command_keeps_recovery_inside_candidate_operation(self) -> None:
+        scenario = get_scenario("functional.product-process-loss")
+        command_file, _profile, _output = self.adapter._write_command(scenario)
+        payload = json.loads(command_file.read_text(encoding="utf-8"))
+        operations = payload["operations"]
+        process_index = next(
+            index for index, item in enumerate(operations)
+            if item["operation"] == "process_loss"
+        )
+        self.assertEqual(
+            [item["operation"] for item in operations[process_index + 1:process_index + 4]],
+            ["disconnect", "inspect_cleanup"],
+        )
+
+    def test_android_network_transition_is_unavailable_without_real_uplink_seam(self) -> None:
+        self.assertNotIn(Capability.NETWORK_TRANSITION, self.adapter.capabilities)
+        self.assertEqual(
+            self.adapter.capability_unavailable_reasons[Capability.NETWORK_TRANSITION],
+            "ANDROID_UPLINK_TOGGLE_UNSUPPORTED",
+        )
+
+    def test_sleep_wake_accepts_power_boundary_not_device_idle(self) -> None:
+        self.assertFalse(AndroidHostedAdapter._power_state("mState=IDLE", asleep=True))
+        self.assertTrue(
+            AndroidHostedAdapter._power_state(
+                "mWakefulness=Asleep\nDisplay Power: state=OFF", asleep=True
+            )
+        )
+        self.assertTrue(
+            AndroidHostedAdapter._power_state(
+                "mWakefulness=Awake\nDisplay Power: state=ON", asleep=False
+            )
+        )
+
+    def test_android_endurance_gap_is_unavailable_with_exact_reason(self) -> None:
+        result = FunctionalEngine("e" * 64).run(
+            get_scenario("functional.bounded-endurance"),
+            self.adapter,
+            _provenance(self.adapter),
+        )
+        self.assertEqual(result.outcome, "unavailable")
+        self.assertEqual(result.reason_code, "ANDROID_ENDURANCE_SEAM_UNSUPPORTED")
+
+    def test_android_external_controls_match_private_harness_operations(self) -> None:
+        runner = ExternalControlRunner(self.runner.raw_directory.parent / "external-raw")
+        adapter = AndroidHostedAdapter(
+            runner=runner,
+            profile=self.profile,
+            adb=self.adb,
+            source_sha=_SOURCE_SHA,
+            identity_url="https://identity.example.test/ip",
+            latency_url="https://latency.example.test/blob",
+            download_url="https://download.example.test/blob",
+            upload_url="https://upload.example.test/blob",
+        )
+        for operation in ("sleep_wake", "process_loss"):
+            with self.subTest(operation=operation):
+                runner.airplane = False
+                runner.awake = True
+                runner.app_alive = True
+                adapter._perform_external_control(operation, time.monotonic() + 5.0)
+        self.assertFalse(runner.airplane)
+        self.assertTrue(runner.awake)
+        self.assertFalse(runner.app_alive)
 
     def test_finalization_failure_remains_visible_after_product_failure(self) -> None:
         self.runner.observation = _observation("DRIVER_ERROR")

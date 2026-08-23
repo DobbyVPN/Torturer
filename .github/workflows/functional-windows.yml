@@ -554,8 +554,10 @@ jobs:
         run: |
           set -euo pipefail
           remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 120))
-          if [ "$remaining" -lt 950 ]; then printf 'insufficient full-catalog budget before cleanup reserve: seconds=%s\n' "$remaining" >&2; exit 1; fi
-          if [ "$remaining" -gt 1260 ]; then remaining=1260; fi
+          # Eight applicable scenarios plus ten resets require 938 seconds;
+          # keep a deliberate 60-second scheduling margin inside the 1,200s cap.
+          if [ "$remaining" -lt 998 ]; then printf 'insufficient Windows canonical budget before cleanup reserve: seconds=%s required=998\n' "$remaining" >&2; exit 1; fi
+          if [ "$remaining" -gt 1200 ]; then remaining=1200; fi
           printf 'canonical_lane_timeout_seconds=%s\n' "$remaining"
           python -m torturer_checks.hosted.deadline --timeout-seconds "$remaining" --kill-grace-seconds 30 \
             python -m torturer_checks.hosted.run --platform windows --cli "$GITHUB_WORKSPACE/candidate/dobby-cli.exe" \
@@ -564,7 +566,9 @@ jobs:
             --candidate-manifest "$GITHUB_WORKSPACE/candidate/manifest.json" --server-image-digest "$SERVER_IMAGE_DIGEST" --output "$RESULT_PATH" \
             --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" --download-url "https://proof.ovh.net/files/1Mb.dat" \
             --upload-url "https://speed.cloudflare.com/__up" --service-pid "$SERVICE_PID" --service-binary "$SERVICE_BINARY" \
-            --service-socket "$SERVICE_CONTROL_ADDRESS" --service-pid-file "$SERVICE_PID_FILE"
+            --service-socket "$SERVICE_CONTROL_ADDRESS" --service-pid-file "$SERVICE_PID_FILE" \
+            --expected-unavailable functional.network-transition=HOSTED_WINDOWS_UPLINK_TOGGLE_UNSUPPORTED \
+            --expected-unavailable functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED
 
       - name: Stop exact Windows service and verify cleanup
         if: always()

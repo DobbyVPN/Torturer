@@ -40,6 +40,24 @@ class BulkScenarioAdapter(Protocol):
     def execute_scenario(self, scenario: ScenarioDefinition) -> Mapping[str, object]: ...
 
 
+def _unavailable_reason(adapter: ScenarioAdapter, missing: frozenset[Capability]) -> str:
+    """Return an adapter-owned reason for a proved hosted capability gap.
+
+    The canonical engine still owns the unavailable outcome.  Adapters may
+    explain why a platform cannot perform one of the shared operations, but
+    they cannot turn that gap into a pass or remove the scenario from the
+    selected catalog.
+    """
+
+    reasons = getattr(adapter, "capability_unavailable_reasons", {})
+    if isinstance(reasons, Mapping):
+        for capability in sorted(missing, key=lambda value: value.value):
+            reason = reasons.get(capability)
+            if isinstance(reason, str) and reason:
+                return reason
+    return "CAPABILITY_UNAVAILABLE"
+
+
 EvidenceProvider = Callable[[], Sequence[EvidenceReference]]
 
 
@@ -67,7 +85,7 @@ class FunctionalEngine:
                 scenario,
                 provenance,
                 outcome="unavailable",
-                reason_code="CAPABILITY_UNAVAILABLE",
+                reason_code=_unavailable_reason(adapter, missing),
                 assertions=(),
                 cleanup={"required": False, "verified": True},
                 metrics={},
@@ -113,7 +131,9 @@ class FunctionalEngine:
                 scenario,
                 provenance,
                 outcome="unavailable",
-                reason_code="CAPABILITY_UNAVAILABLE",
+                reason_code=_unavailable_reason(
+                    adapter, scenario.required_capabilities - adapter.capabilities
+                ),
                 assertions=(),
                 cleanup={"required": False, "verified": True},
                 metrics={},

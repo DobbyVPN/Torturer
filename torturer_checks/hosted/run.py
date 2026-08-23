@@ -32,6 +32,31 @@ _SHA40 = set("0123456789abcdef")
 _MAX_LANE_SECONDS = 1200
 _RESET_TIMEOUT_SECONDS = 5
 _OPAQUE_EVIDENCE_ID = re.compile(r"[a-z][0-9a-f]{31}\Z")
+_SCENARIO_ID = re.compile(r"[a-z][a-z0-9._-]{2,95}\Z")
+_REASON_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
+
+# These are deliberately part of the executable contract as well as being
+# repeated in each trusted workflow invocation.  A workflow may not silently
+# turn a newly unsupported scenario into a successful lane, and an old
+# expected gap must fail when the adapter starts supporting it.
+EXPECTED_UNAVAILABLE_BY_PLATFORM: dict[str, frozenset[tuple[str, str]]] = {
+    "linux": frozenset({
+        ("functional.network-transition", "HOSTED_LINUX_INTERFACE_REQUIRED"),
+        ("functional.sleep-wake", "HOSTED_RUNNER_SUSPEND_UNSUPPORTED"),
+    }),
+    "windows": frozenset({
+        ("functional.network-transition", "HOSTED_WINDOWS_UPLINK_TOGGLE_UNSUPPORTED"),
+        ("functional.sleep-wake", "HOSTED_RUNNER_SUSPEND_UNSUPPORTED"),
+    }),
+    "macos": frozenset({
+        ("functional.network-transition", "HOSTED_MACOS_UPLINK_TOGGLE_UNSUPPORTED"),
+        ("functional.sleep-wake", "HOSTED_RUNNER_SUSPEND_UNSUPPORTED"),
+    }),
+    "android": frozenset({
+        ("functional.bounded-endurance", "ANDROID_ENDURANCE_SEAM_UNSUPPORTED"),
+        ("functional.network-transition", "ANDROID_UPLINK_TOGGLE_UNSUPPORTED"),
+    }),
+}
 
 
 def _full_sha(value: str, name: str) -> str:
@@ -109,7 +134,11 @@ def _select_scenarios(scenario_ids: list[str] | None) -> tuple:
     return scenarios
 
 
-def _partition_applicable(scenarios, capabilities) -> tuple[tuple, list[dict[str, object]]]:
+def _partition_applicable(
+    scenarios,
+    capabilities,
+    unavailable_reasons=None,
+) -> tuple[tuple, list[dict[str, object]]]:
     available = frozenset(capabilities)
     applicable = []
     unsupported = []
@@ -119,16 +148,111 @@ def _partition_applicable(scenarios, capabilities) -> tuple[tuple, list[dict[str
             for capability in scenario.required_capabilities - available
         )
         if missing:
+            reason_code = "CAPABILITY_UNAVAILABLE"
+            if isinstance(unavailable_reasons, dict):
+                for capability in sorted(missing):
+                    candidate = unavailable_reasons.get(capability)
+                    if isinstance(candidate, str) and candidate:
+                        reason_code = candidate
+                        break
             unsupported.append(
                 {
                     "scenario_id": scenario.id,
                     "missing_capabilities": missing,
-                    "reason_code": "CAPABILITY_UNAVAILABLE",
+                    "reason_code": reason_code,
                 }
             )
         else:
             applicable.append(scenario)
     return tuple(applicable), unsupported
+
+
+def _expected_unavailable(values: list[str] | None) -> frozenset[tuple[str, str]]:
+    """Parse the workflow's explicit scenario-id=reason-code allowlist."""
+
+    pairs: set[tuple[str, str]] = set()
+    for value in values or []:
+        scenario_id, separator, reason_code = value.partition("=")
+        if (
+            not separator
+            or _SCENARIO_ID.fullmatch(scenario_id) is None
+            or _REASON_CODE.fullmatch(reason_code) is None
+        ):
+            raise ValueError(
+                "expected-unavailable values must be scenario-id=REASON_CODE"
+            )
+        pair = (scenario_id, reason_code)
+        if pair in pairs:
+            raise ValueError("expected-unavailable values must be unique")
+        pairs.add(pair)
+    return frozenset(pairs)
+
+
+def _unavailable_pairs(
+    values: list[dict[str, object]],
+    *,
+    result_values: bool = False,
+) -> frozenset[tuple[str, str]]:
+    pairs: set[tuple[str, str]] = set()
+    for value in values:
+        if result_values and value.get("outcome") != "unavailable":
+            continue
+        scenario_id = value.get("scenario_id")
+        reason_code = value.get("reason_code")
+        if isinstance(scenario_id, str) and isinstance(reason_code, str):
+            pairs.add((scenario_id, reason_code))
+        else:
+            # Invalid result shape is still an unexpected unavailable item;
+            # it must not be hidden by a permissive comparison.
+            pairs.add(("<invalid-scenario>", "<invalid-reason>"))
+    return frozenset(pairs)
+
+
+def _coverage_contract(
+    platform: str,
+    selected_scenarios,
+    results: list[dict[str, object]],
+    unsupported_scenarios: list[dict[str, object]],
+    expected_unavailable: frozenset[tuple[str, str]],
+) -> dict[str, object]:
+    expected_platform = EXPECTED_UNAVAILABLE_BY_PLATFORM[platform]
+    declared = _unavailable_pairs(unsupported_scenarios)
+    observed = _unavailable_pairs(results, result_values=True)
+    selected_ids = {scenario.id for scenario in selected_scenarios}
+    catalog_ids = {scenario.id for scenario in scenario_catalog()}
+    selected_catalog_match = (
+        len(selected_scenarios) == len(catalog_ids) and selected_ids == catalog_ids
+    )
+    configured = expected_unavailable == expected_platform
+    reasons_match = declared == observed
+    expected_match = observed == expected_unavailable
+    status = (
+        "supported-subset-with-expected-limitations"
+        if configured and reasons_match and expected_match and selected_catalog_match
+        else "coverage-contract-failed"
+    )
+    return {
+        "status": status,
+        "complete": False,
+        "catalog_scenario_count": len(scenario_catalog()),
+        "selected_scenario_count": len(selected_scenarios),
+        "selected_catalog_match": selected_catalog_match,
+        "expected_unavailable": [
+            {"scenario_id": scenario_id, "reason_code": reason_code}
+            for scenario_id, reason_code in sorted(expected_unavailable)
+        ],
+        "actual_unavailable": [
+            {"scenario_id": scenario_id, "reason_code": reason_code}
+            for scenario_id, reason_code in sorted(observed)
+        ],
+        "declared_unavailable": [
+            {"scenario_id": scenario_id, "reason_code": reason_code}
+            for scenario_id, reason_code in sorted(declared)
+        ],
+        "configured_allowlist_matches_platform": configured,
+        "declared_results_match": reasons_match,
+        "actual_matches_allowlist": expected_match,
+    }
 
 
 def _lane_remaining(deadline: float | None) -> float | None:
@@ -253,11 +377,19 @@ def _qualification_exit_code(
     results: list[dict[str, object]],
     unsupported_scenarios: list[dict[str, object]],
     reset_failures: list[str],
+    expected_unavailable: frozenset[tuple[str, str]] = frozenset(),
 ) -> int:
-    """Fail qualification for failed, unavailable, or omitted coverage."""
+    """Allow only the exact reviewed unavailable set, never arbitrary gaps."""
     failed = [item for item in results if item["outcome"] == "failed"]
     unavailable = [item for item in results if item["outcome"] == "unavailable"]
-    if failed or unavailable or unsupported_scenarios or reset_failures:
+    declared = _unavailable_pairs(unsupported_scenarios)
+    observed = _unavailable_pairs(unavailable)
+    if (
+        failed
+        or reset_failures
+        or declared != observed
+        or observed != expected_unavailable
+    ):
         return 2
     return 0
 
@@ -363,12 +495,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--service-library-path", type=Path)
     parser.add_argument("--service-pid-file", type=Path)
     parser.add_argument("--network-interface")
+    parser.add_argument(
+        "--expected-unavailable",
+        action="append",
+        default=[],
+        metavar="SCENARIO_ID=REASON_CODE",
+        help="Reviewed unavailable scenario/reason pair; repeat for the exact lane allowlist.",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        expected_unavailable = _expected_unavailable(args.expected_unavailable)
         source_sha = _full_sha(args.source_sha, "source SHA")
         raw_dir = args.raw_log_dir or args.output.parent / "hosted-command-raw"
         _ensure_owner_only_directory(raw_dir)
@@ -428,7 +568,9 @@ def main(argv: list[str] | None = None) -> int:
         # removing those scenarios would make an all-applicable pass look like
         # complete coverage.
         _, unsupported_scenarios = _partition_applicable(
-            selected_scenarios, adapter.capabilities
+            selected_scenarios,
+            adapter.capabilities,
+            getattr(adapter, "capability_unavailable_reasons", None),
         )
         scenarios = selected_scenarios
         # The canonical lane clock starts only after source/candidate
@@ -473,6 +615,16 @@ def main(argv: list[str] | None = None) -> int:
                 getattr(adapter.runner, "safe_evidence", lambda: ())()
             ),
         }
+        failed = [item for item in results if item["outcome"] == "failed"]
+        unavailable = [item for item in results if item["outcome"] == "unavailable"]
+        coverage = _coverage_contract(
+            args.platform,
+            selected_scenarios,
+            results,
+            unsupported_scenarios,
+            expected_unavailable,
+        )
+        document["coverage"] = coverage
         _require_lane_time(
             lane_deadline,
             required_seconds=0.0,
@@ -484,14 +636,18 @@ def main(argv: list[str] | None = None) -> int:
         # retain the result and fail closed rather than reporting a late pass.
         if time.monotonic() > lane_deadline:
             raise ValueError("HOSTED_LANE_DEADLINE_EXCEEDED during result fsync")
-        failed = [item for item in results if item["outcome"] == "failed"]
-        unavailable = [item for item in results if item["outcome"] == "unavailable"]
         print(
             f"hosted-functional platform={args.platform} scenarios={len(results)} "
             f"unsupported={len(unsupported_scenarios)} failed={len(failed)} "
-            f"unavailable={len(unavailable)} reset_failures={len(reset_failures)}"
+            f"unavailable={len(unavailable)} reset_failures={len(reset_failures)} "
+            f"coverage={coverage['status']}"
         )
-        return _qualification_exit_code(results, unsupported_scenarios, reset_failures)
+        return _qualification_exit_code(
+            results,
+            unsupported_scenarios,
+            reset_failures,
+            expected_unavailable,
+        ) if coverage["status"] == "supported-subset-with-expected-limitations" else 2
     except Exception as error:
         print(f"hosted-functional failed code={type(error).__name__}", file=sys.stderr)
         return 1

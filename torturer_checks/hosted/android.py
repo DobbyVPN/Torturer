@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Mapping
 import uuid
@@ -55,7 +56,13 @@ _ALLOWED_OPERATIONS = {
     "disconnect",
     "reconnect",
     "inspect_cleanup",
+    "network_transition",
+    "sleep_wake",
+    "process_loss",
 }
+_EXTERNAL_OPERATIONS = frozenset(
+    {"network_transition", "sleep_wake", "process_loss"}
+)
 _CORE_CAPABILITIES = frozenset(
     {
         Capability.CONFIGURE,
@@ -147,7 +154,7 @@ class AndroidHostedAdapter:
     """Run canonical scenarios through DobbyVPN Android instrumentation."""
 
     adapter_id = "hosted-android-app"
-    adapter_version = "v3"
+    adapter_version = "v4"
 
     def __init__(
         self,
@@ -194,10 +201,30 @@ class AndroidHostedAdapter:
         self.upload_url = (
             _https_endpoint(upload_url, "upload_url") if upload_url is not None else None
         )
+        self._active_controls: tuple[tuple[str, str, str, float], ...] = ()
 
     @property
     def capabilities(self) -> frozenset[Capability]:
-        return _CORE_CAPABILITIES if self._ready else frozenset()
+        if not self._ready:
+            return frozenset()
+        return _CORE_CAPABILITIES | frozenset(
+            {
+                Capability.SLEEP_WAKE,
+                Capability.PROCESS_LOSS,
+            }
+        )
+
+    @property
+    def capability_unavailable_reasons(self) -> dict[Capability, str]:
+        return {
+            # Airplane-mode toggling alone does not prove that the emulator's
+            # non-VPN uplink/default route was lost and restored. The public
+            # google_apis image is not provisioned with a reliable isolated
+            # root-controlled data interface, so fail closed until that seam
+            # exists rather than calling a settings change a transition.
+            Capability.NETWORK_TRANSITION: "ANDROID_UPLINK_TOGGLE_UNSUPPORTED",
+            Capability.ENDURANCE: "ANDROID_ENDURANCE_SEAM_UNSUPPORTED",
+        }
 
     @property
     def _ready(self) -> bool:
@@ -268,28 +295,7 @@ class AndroidHostedAdapter:
                 _remaining(deadline, "ANDROID_COMMAND_STAGE_TIMEOUT"),
                 "ANDROID_COMMAND_STAGE_FAILED",
             )
-            instrument = self._adb(
-                (
-                    "shell",
-                    "am",
-                    "instrument",
-                    "-w",
-                    "-r",
-                    "-e",
-                    "dobby.real_profile",
-                    "1",
-                    "-e",
-                    "dobby.hosted_command_file",
-                    command_file.name,
-                    "-e",
-                    "class",
-                    _INSTRUMENTATION_CLASS,
-                    _INSTRUMENTATION_COMPONENT,
-                ),
-                _remaining(deadline, "ANDROID_INSTRUMENTATION_TIMEOUT"),
-                "ANDROID_INSTRUMENTATION_FAILED",
-                allow_nonzero=True,
-            )
+            instrument = self._run_instrumentation(command_file.name, deadline)
             output = self._adb(
                 ("exec-out", "run-as", _PACKAGE_NAME, "cat", device_output),
                 _remaining(deadline, "ANDROID_OBSERVATION_TIMEOUT"),
@@ -315,8 +321,15 @@ class AndroidHostedAdapter:
         finally:
             diagnostic_error = self._capture_diagnostics(diagnostic_deadline)
             cleanup_error = self._cleanup_device(
-                (profile_name, command_file.name, output_name), cleanup_deadline
+                (
+                    profile_name,
+                    command_file.name,
+                    output_name,
+                    tuple(control[0] for control in self._active_controls),
+                ),
+                cleanup_deadline,
             )
+            self._active_controls = ()
             finalization_error = _finalization_error(diagnostic_error, cleanup_error)
             if finalization_error is not None:
                 # Do not suppress finalization evidence when the product
@@ -336,7 +349,242 @@ class AndroidHostedAdapter:
             "ANDROID_RESET_FAILED",
         )
 
+    def _run_instrumentation(self, command_name: str, deadline: float) -> CommandResult:
+        arguments = (
+            "shell", "am", "instrument", "-w", "-r", "-e", "dobby.real_profile", "1",
+            "-e", "dobby.hosted_command_file", command_name, "-e", "class",
+            _INSTRUMENTATION_CLASS, _INSTRUMENTATION_COMPONENT,
+        )
+        controls = self._active_controls
+        if not controls:
+            return self._adb(
+                arguments,
+                _remaining(deadline, "ANDROID_INSTRUMENTATION_TIMEOUT"),
+                "ANDROID_INSTRUMENTATION_FAILED",
+                allow_nonzero=True,
+            )
+
+        holder: dict[str, object] = {}
+
+        def invoke() -> None:
+            try:
+                holder["result"] = self._adb(
+                    arguments,
+                    _remaining(deadline, "ANDROID_INSTRUMENTATION_TIMEOUT"),
+                    "ANDROID_INSTRUMENTATION_FAILED",
+                    allow_nonzero=True,
+                )
+            except Exception as error:  # surfaced on the owner thread below
+                holder["error"] = error
+
+        worker = threading.Thread(target=invoke, name="dobbyvpn-android-instrument", daemon=True)
+        worker.start()
+        try:
+            for control_file, operation, token, timeout in controls:
+                self._complete_external_control(
+                    control_file, operation, token,
+                    min(deadline, time.monotonic() + timeout),
+                )
+            worker.join(timeout=_remaining(deadline, "ANDROID_INSTRUMENTATION_TIMEOUT"))
+            if worker.is_alive():
+                raise ScenarioExecutionError("ANDROID_INSTRUMENTATION_TIMEOUT")
+            error = holder.get("error")
+            if isinstance(error, ScenarioExecutionError):
+                raise error
+            if isinstance(error, Exception):
+                raise ScenarioExecutionError("ANDROID_INSTRUMENTATION_FAILED") from error
+            result = holder.get("result")
+            if not isinstance(result, CommandResult):
+                raise ScenarioExecutionError("ANDROID_INSTRUMENTATION_FAILED")
+            return result
+        except Exception:
+            # If a control action fails, wait only until the already-declared
+            # work deadline for the runner to reap the instrumentation process
+            # and retain its final bytes. The diagnostics/cleanup reserve is
+            # outside this clock and remains available to the caller.
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+            raise
+        finally:
+            # The command runner owns bounded process cleanup.  This join is
+            # deliberately non-blocking so a failed control cannot extend the
+            # scenario deadline; the runner's timeout retains its diagnostics.
+            worker.join(timeout=0)
+
+    def _complete_external_control(
+        self, control_file: str, operation: str, token: str, deadline: float
+    ) -> None:
+        self._wait_device_file(control_file + ".ready", deadline)
+        self._perform_external_control(operation, deadline)
+        raw_directory = getattr(self.runner, "raw_directory", None)
+        if not isinstance(raw_directory, Path):
+            raise ScenarioExecutionError("ANDROID_CONTROL_EVIDENCE_UNAVAILABLE")
+        control_path = raw_directory / control_file
+        payload = json.dumps(
+            {"operation": operation, "token": token},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii") + b"\n"
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                control_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+            with os.fdopen(descriptor, "wb") as output:
+                descriptor = -1
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
+            staged = f"/data/local/tmp/{control_file}"
+            self._adb(
+                ("push", str(control_path), staged),
+                _remaining(deadline, "ANDROID_CONTROL_STAGE_TIMEOUT"),
+                "ANDROID_CONTROL_STAGE_FAILED",
+            )
+            self._adb(
+                ("shell", "run-as", _PACKAGE_NAME, "cp", staged, f"files/{control_file}"),
+                _remaining(deadline, "ANDROID_CONTROL_STAGE_TIMEOUT"),
+                "ANDROID_CONTROL_STAGE_FAILED",
+            )
+            self._adb(
+                ("shell", "run-as", _PACKAGE_NAME, "chmod", "600", f"files/{control_file}"),
+                _remaining(deadline, "ANDROID_CONTROL_STAGE_TIMEOUT"),
+                "ANDROID_CONTROL_STAGE_FAILED",
+            )
+            self._wait_device_file(control_file + ".ready", deadline, present=False)
+        finally:
+            if descriptor != -1:
+                os.close(descriptor)
+            try:
+                control_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _wait_device_file(
+        self, name: str, deadline: float, *, present: bool = True
+    ) -> None:
+        if _FILE_NAME.fullmatch(name) is None:
+            raise ScenarioExecutionError("ANDROID_CONTROL_NAME_INVALID")
+        expected = b"READY" if present else b"ABSENT"
+        while time.monotonic() < deadline:
+            result = self._adb(
+                (
+                    "shell", "run-as", _PACKAGE_NAME, "sh", "-c",
+                    f"if test -f files/{name}; then printf READY; else printf ABSENT; fi",
+                ),
+                min(2.0, _remaining(deadline, "ANDROID_CONTROL_TIMEOUT")),
+                "ANDROID_CONTROL_PROBE_FAILED",
+                allow_nonzero=True,
+            )
+            if result.returncode == 0 and result.stdout.strip() == expected:
+                return
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        raise ScenarioExecutionError("ANDROID_CONTROL_TIMEOUT")
+
+    def _perform_external_control(self, operation: str, deadline: float) -> None:
+        if operation == "network_transition":
+            # Do not confuse an airplane-mode setting change with a real
+            # uplink transition. This hosted image currently has no reliable
+            # isolated interface whose link/default route can be toggled
+            # while ADB remains reachable, so the capability is unavailable.
+            del deadline
+            raise ScenarioExecutionError("ANDROID_UPLINK_TOGGLE_UNSUPPORTED")
+        if operation == "sleep_wake":
+            awake_before = self._device_text(
+                ("shell", "dumpsys", "power"), deadline,
+                "ANDROID_SLEEP_WAKE_PROBE_FAILED",
+            ).upper()
+            if not self._power_state(awake_before, asleep=False):
+                raise ScenarioExecutionError("ANDROID_SLEEP_WAKE_PRECONDITION")
+            sleep_sent = False
+            self._adb(
+                ("shell", "input", "keyevent", "223"),
+                _remaining(deadline, "ANDROID_SLEEP_WAKE_SLEEP_FAILED"),
+                "ANDROID_SLEEP_WAKE_SLEEP_FAILED",
+            )
+            sleep_sent = True
+            try:
+                state = self._device_text(
+                    ("shell", "dumpsys", "power"), deadline,
+                    "ANDROID_SLEEP_WAKE_PROBE_FAILED",
+                ).upper()
+                if not self._power_state(state, asleep=True):
+                    raise ScenarioExecutionError("ANDROID_SLEEP_WAKE_NOT_OBSERVED")
+                self._observe_android_vpn(deadline, "ANDROID_SLEEP_WAKE_ACTIVE")
+            finally:
+                if sleep_sent:
+                    self._adb(
+                        ("shell", "input", "keyevent", "224"),
+                        _remaining(deadline, "ANDROID_SLEEP_WAKE_WAKE_FAILED"),
+                        "ANDROID_SLEEP_WAKE_WAKE_FAILED",
+                    )
+                    state = self._device_text(
+                        ("shell", "dumpsys", "power"), deadline,
+                        "ANDROID_SLEEP_WAKE_PROBE_FAILED",
+                    ).upper()
+                    if not self._power_state(state, asleep=False):
+                        raise ScenarioExecutionError("ANDROID_SLEEP_WAKE_NOT_RESTORED")
+                    self._observe_android_vpn(deadline, "ANDROID_SLEEP_WAKE_RESTORED")
+            return
+        if operation == "process_loss":
+            before = self._device_text(
+                ("shell", "pidof", _PACKAGE_NAME), deadline,
+                "ANDROID_PROCESS_LOSS_PROBE_FAILED",
+            )
+            if not before:
+                raise ScenarioExecutionError("ANDROID_PROCESS_LOSS_PRECONDITION")
+            self._adb(
+                ("shell", "am", "force-stop", _PACKAGE_NAME),
+                _remaining(deadline, "ANDROID_PROCESS_LOSS_STOP_FAILED"),
+                "ANDROID_PROCESS_LOSS_STOP_FAILED",
+            )
+            absent_probes = 0
+            while time.monotonic() < deadline:
+                current = self._adb(
+                    ("shell", "pidof", _PACKAGE_NAME),
+                    min(2.0, _remaining(deadline, "ANDROID_PROCESS_LOSS_TIMEOUT")),
+                    "ANDROID_PROCESS_LOSS_PROBE_FAILED",
+                    allow_nonzero=True,
+                )
+                if current.returncode in (0, 1) and not current.stdout.strip():
+                    absent_probes += 1
+                    if absent_probes >= 2:
+                        return
+                else:
+                    absent_probes = 0
+                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+            raise ScenarioExecutionError("ANDROID_PROCESS_LOSS_NOT_ABSENT")
+        raise ScenarioExecutionError("ANDROID_OPERATION_UNSUPPORTED")
+
+    def _device_text(self, arguments: tuple[str, ...], deadline: float, failure: str) -> str:
+        result = self._adb(arguments, _remaining(deadline, failure), failure, allow_nonzero=True)
+        if result.returncode != 0:
+            raise ScenarioExecutionError(failure)
+        return result.stdout.decode("utf-8", errors="replace").strip()
+
+    @staticmethod
+    def _power_state(value: str, *, asleep: bool) -> bool:
+        """Recognize the Android power boundary, not Doze/device-idle state."""
+        if asleep:
+            return bool(
+                re.search(r"\bmWakefulness\s*=\s*Asleep\b", value, re.IGNORECASE)
+                or re.search(r"Display Power:.*\bstate=OFF\b", value, re.IGNORECASE)
+            )
+        return bool(
+            re.search(r"\bmWakefulness\s*=\s*Awake\b", value, re.IGNORECASE)
+            or re.search(r"Display Power:.*\bstate=ON\b", value, re.IGNORECASE)
+        )
+
+    def _observe_android_vpn(self, deadline: float, failure: str) -> None:
+        connectivity = self._device_text(
+            ("shell", "dumpsys", "connectivity"), deadline, failure
+        ).lower()
+        links = self._device_text(("shell", "ip", "-o", "link"), deadline, failure).lower()
+        routes = self._device_text(("shell", "ip", "route"), deadline, failure).lower()
+        if "vpn" not in connectivity or ("tun" not in links and "tun" not in routes):
+            raise ScenarioExecutionError(failure)
+
     def _write_command(self, scenario: ScenarioDefinition) -> tuple[Path, str, str]:
+        self._active_controls = ()
         raw_directory = getattr(self.runner, "raw_directory", None)
         if not isinstance(raw_directory, Path):
             raise ScenarioExecutionError("ANDROID_EVIDENCE_UNAVAILABLE")
@@ -355,10 +603,26 @@ class AndroidHostedAdapter:
             if _FILE_NAME.fullmatch(name) is None:
                 raise ScenarioExecutionError("ANDROID_COMMAND_NAME_INVALID")
         operations = []
+        controls: list[tuple[str, str, str, float]] = []
         for step in scenario.steps:
             if step.operation not in _ALLOWED_OPERATIONS:
                 raise ScenarioExecutionError("ANDROID_OPERATION_UNSUPPORTED")
-            operations.append(step.to_dict())
+            item = step.to_dict()
+            if step.operation in _EXTERNAL_OPERATIONS:
+                control_file = f"{token}.external-{len(controls)}.json"
+                control_token = hashlib.sha256(
+                    f"{scenario.id}\0{step.id}\0{step.operation}\0{self.source_sha}".encode(
+                        "ascii"
+                    )
+                ).hexdigest()
+                if _FILE_NAME.fullmatch(control_file) is None:
+                    raise ScenarioExecutionError("ANDROID_CONTROL_NAME_INVALID")
+                item["control_file"] = control_file
+                item["control_token"] = control_token
+                controls.append(
+                    (control_file, step.operation, control_token, float(step.timeout_seconds))
+                )
+            operations.append(item)
         command = {
             "schema": 1,
             "kind": "dobbyvpn.android.profile-command",
@@ -394,6 +658,7 @@ class AndroidHostedAdapter:
             if descriptor != -1:
                 os.close(descriptor)
         command_file.chmod(0o600)
+        self._active_controls = tuple(controls)
         return command_file, profile_name, output_name
 
     def _adb(
@@ -437,9 +702,9 @@ class AndroidHostedAdapter:
         return error
 
     def _cleanup_device(
-        self, names: tuple[str, str, str], deadline: float
+        self, names: tuple[str, str, str, tuple[str, ...]], deadline: float
     ) -> ScenarioExecutionError | None:
-        profile_name, command_name, output_name = names
+        profile_name, command_name, output_name, control_names = names
         error: ScenarioExecutionError | None = None
         for command in (
             (
@@ -451,6 +716,9 @@ class AndroidHostedAdapter:
                 f"files/{profile_name}",
                 f"files/{command_name}",
                 f"files/{output_name}",
+                *(f"files/{name}" for name in control_names),
+                *(f"files/{name}.ready" for name in control_names),
+                *(f"files/{name}.tmp" for name in control_names),
             ),
             (
                 "shell",
@@ -458,6 +726,7 @@ class AndroidHostedAdapter:
                 "-f",
                 f"/data/local/tmp/{profile_name}",
                 f"/data/local/tmp/{command_name}",
+                *(f"/data/local/tmp/{name}" for name in control_names),
             ),
             ("shell", "am", "force-stop", _PACKAGE_NAME),
         ):
