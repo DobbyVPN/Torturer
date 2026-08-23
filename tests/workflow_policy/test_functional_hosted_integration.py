@@ -6,6 +6,9 @@ from pathlib import Path
 import re
 import unittest
 
+from torturer_checks.hosted.run import EXPECTED_UNAVAILABLE_BY_PLATFORM
+from torturer_contract.functional.scenarios import scenario_catalog
+
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = {
     "linux": ROOT / ".github" / "workflows" / "functional.yml",
@@ -13,6 +16,31 @@ WORKFLOWS = {
     "macos": ROOT / ".github" / "workflows" / "functional-macos.yml",
     "android": ROOT / ".github" / "workflows" / "functional-android.yml",
 }
+EXPECTED_UNAVAILABLE = {
+    "linux": (
+        "functional.network-transition=HOSTED_LINUX_INTERFACE_REQUIRED",
+        "functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
+    ),
+    "windows": (
+        "functional.network-transition=HOSTED_WINDOWS_UPLINK_TOGGLE_UNSUPPORTED",
+        "functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
+    ),
+    "macos": (
+        "functional.network-transition=HOSTED_MACOS_UPLINK_TOGGLE_UNSUPPORTED",
+        "functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
+    ),
+    "android": (
+        "functional.network-transition=ANDROID_UPLINK_TOGGLE_UNSUPPORTED",
+        "functional.bounded-endurance=ANDROID_ENDURANCE_SEAM_UNSUPPORTED",
+    ),
+}
+MIN_CANONICAL_TIMEOUT = {
+    "linux": 998,
+    "windows": 998,
+    "macos": 998,
+    "android": 968,
+}
+DECLARED_LANE_SECONDS = {"linux": 938, "windows": 938, "macos": 938, "android": 908}
 
 def _job(text: str, name: str, next_name: str | None = None) -> str:
     start = text.index(f"  {name}:")
@@ -43,6 +71,9 @@ class FunctionalHostedIntegrationPolicyTest(unittest.TestCase):
                 self.assertIn("RUN_DEADLINE_EPOCH - $(date +%s) - 120", client)
                 self.assertIn("torturer_checks.hosted.deadline", client)
                 self.assertIn("--kill-grace-seconds 30", client)
+                self.assertIn(f'-lt {MIN_CANONICAL_TIMEOUT[platform]}', client)
+                self.assertIn('remaining=1200', client)
+                self.assertNotIn('remaining=1260', client)
                 self.assertIn("CONTROLLER_DEADLINE_EPOCH", controller)
                 self.assertIn("CONTROLLER_DEADLINE_EPOCH - $(date +%s) - 120", controller)
                 self.assertIn("api_timeout=30", controller)
@@ -54,6 +85,22 @@ class FunctionalHostedIntegrationPolicyTest(unittest.TestCase):
                 self.assertLess(controller.index("CONTROLLER_DEADLINE_EPOCH"), controller.index("found=false"))
                 self.assertLess(controller.index("found=false"), controller.index("Dispatch exactly one trusted"))
 
+    def test_platform_lane_minima_match_catalog_and_capability_arithmetic(self) -> None:
+        scenarios = scenario_catalog()
+        scenario_by_id = {scenario.id: scenario for scenario in scenarios}
+        for platform, expected_pairs in EXPECTED_UNAVAILABLE.items():
+            unavailable_ids = {pair.split("=", 1)[0] for pair in expected_pairs}
+            applicable_seconds = sum(
+                scenario.max_duration_seconds
+                for scenario_id, scenario in scenario_by_id.items()
+                if scenario_id not in unavailable_ids
+            )
+            declared = applicable_seconds + len(scenarios) * 5
+            with self.subTest(platform=platform):
+                self.assertEqual(declared, DECLARED_LANE_SECONDS[platform])
+                self.assertEqual(MIN_CANONICAL_TIMEOUT[platform], declared + 60)
+                self.assertLessEqual(MIN_CANONICAL_TIMEOUT[platform], 1200)
+
     def test_source_sha_binds_request_lease_and_pre_decrypt_validation(self) -> None:
         for platform, text in self.texts.items():
             with self.subTest(platform=platform):
@@ -62,6 +109,19 @@ class FunctionalHostedIntegrationPolicyTest(unittest.TestCase):
                 self.assertIn("inputs[origin_source_sha]=${SOURCE_SHA}", _job(text, "controller"))
                 self.assertIn("source_sha", text[text.index("request.json"):])
                 self.assertIn("source_sha", text[text.index("openssl cms -decrypt"):])
+
+    def test_each_workflow_declares_exact_reviewed_unavailable_allowlist(self) -> None:
+        for platform, text in self.texts.items():
+            with self.subTest(platform=platform):
+                client = _job(text, "client", "controller")
+                run = client[client.index("- name: Run canonical") :]
+                actual = re.findall(r"--expected-unavailable\s+([^\s\\]+)", run)
+                self.assertCountEqual(actual, EXPECTED_UNAVAILABLE[platform])
+                self.assertEqual(
+                    set(EXPECTED_UNAVAILABLE[platform]),
+                    set("%s=%s" % pair for pair in EXPECTED_UNAVAILABLE_BY_PLATFORM[platform]),
+                )
+                self.assertNotIn("--scenario-id", run)
 
     def test_deadline_arithmetic_keeps_api_grace_inside_finalization_reserve(self) -> None:
         lane_seconds = 30 * 60

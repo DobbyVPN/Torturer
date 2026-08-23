@@ -30,8 +30,9 @@ class FunctionalAndroidWorkflowPolicyTest(unittest.TestCase):
         self.assertRegex(self.text, r"(?m)^    runs-on: ubuntu-24\.04$")
         self.assertRegex(self.text, r"(?m)^    timeout-minutes: 30$")
         self.assertIn("deadline = int(started.timestamp()) + 30 * 60", self.text)
-        self.assertIn('if [ "$remaining" -lt 650 ]', self.text)
-        self.assertIn("six applicable canonical scenarios plus resets", self.text)
+        self.assertIn('if [ "$remaining" -lt 968 ]', self.text)
+        self.assertIn("Eight applicable scenarios plus ten resets", self.text)
+        self.assertIn('if [ "$remaining" -gt 1200 ]', self.text)
         self.assertIn("hosted.deadline", self.text)
         self.assertIn("--kill-grace-seconds 30", self.text)
 

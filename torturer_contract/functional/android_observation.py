@@ -25,6 +25,9 @@ class AndroidProfileObservation:
     tunnel_interface: bool
     routing_identity_changed: bool
     stability_verified: bool
+    network_transition_verified: bool
+    sleep_wake_verified: bool
+    process_loss_verified: bool
     latency_ms: float
     download_mbps: float
     upload_mbps: float
@@ -47,6 +50,7 @@ class AndroidProfileObservation:
         for name in (
             "configured", "connected", "tunnel_interface",
             "routing_identity_changed", "stability_verified", "disconnect_clean",
+            "network_transition_verified", "sleep_wake_verified", "process_loss_verified",
             "restart_verified", "reconnect_bounded", "second_tunnel_interface",
             "second_routing_identity_changed", "final_disconnect_clean",
             "cleanup_verified",
@@ -70,7 +74,8 @@ class AndroidProfileObservation:
         expected = {
             "schema", "kind", "platform", "source_sha", "configured", "connected",
             "tunnel_interface", "routing_identity_changed",
-            "stability_verified", "latency_ms", "download_mbps",
+            "stability_verified", "network_transition_verified", "sleep_wake_verified",
+            "process_loss_verified", "latency_ms", "download_mbps",
             "upload_mbps", "disconnect_clean", "restart_verified", "reconnect_bounded",
             "second_tunnel_interface", "second_routing_identity_changed",
             "final_disconnect_clean", "cleanup_verified",
@@ -92,6 +97,9 @@ class AndroidProfileObservation:
             tunnel_interface=value["tunnel_interface"],
             routing_identity_changed=value["routing_identity_changed"],
             stability_verified=value["stability_verified"],
+            network_transition_verified=value["network_transition_verified"],
+            sleep_wake_verified=value["sleep_wake_verified"],
+            process_loss_verified=value["process_loss_verified"],
             latency_ms=value["latency_ms"],
             download_mbps=value["download_mbps"],
             upload_mbps=value["upload_mbps"],
@@ -125,6 +133,9 @@ class AndroidProfileObservation:
             "tunnel_interface": self.tunnel_interface,
             "routing_identity_changed": self.routing_identity_changed,
             "stability_verified": self.stability_verified,
+            "network_transition_verified": self.network_transition_verified,
+            "sleep_wake_verified": self.sleep_wake_verified,
+            "process_loss_verified": self.process_loss_verified,
             "latency_ms": self.latency_ms,
             "download_mbps": self.download_mbps,
             "upload_mbps": self.upload_mbps,

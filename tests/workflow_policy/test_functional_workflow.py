@@ -40,19 +40,11 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         for option in (
             "--download-url", "--upload-url", "--service-pid",
             "--service-binary", "--service-socket", "--service-library-path",
-            "--service-pid-file", "--network-interface",
+            "--service-pid-file",
         ):
             self.assertIn(option, block)
-        discovery = self.text.index("- name: Discover physical default-route interface for network transition")
-        self.assertLess(discovery, start)
-        discovery_block = self.text[discovery:start]
-        self.assertIn("ip -o route show table main default", discovery_block)
-        self.assertIn('NETWORK_INTERFACE=%s\\n', discovery_block)
-        self.assertIn('ip link show dev "$network_interface"', discovery_block)
-        self.assertIn('timeout --foreground --signal=TERM --kill-after=1s 10s', discovery_block)
-        self.assertNotIn("> /dev/null", discovery_block)
-        self.assertNotIn("2> /dev/null", discovery_block)
-        self.assertIn('--network-interface "$NETWORK_INTERFACE"', block)
+        self.assertNotIn("--network-interface", block)
+        self.assertNotIn("Discover physical default-route interface", self.text)
         self.assertIn('--download-url "https://proof.ovh.net/files/1Mb.dat"', block)
         self.assertNotRegex(block, r'--(?:download|upload)-url\s+"[^"\n]*[?#]')
         self.assertNotIn("speed.cloudflare.com/__down?", block)

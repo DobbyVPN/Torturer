@@ -255,6 +255,13 @@ class LinuxHostedAdapter(HostedCLIAdapter):
             result.add(Capability.PROCESS_LOSS)
         return frozenset(result)
 
+    @property
+    def capability_unavailable_reasons(self) -> dict[Capability, str]:
+        reasons = dict(super().capability_unavailable_reasons)
+        if self.network_interface is None:
+            reasons[Capability.NETWORK_TRANSITION] = "HOSTED_LINUX_INTERFACE_REQUIRED"
+        return reasons
+
     def execute(self, step: ScenarioStep) -> dict[str, object]:
         if step.operation == "network_transition":
             return self._network_transition(float(step.timeout_seconds))

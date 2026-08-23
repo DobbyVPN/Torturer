@@ -1409,6 +1409,16 @@ class HostedCLIAdapter:
             result.add(Capability.ENDURANCE)
         return frozenset(result)
 
+    @property
+    def capability_unavailable_reasons(self) -> dict[Capability, str]:
+        """Explain capabilities that this hosted shell cannot safely provide."""
+
+        return {
+            Capability.NETWORK_TRANSITION: "HOSTED_RUNNER_UPLINK_TOGGLE_UNSUPPORTED",
+            Capability.SLEEP_WAKE: "HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
+            Capability.PROCESS_LOSS: "HOSTED_SERVICE_CONTROL_UNAVAILABLE",
+        }
+
     def execute(self, step: ScenarioStep) -> dict[str, object]:
         operation = step.operation
         timeout = float(step.timeout_seconds)

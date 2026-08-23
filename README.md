@@ -47,11 +47,23 @@ same canonical scenario catalog and assertions, runs every scenario supported
 by its proved capabilities, and reports the remainder explicitly as
 unsupported. Current hosted desktop lanes prove configuration, connection,
 tunnel and routing identity, traffic metrics, disconnect/cleanup, reconnect,
-bounded endurance, and exact product-process recovery. Android proves the
-common connection, traffic, reconnect, disconnect, and cleanup set. Hosted
-network-transition and sleep/wake operations remain unavailable because no
-workflow supplies a safe runner control for them; they are never inferred as
-passes.
+bounded endurance, and exact product-process recovery. Linux network-transition
+is unavailable in the hosted lane because the runner's physical default route
+is also its control path; a separate isolated data interface is required.
+Android does not advertise network-transition because airplane-mode setting
+changes do not prove loss/restoration of a non-VPN uplink/default route on the
+public image. Android does perform a real emulator power sleep/wake boundary
+(ADB sleep/wakeup key events with `dumpsys power` proof) and force-stop
+process-loss control through a token-bound rendezvous.
+Process-loss recovery must then start a fresh candidate-owned session and prove
+its tunnel and routed identity before it can pass. Android endurance remains
+explicitly unavailable until the public instrumentation seam exposes a real
+bounded-endurance operation; no shorter substitute is reported as endurance.
+
+The hosted result records `coverage.status` as
+`supported-subset-with-expected-limitations`, never as complete coverage. Each
+workflow supplies an explicit scenario/reason allowlist, and the run fails
+closed unless the observed unavailable pairs match that allowlist exactly.
 
 Each platform workflow has one total 30-minute deadline measured from the
 workflow run start, including source build, client readiness, lease

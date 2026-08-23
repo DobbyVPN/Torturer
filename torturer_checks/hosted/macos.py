@@ -292,6 +292,12 @@ class MacOSHostedAdapter(HostedCLIAdapter):
             result.add(Capability.PROCESS_LOSS)
         return frozenset(result)
 
+    @property
+    def capability_unavailable_reasons(self) -> dict[Capability, str]:
+        reasons = dict(super().capability_unavailable_reasons)
+        reasons[Capability.NETWORK_TRANSITION] = "HOSTED_MACOS_UPLINK_TOGGLE_UNSUPPORTED"
+        return reasons
+
     def execute(self, step: ScenarioStep) -> dict[str, object]:
         if step.operation == "process_loss":
             return self._process_loss(float(step.timeout_seconds))

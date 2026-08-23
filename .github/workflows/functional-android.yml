@@ -561,9 +561,10 @@ jobs:
         run: |
           set -euo pipefail
           remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 120))
-          # Android's six applicable canonical scenarios plus resets have a 621-second declared maximum.
-          if [ "$remaining" -lt 650 ]; then printf 'insufficient Android canonical budget before cleanup reserve: seconds=%s\n' "$remaining" >&2; exit 1; fi
-          if [ "$remaining" -gt 1260 ]; then remaining=1260; fi
+          # Eight applicable scenarios plus ten resets require 908 seconds;
+          # keep a deliberate 60-second scheduling margin inside the 1,200s cap.
+          if [ "$remaining" -lt 968 ]; then printf 'insufficient Android canonical budget before cleanup reserve: seconds=%s required=968\n' "$remaining" >&2; exit 1; fi
+          if [ "$remaining" -gt 1200 ]; then remaining=1200; fi
           printf 'canonical_lane_timeout_seconds=%s\n' "$remaining"
           python3 -m torturer_checks.hosted.deadline --timeout-seconds "$remaining" --kill-grace-seconds 30 \
             python3 -m torturer_checks.hosted.run --platform android \
@@ -573,7 +574,9 @@ jobs:
             --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" --identity-url "https://api.ipify.org" \
             --latency-url "https://proof.ovh.net/files/1Mb.dat" \
             --download-url "https://proof.ovh.net/files/1Mb.dat" --upload-url "https://speed.cloudflare.com/__up" \
-            --adb "$ADB_PATH"
+            --adb "$ADB_PATH" \
+            --expected-unavailable functional.network-transition=ANDROID_UPLINK_TOGGLE_UNSUPPORTED \
+            --expected-unavailable functional.bounded-endurance=ANDROID_ENDURANCE_SEAM_UNSUPPORTED
 
       - name: Stop Android emulator and verify cleanup
         if: always()

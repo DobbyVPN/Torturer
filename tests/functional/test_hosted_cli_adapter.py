@@ -30,6 +30,9 @@ from torturer_checks.hosted.linux import (
 from torturer_checks.hosted.macos import MacOSHostedAdapter
 from torturer_checks.hosted.windows import WindowsHostedAdapter
 from torturer_checks.hosted.run import (
+    EXPECTED_UNAVAILABLE_BY_PLATFORM,
+    _coverage_contract,
+    _expected_unavailable,
     _partition_applicable,
     _qualification_exit_code,
     _run_scenarios,
@@ -125,6 +128,23 @@ class HostedCLIAdapterTests(unittest.TestCase):
             self.assertEqual(adapter.adapter_id, expected_id)
             result = FunctionalEngine("f" * 64).run(scenario, adapter, _provenance(adapter))
             self.assertEqual(result.outcome, "passed")
+
+    def test_hosted_desktop_unsafe_gaps_have_platform_reason_codes(self) -> None:
+        windows = WindowsHostedAdapter(cli=self.cli, profile=self.profile, runner=FakeRunner())
+        macos = MacOSHostedAdapter(cli=self.cli, profile=self.profile, runner=FakeRunner())
+        linux = LinuxHostedAdapter(cli=self.cli, profile=self.profile, runner=FakeRunner())
+        self.assertEqual(
+            windows.capability_unavailable_reasons[Capability.NETWORK_TRANSITION],
+            "HOSTED_WINDOWS_UPLINK_TOGGLE_UNSUPPORTED",
+        )
+        self.assertEqual(
+            macos.capability_unavailable_reasons[Capability.NETWORK_TRANSITION],
+            "HOSTED_MACOS_UPLINK_TOGGLE_UNSUPPORTED",
+        )
+        self.assertEqual(
+            linux.capability_unavailable_reasons[Capability.NETWORK_TRANSITION],
+            "HOSTED_LINUX_INTERFACE_REQUIRED",
+        )
 
     def test_reconnect_reuses_public_cli_and_leaves_clean_baseline(self) -> None:
         self.assertIn(Capability.RECONNECT, self.adapter.capabilities)
@@ -316,7 +336,11 @@ class HostedCLIAdapterTests(unittest.TestCase):
 
     def test_default_lane_partitions_all_applicable_and_unsupported_scenarios(self) -> None:
         selected = _select_scenarios(None)
-        applicable, unsupported = _partition_applicable(selected, self.adapter.capabilities)
+        applicable, unsupported = _partition_applicable(
+            selected,
+            self.adapter.capabilities,
+            self.adapter.capability_unavailable_reasons,
+        )
         self.assertEqual(
             len(applicable) + len(unsupported),
             len(selected),
@@ -329,11 +353,18 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertIn("functional.sleep-wake", unsupported_ids)
         self.assertIn("functional.network-transition", unsupported_ids)
         self.assertIn("functional.bounded-endurance", unsupported_ids)
-        self.assertTrue(
-            all(item["reason_code"] == "CAPABILITY_UNAVAILABLE" for item in unsupported)
+        self.assertEqual(
+            next(item["reason_code"] for item in unsupported
+                 if item["scenario_id"] == "functional.sleep-wake"),
+            "HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
+        )
+        self.assertEqual(
+            next(item["reason_code"] for item in unsupported
+                 if item["scenario_id"] == "functional.network-transition"),
+            "HOSTED_RUNNER_UPLINK_TOGGLE_UNSUPPORTED",
         )
 
-    def test_unsupported_scenarios_are_unavailable_results_and_fail_gate(self) -> None:
+    def test_expected_unavailable_scenario_is_an_explicit_supported_subset(self) -> None:
         scenario = get_scenario("functional.sleep-wake")
         results, reset_failures, reset_count = _run_scenarios(
             FunctionalEngine("1" * 64), (scenario,), self.adapter, _provenance(self.adapter)
@@ -342,15 +373,70 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertEqual(reset_failures, [])
         self.assertEqual(results[0]["scenario_id"], scenario.id)
         self.assertEqual(results[0]["outcome"], "unavailable")
-        self.assertEqual(results[0]["reason_code"], "CAPABILITY_UNAVAILABLE")
+        self.assertEqual(results[0]["reason_code"], "HOSTED_RUNNER_SUSPEND_UNSUPPORTED")
         self.assertEqual(
             _qualification_exit_code(
-                [{"outcome": "passed"}],
-                [{"scenario_id": scenario.id, "reason_code": "CAPABILITY_UNAVAILABLE"}],
+                [
+                    {"outcome": "passed"},
+                    {"outcome": "unavailable", "scenario_id": scenario.id, "reason_code": "HOSTED_RUNNER_SUSPEND_UNSUPPORTED"},
+                ],
+                [{"scenario_id": scenario.id, "reason_code": "HOSTED_RUNNER_SUSPEND_UNSUPPORTED"}],
                 [],
+                frozenset({(scenario.id, "HOSTED_RUNNER_SUSPEND_UNSUPPORTED")}),
             ),
-            2,
+            0,
         )
+
+    def test_unavailable_allowlist_rejects_new_changed_and_stale_pairs(self) -> None:
+        result = {"scenario_id": "functional.sleep-wake", "outcome": "unavailable", "reason_code": "HOSTED_RUNNER_SUSPEND_UNSUPPORTED"}
+        declared = [{"scenario_id": result["scenario_id"], "reason_code": result["reason_code"]}]
+        for expected in (
+            frozenset(),
+            frozenset({("functional.sleep-wake", "CHANGED_REASON")}),
+            frozenset({("functional.sleep-wake", "HOSTED_RUNNER_SUSPEND_UNSUPPORTED"), ("functional.network-transition", "NEW_GAP")}),
+        ):
+            with self.subTest(expected=expected):
+                self.assertEqual(_qualification_exit_code([result], declared, [], expected), 2)
+
+    def test_coverage_result_is_explicitly_incomplete_and_records_exact_pairs(self) -> None:
+        selected = _select_scenarios(None)
+        unsupported = [{
+            "scenario_id": "functional.sleep-wake",
+            "missing_capabilities": ["sleep_wake"],
+            "reason_code": "HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
+        }, {
+            "scenario_id": "functional.network-transition",
+            "missing_capabilities": ["network_transition"],
+            "reason_code": "HOSTED_LINUX_INTERFACE_REQUIRED",
+        }]
+        results = [
+            {"scenario_id": "functional.sleep-wake", "outcome": "unavailable", "reason_code": "HOSTED_RUNNER_SUSPEND_UNSUPPORTED"},
+            {"scenario_id": "functional.network-transition", "outcome": "unavailable", "reason_code": "HOSTED_LINUX_INTERFACE_REQUIRED"},
+        ]
+        coverage = _coverage_contract(
+            "linux", selected, results, unsupported,
+            EXPECTED_UNAVAILABLE_BY_PLATFORM["linux"],
+        )
+        self.assertEqual(coverage["status"], "supported-subset-with-expected-limitations")
+        self.assertFalse(coverage["complete"])
+        self.assertTrue(coverage["selected_catalog_match"])
+        self.assertEqual(coverage["actual_unavailable"], [
+            {"scenario_id": "functional.network-transition", "reason_code": "HOSTED_LINUX_INTERFACE_REQUIRED"},
+            {"scenario_id": "functional.sleep-wake", "reason_code": "HOSTED_RUNNER_SUSPEND_UNSUPPORTED"},
+        ])
+
+    def test_expected_unavailable_cli_values_are_strict_and_unique(self) -> None:
+        self.assertEqual(
+            _expected_unavailable(["functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED"]),
+            frozenset({("functional.sleep-wake", "HOSTED_RUNNER_SUSPEND_UNSUPPORTED")}),
+        )
+        with self.assertRaises(ValueError):
+            _expected_unavailable(["functional.sleep-wake"])
+        with self.assertRaises(ValueError):
+            _expected_unavailable([
+                "functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
+                "functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
+            ])
 
     def test_hosted_runner_accepts_all_feasible_cli_scenarios_in_one_lane(self) -> None:
         selected = _select_scenarios([
@@ -373,7 +459,7 @@ class HostedCLIAdapterTests(unittest.TestCase):
         engine = FunctionalEngine(scenario_set_digest="c" * 64)
         result = engine.run(scenario, self.adapter, _provenance(self.adapter))
         self.assertEqual(result.outcome, "unavailable")
-        self.assertEqual(result.reason_code, "CAPABILITY_UNAVAILABLE")
+        self.assertEqual(result.reason_code, "HOSTED_RUNNER_SUSPEND_UNSUPPORTED")
 
     def test_throughput_probe_keeps_curl_diagnostics_visible(self) -> None:
         adapter = HostedCLIAdapter(

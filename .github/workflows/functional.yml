@@ -492,46 +492,20 @@ jobs:
             exit 1
           fi
 
-      - name: Discover physical default-route interface for network transition
-        run: |
-          set -euo pipefail
-          umask 077
-          route_log="$HANDOFF_DIR/default-route-interface.raw.log"
-          timeout --foreground --signal=TERM --kill-after=1s 10s \
-            ip -o route show table main default > "$route_log" 2>&1
-          network_interface="$(awk '
-            $1 == "default" {
-              for (i = 1; i < NF; i++) {
-                if ($i == "dev") {
-                  print $(i + 1)
-                  exit
-                }
-              }
-            }
-          ' "$route_log")"
-          case "$network_interface" in
-            ""|lo|tun*|wg*|tap*|utun*)
-              printf '%s\n' 'no usable physical default-route interface was discovered' >&2
-              exit 1
-              ;;
-          esac
-          timeout --foreground --signal=TERM --kill-after=1s 10s \
-            ip link show dev "$network_interface" >> "$route_log" 2>&1
-          printf 'NETWORK_INTERFACE=%s\n' "$network_interface" >> "$GITHUB_ENV"
-          printf 'network_transition_interface_discovered=true\n'
-
       - name: Run canonical Linux functional scenarios
         id: functional
         working-directory: torturer
         run: |
           set -euo pipefail
           remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 120))
-          if [ "$remaining" -lt 950 ]; then
-            printf 'insufficient full-catalog budget before cleanup reserve: seconds=%s\n' "$remaining" >&2
+          # Eight applicable scenarios plus ten resets require 938 seconds;
+          # keep a deliberate 60-second scheduling margin inside the 1,200s cap.
+          if [ "$remaining" -lt 998 ]; then
+            printf 'insufficient Linux canonical budget before cleanup reserve: seconds=%s required=998\n' "$remaining" >&2
             exit 1
           fi
-          if [ "$remaining" -gt 1260 ]; then
-            remaining=1260
+          if [ "$remaining" -gt 1200 ]; then
+            remaining=1200
           fi
           printf 'canonical_lane_timeout_seconds=%s\n' "$remaining"
           PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.deadline \
@@ -554,7 +528,8 @@ jobs:
             --service-socket "$SERVICE_SOCKET" \
             --service-library-path "$GITHUB_WORKSPACE/candidate" \
             --service-pid-file "$SERVICE_PID_FILE" \
-            --network-interface "$NETWORK_INTERFACE"
+            --expected-unavailable functional.network-transition=HOSTED_LINUX_INTERFACE_REQUIRED \
+            --expected-unavailable functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED
 
       - name: Stop candidate service and verify process cleanup
         if: always()

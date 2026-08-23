@@ -167,6 +167,45 @@ opaque run/platform artifact name. Command construction rejects shell-style
 interpolation and file collisions. The handoff helper is a contract boundary,
 not permission to publish a plaintext profile or to expose the Render token.
 
+## Hosted capability coverage contract
+
+Every trusted platform workflow selects and emits all ten canonical scenarios.
+An unavailable scenario is not a pass and is not silently removed. The workflow
+passes only when failed and reset-failure counts are zero and the complete set
+of `(scenario_id, reason_code)` unavailable pairs exactly matches its reviewed
+allowlist:
+
+| Platform | Expected unavailable pair(s) |
+|---|---|
+| Linux | `functional.network-transition=HOSTED_LINUX_INTERFACE_REQUIRED`; `functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED` |
+| Windows | `functional.network-transition=HOSTED_WINDOWS_UPLINK_TOGGLE_UNSUPPORTED`; `functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED` |
+| macOS | `functional.network-transition=HOSTED_MACOS_UPLINK_TOGGLE_UNSUPPORTED`; `functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED` |
+| Android | `functional.network-transition=ANDROID_UPLINK_TOGGLE_UNSUPPORTED`; `functional.bounded-endurance=ANDROID_ENDURANCE_SEAM_UNSUPPORTED` |
+
+A new unavailable pair, a changed reason, or a stale pair after a capability is
+implemented fails closed. The owner-only hosted envelope records
+`coverage.status`, the selected/catalog counts, and declared, expected, and
+observed unavailable pairs. Its status is explicitly
+`supported-subset-with-expected-limitations`; it must never be described as
+complete coverage.
+
+The pre-start budget checks are derived from the current catalog and capability
+sets, not from the count of scenarios that happen to be executed: Linux needs
+938 seconds, Windows/macOS need 938 seconds, and Android needs 908 seconds
+including ten five-second resets. These values include the reviewed
+network-transition gaps. Each workflow adds a deliberate 60-second scheduling
+margin, keeps the inner lane at or below 1,200 seconds, and retains the outer
+120-second evidence/cleanup reserve.
+
+The Android sleep/wake operation is a real emulator power boundary: the adapter
+sends bounded ADB `KEYCODE_SLEEP`/`KEYCODE_WAKEUP` events, proves
+`dumpsys power` transitions to asleep and back to awake, and proves the VPN
+state after restoration. Doze/device-idle alone is not accepted as sleep/wake.
+For Android process loss, the owner-side force-stop is followed by the
+candidate-owned controller starting a new session and observations of the new
+tunnel and routed identity; failure to prove that recovery fails the scenario
+rather than turning it into an expected runner limitation.
+
 ## Android profile-observation seam
 
 When DobbyVPN exposes a candidate-owned Android profile test seam, its only
@@ -183,10 +222,18 @@ public result must be one JSON observation record with this fixed shape:
   "tunnel_interface": true,
   "routing_identity_changed": true,
   "stability_verified": true,
+  "network_transition_verified": true,
+  "sleep_wake_verified": true,
+  "process_loss_verified": true,
   "latency_ms": 12.5,
   "download_mbps": 20.0,
   "upload_mbps": 10.0,
-  "disconnected": true,
+  "disconnect_clean": true,
+  "restart_verified": true,
+  "reconnect_bounded": true,
+  "second_tunnel_interface": true,
+  "second_routing_identity_changed": true,
+  "final_disconnect_clean": true,
   "cleanup_verified": true,
   "error_code": "OPTIONAL_SAFE_CODE"
 }
@@ -345,10 +392,13 @@ job timeout is not the cleanup mechanism.
 Linux, Windows, and macOS start the exact source-built product service and drive
 the public CLI. Their workflows provide the exact service PID, binary, control
 socket or address, PID file, and fixed query-free HTTPS measurement endpoints,
-so process-loss recovery and bounded endurance are real capabilities. The
-optional network-transition seam is not enabled because interrupting the whole
-runner interface would also destroy the job's control path. Sleep/wake is not
-advertised on hosted runners.
+so process-loss recovery and bounded endurance are real capabilities. Linux
+may advertise network-transition only when the workflow supplies an exact
+non-control interface; Windows and macOS report an explicit uplink-toggle
+limitation because interrupting the runner's control interface would destroy
+the job. Sleep/wake is not advertised on hosted runners because suspending the
+runner itself cannot provide the guest-level sleep/wake proof used by the
+private Harness.
 
 Android requires usable `/dev/kvm`, starts an API-35 x86_64 emulator with
 `-no-window` and hardware acceleration, installs the exact staged application
@@ -356,6 +406,16 @@ and instrumentation APKs, and proves readiness before requesting its lease.
 The candidate-owned `AndroidHostedProfileInstrumentationTest` accepts an
 owner-only command file and profile, executes one complete canonical scenario,
 and emits only the fixed safe observation schema. Torturer validates those
-facts and owns the assertions and outcome. Android advertises no process-loss,
-network-transition, sleep/wake, or endurance capability that its driver cannot
-prove.
+facts and owns the assertions and outcome. The hosted Android adapter does not
+advertise network transition: airplane-mode setting changes do not prove loss
+and restoration of a non-VPN uplink/default route, and the public image has no
+reliable isolated root-controlled data interface while ADB remains reachable.
+It uses bounded `KEYCODE_SLEEP`/`KEYCODE_WAKEUP` events with `dumpsys power`
+state proof and VPN restoration for sleep/wake, and `am force-stop` for process
+loss. The candidate-owned instrumentation must report process-loss recovery (a
+new session with tunnel/routing facts) in `process_loss_verified`; Torturer does
+not infer recovery from PID disappearance. Each action is performed outside
+the APK and released through its one-use, token-bound control rendezvous; a
+failure remains a failed scenario. Android does not advertise endurance
+because the current public instrumentation seam has no `measure_endurance`
+operation, and the adapter does not substitute a shorter or unrelated pause.
