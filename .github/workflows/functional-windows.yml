@@ -217,6 +217,80 @@ jobs:
           print(f"lease_run_id={run_id}\nrequest_artifact_name={name}")
           PY
 
+      - name: Start exact Windows preflight candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          # These single-quoted commands are interpreted by PowerShell, not Bash.
+          # The preflight process is stopped and verified before any token-bearing Render step.
+          # shellcheck disable=SC2016
+          mkdir -p "$SERVICE_DIR/ProgramData/DobbyVPN"
+          export PROGRAMDATA="$SERVICE_DIR/ProgramData"
+          printf 'PROGRAMDATA=%s\n' "$PROGRAMDATA" >> "$GITHUB_ENV"
+          service_log="$SERVICE_DIR/preflight-service.raw.log"
+          service_err="$SERVICE_DIR/preflight-service.stderr.raw.log"
+          service_binary="$GITHUB_WORKSPACE/candidate/windows_grpcvpnserver.exe"
+          # shellcheck disable=SC2016
+          service_pid="$(powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; $p=Start-Process -FilePath $args[0] -ArgumentList @("-port","50051") -RedirectStandardOutput $args[1] -RedirectStandardError $args[2] -PassThru; $p.Id' "$service_binary" "$service_log" "$service_err")"
+          case "$service_pid" in ""|*[!0-9]*) printf 'invalid preflight service pid=%s\n' "$service_pid" >&2; exit 1;; esac
+          printf '%s\n' "$service_pid" > "$HANDOFF_DIR/preflight-service.pid"
+          printf 'PREFLIGHT_SERVICE_PID=%s\nPREFLIGHT_SERVICE_PID_FILE=%s\nPREFLIGHT_SERVICE_LOG=%s\n' "$service_pid" "$HANDOFF_DIR/preflight-service.pid" "$service_log" >> "$GITHUB_ENV"
+          ready=false
+          for attempt in $(seq 1 60); do
+            printf 'preflight_service_readiness_attempt=%s\n' "$attempt"
+            remaining=$((RUN_DEADLINE_EPOCH - $(date +%s)))
+            if [ "$remaining" -le 180 ]; then printf 'preflight readiness reached cleanup reserve: remaining=%s\n' "$remaining" >&2; exit 1; fi
+            # shellcheck disable=SC2016
+            if ! powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("preflight_service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid"; then
+              printf 'preflight candidate service exited before readiness\n' >&2; cat "$service_log" "$service_err"; exit 1
+            fi
+            # shellcheck disable=SC2016
+            if powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$c=Test-NetConnection -ComputerName 127.0.0.1 -Port 50051; Write-Output $c; if ($c.TcpTestSucceeded) { exit 0 }; exit 1'; then ready=true; break; fi
+            sleep 1
+          done
+          if [ "$ready" != true ]; then printf 'preflight candidate service did not open loopback control port\n' >&2; cat "$service_log" "$service_err"; exit 1; fi
+          control_token="$PROGRAMDATA/DobbyVPN/control.token"
+          test -s "$control_token"
+          token_value="$(tr -d '\r\n' < "$control_token")"
+          [[ "$token_value" =~ ^[0-9a-fA-F]{64}$ ]]
+          printf 'preflight_control_token_ready=1 path=%s bytes=%s\n' "$control_token" "${#token_value}"
+          "$GITHUB_WORKSPACE/candidate/dobby-cli.exe" status | tee "$SERVICE_DIR/preflight-control-status.raw.log"
+          printf 'preflight_service_ready=true pid=%s service_control_address=%s\n' "$service_pid" "$SERVICE_CONTROL_ADDRESS"
+
+      - name: Stop Windows preflight candidate before Render handoff
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # No candidate process may remain while the Render handoff uses the GitHub credential.
+          service_pid="${PREFLIGHT_SERVICE_PID:-}"
+          if [ -f "${PREFLIGHT_SERVICE_PID_FILE:-}" ]; then service_pid="$(cat "$PREFLIGHT_SERVICE_PID_FILE")"; fi
+          case "$service_pid" in
+            "") printf 'preflight_service_stop_verified=true state=not-started\n'; exit 0;;
+            0|*[!0-9]*) printf 'invalid preflight cleanup pid=%s\n' "$service_pid" >&2; exit 1;;
+          esac
+          running=false
+          # shellcheck disable=SC2016
+          if powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("preflight_service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid"; then
+            running=true
+            taskkill.exe /PID "$service_pid" /T /F
+          fi
+          stopped=false
+          if [ "$running" = true ]; then
+            for attempt in $(seq 1 30); do
+              printf 'preflight_service_stop_attempt=%s\n' "$attempt"
+              # shellcheck disable=SC2016
+              if ! powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("preflight_service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid"; then stopped=true; break; fi
+              sleep 1
+            done
+          else
+            stopped=true
+          fi
+          test "$stopped" = true
+          printf 'preflight_service_stop_verified=true pid=%s\n' "$service_pid"
+          rm -f "$SERVICE_DIR/ProgramData/DobbyVPN/control.token"
+          printf 'preflight_control_state_removed=true\n'
+
       - name: Upload public certificate and opaque request
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
@@ -304,11 +378,12 @@ jobs:
           chmod 600 "$HANDOFF_DIR/profile.toml"
           test -s "$HANDOFF_DIR/profile.toml"
 
-      - name: Start exact Windows service candidate
+      - name: Start exact Windows functional candidate
         shell: bash
         run: |
           set -euo pipefail
           # These single-quoted commands are interpreted by PowerShell, not Bash.
+          # This is the second start: all Render credential-bearing operations have finished.
           # shellcheck disable=SC2016
           mkdir -p "$SERVICE_DIR/ProgramData/DobbyVPN"
           export PROGRAMDATA="$SERVICE_DIR/ProgramData"
@@ -341,7 +416,7 @@ jobs:
           [[ "$token_value" =~ ^[0-9a-fA-F]{64}$ ]]
           printf 'control_token_ready=1 path=%s bytes=%s\n' "$control_token" "${#token_value}"
           "$GITHUB_WORKSPACE/candidate/dobby-cli.exe" status | tee "$SERVICE_DIR/control-status.raw.log"
-          printf 'service_pid=%s service_control_address=%s\n' "$service_pid" "$SERVICE_CONTROL_ADDRESS"
+          printf 'service_ready_for_functional_run=true pid=%s service_control_address=%s\n' "$service_pid" "$SERVICE_CONTROL_ADDRESS"
 
       - name: Run canonical Windows functional scenarios
         id: functional

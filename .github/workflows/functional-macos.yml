@@ -217,6 +217,91 @@ jobs:
           print(f"lease_run_id={run_id}\nrequest_artifact_name={name}")
           PY
 
+      - name: Start exact macOS preflight candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The preflight process is stopped and verified before any token-bearing Render step.
+          mkdir -p "$SERVICE_DIR"
+          control_socket="$SERVICE_DIR/preflight.control.sock"
+          service_log="$SERVICE_DIR/preflight-service.raw.log"
+          service_binary="$GITHUB_WORKSPACE/candidate/macos_grpcvpnserver"
+          peer_uid="$(id -u)"
+          service_pid="$(sudo -n sh -c 'set -eu; env DOBBYVPN_CONTROL_SOCKET="$1" DOBBYVPN_CONTROL_PEER_UID="$2" "$3" > "$4" 2>&1 & printf "%s\n" "$!"' dobbyvpn-preflight-service "$control_socket" "$peer_uid" "$service_binary" "$service_log")"
+          case "$service_pid" in ""|*[!0-9]*) printf 'invalid preflight service pid=%s\n' "$service_pid" >&2; exit 1;; esac
+          printf '%s\n' "$service_pid" > "$HANDOFF_DIR/preflight-service.pid"
+          printf 'PREFLIGHT_SERVICE_PID=%s\nPREFLIGHT_SERVICE_PID_FILE=%s\nPREFLIGHT_SERVICE_CONTROL_SOCKET=%s\nPREFLIGHT_SERVICE_LOG=%s\n' "$service_pid" "$HANDOFF_DIR/preflight-service.pid" "$control_socket" "$service_log" >> "$GITHUB_ENV"
+          ready=false
+          for attempt in $(seq 1 60); do
+            printf 'preflight_service_readiness_attempt=%s\n' "$attempt"
+            remaining=$((RUN_DEADLINE_EPOCH - $(date +%s)))
+            if [ "$remaining" -le 180 ]; then printf 'preflight readiness reached cleanup reserve: remaining=%s\n' "$remaining" >&2; exit 1; fi
+            if ! sudo -n kill -0 "$service_pid"; then
+              printf 'preflight candidate service exited before readiness\n' >&2
+              cat "$service_log"
+              exit 1
+            fi
+            if [ -S "$control_socket" ]; then
+              printf 'preflight_service_control_socket_ready=%s\n' "$control_socket"
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != true ]; then
+            printf 'preflight candidate service did not create its control socket\n' >&2
+            cat "$service_log"
+            exit 1
+          fi
+          socket_mode="$(stat -f '%Lp' "$control_socket")"
+          socket_owner="$(stat -f '%Su' "$control_socket")"
+          printf 'preflight_control_socket_ready=1 path=%s mode=%s owner=%s\n' "$control_socket" "$socket_mode" "$socket_owner"
+          test "$socket_mode" = 600
+          DOBBYVPN_CONTROL_SOCKET="$control_socket" "$GITHUB_WORKSPACE/candidate/dobby-cli" status | tee "$SERVICE_DIR/preflight-control-status.raw.log"
+          printf 'preflight_service_ready=true pid=%s service_control_socket=%s\n' "$service_pid" "$control_socket"
+
+      - name: Stop macOS preflight candidate before Render handoff
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # No candidate process may remain while the Render handoff uses the GitHub credential.
+          service_pid="${PREFLIGHT_SERVICE_PID:-}"
+          if [ -f "${PREFLIGHT_SERVICE_PID_FILE:-}" ]; then service_pid="$(cat "$PREFLIGHT_SERVICE_PID_FILE")"; fi
+          case "$service_pid" in
+            "") printf 'preflight_service_stop_verified=true state=not-started\n'; exit 0;;
+            0|*[!0-9]*) printf 'invalid preflight cleanup pid=%s\n' "$service_pid" >&2; exit 1;;
+          esac
+          running=false
+          if sudo -n kill -0 "$service_pid"; then
+            running=true
+            sudo -n kill -TERM "$service_pid"
+          fi
+          stopped=false
+          if [ "$running" = true ]; then
+            for attempt in $(seq 1 30); do
+              printf 'preflight_service_stop_attempt=%s\n' "$attempt"
+              if ! sudo -n kill -0 "$service_pid"; then stopped=true; break; fi
+              sleep 1
+            done
+            if [ "$stopped" != true ]; then
+              sudo -n kill -KILL "$service_pid"
+              for attempt in $(seq 1 10); do
+                printf 'preflight_service_force_stop_attempt=%s\n' "$attempt"
+                if ! sudo -n kill -0 "$service_pid"; then stopped=true; break; fi
+                sleep 1
+              done
+            fi
+          else
+            stopped=true
+          fi
+          test "$stopped" = true
+          children="$(ps -axo pid=,ppid=,command= | awk -v parent="$service_pid" '$2 == parent {print}')"
+          printf 'preflight_remaining_service_children=%s\n' "$children"
+          test -z "$children"
+          rm -f "$PREFLIGHT_SERVICE_CONTROL_SOCKET"
+          printf 'preflight_service_stop_verified=true pid=%s\n' "$service_pid"
+
       - name: Upload public certificate and opaque request
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
@@ -304,10 +389,11 @@ jobs:
           chmod 600 "$HANDOFF_DIR/profile.toml"
           test -s "$HANDOFF_DIR/profile.toml"
 
-      - name: Start exact macOS service candidate
+      - name: Start exact macOS functional candidate
         shell: bash
         run: |
           set -euo pipefail
+          # This is the second start: all Render credential-bearing operations have finished.
           mkdir -p "$SERVICE_DIR"
           control_socket="$SERVICE_DIR/control.sock"
           service_log="$SERVICE_DIR/service.raw.log"
@@ -344,7 +430,7 @@ jobs:
           printf 'control_socket_ready=1 path=%s mode=%s owner=%s\n' "$control_socket" "$socket_mode" "$socket_owner"
           test "$socket_mode" = 600
           DOBBYVPN_CONTROL_SOCKET="$control_socket" "$GITHUB_WORKSPACE/candidate/dobby-cli" status | tee "$SERVICE_DIR/control-status.raw.log"
-          printf 'service_pid=%s service_control_socket=%s\n' "$service_pid" "$control_socket"
+          printf 'service_ready_for_functional_run=true pid=%s service_control_socket=%s\n' "$service_pid" "$control_socket"
 
       - name: Run canonical macOS functional scenarios
         id: functional
