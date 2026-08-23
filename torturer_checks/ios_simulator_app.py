@@ -10,12 +10,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import re
+import secrets
+import signal
 import subprocess
 import sys
 import time
 from typing import Protocol, Sequence
+
+from torturer_checks.public_output import emit_evidence
 
 from torturer_checks.ios_simulator import (
     IOSSimulatorContractError,
@@ -48,6 +53,10 @@ _SUPPORTED_ARCHITECTURES = frozenset(("arm64", "amd64"))
 _XCODE_ARCHITECTURES = {"arm64": "arm64", "amd64": "x86_64"}
 _TERMINATE_NOT_RUNNING_EXIT_CODE = 3
 _TERMINATE_RETRY_DELAY_SECONDS = 1.0
+MAX_RUN_SECONDS = 30 * 60
+CLEANUP_RESERVE_SECONDS = 120
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
+COMMAND_TERMINATION_GRACE_SECONDS = 15
 _TEST_IDENTIFIER = (
     "IOSSimulatorAppContractTests/IOSSimulatorAppContractTests/"
     "testAppLaunchesWithoutCredentials"
@@ -58,39 +67,292 @@ class IOSSimulatorAppContractError(RuntimeError):
     """The fixed public app contract could not be executed or verified."""
 
 
+class RunBudget:
+    """Track one iOS lane's hard deadline and reserved cleanup window."""
+
+    def __init__(
+        self,
+        *,
+        max_seconds: float = MAX_RUN_SECONDS,
+        cleanup_reserve_seconds: float = CLEANUP_RESERVE_SECONDS,
+        clock=time.monotonic,
+    ) -> None:
+        if max_seconds <= 0 or cleanup_reserve_seconds < 0 or cleanup_reserve_seconds >= max_seconds:
+            raise ValueError("cleanup reserve must be non-negative and smaller than the run deadline")
+        self.max_seconds = float(max_seconds)
+        self.cleanup_reserve_seconds = float(cleanup_reserve_seconds)
+        self.clock = clock
+        self.started_at = clock()
+
+    @property
+    def deadline(self) -> float:
+        return self.started_at + self.max_seconds
+
+    def operation_timeout(self, requested: float | None = None) -> float:
+        remaining = self.deadline - self.clock() - self.cleanup_reserve_seconds
+        if remaining <= 0:
+            raise IOSSimulatorAppContractError("iOS lane exhausted its functional budget before cleanup reserve")
+        if requested is None:
+            return remaining
+        if requested <= 0:
+            raise IOSSimulatorAppContractError("iOS command timeout must be positive")
+        return min(float(requested), remaining)
+
+    def cleanup_timeout(self) -> float:
+        return max(0.0, min(self.cleanup_reserve_seconds, self.deadline - self.clock()))
+
+    def assert_within_deadline(self) -> None:
+        if self.clock() > self.deadline:
+            raise IOSSimulatorAppContractError("iOS lane exceeded its strict 1800-second deadline")
+
+
 @dataclass(frozen=True)
 class CommandResult:
     """The only command result the orchestrator needs from a host runner."""
 
     returncode: int
     stdout: str = ""
+    raw_log: Path | None = None
 
 
 class CommandRunner(Protocol):
     """Injectable, argument-vector-only host command executor."""
 
-    def run(self, command: Sequence[str], *, cwd: Path | None = None) -> CommandResult:
+    def run(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        timeout_seconds: float | None = None,
+    ) -> CommandResult:
         """Run one host command without a shell."""
+
+
+def _process_group_alive(process: subprocess.Popen[bytes]) -> bool:
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _proc_descendants(root_pid: int) -> set[int]:
+    """Return recursive descendants using /proc or bounded macOS ``ps``."""
+
+    parent_by_pid: dict[int, int] = {}
+    proc_root = Path("/proc")
+    if proc_root.is_dir():
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat_line = (entry / "stat").read_text(encoding="ascii")
+                close = stat_line.rfind(")")
+                fields = stat_line[close + 2 :].split()
+                parent_by_pid[int(entry.name)] = int(fields[1])
+            except (OSError, ValueError, IndexError):
+                continue
+    else:
+        try:
+            listing = subprocess.run(
+                ["ps", "-axo", "pid=,ppid="],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=2,
+            ).stdout.decode("ascii", errors="ignore")
+        except (OSError, subprocess.TimeoutExpired):
+            raise IOSSimulatorAppContractError("could not inspect the iOS process tree")
+        for line in listing.splitlines():
+            fields = line.split()
+            if len(fields) == 2:
+                try:
+                    parent_by_pid[int(fields[0])] = int(fields[1])
+                except ValueError:
+                    continue
+    descendants: set[int] = set()
+    frontier = [root_pid]
+    while frontier:
+        parent = frontier.pop()
+        for child, child_parent in parent_by_pid.items():
+            if child_parent == parent and child not in descendants:
+                descendants.add(child)
+                frontier.append(child)
+    return descendants
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    if Path(f"/proc/{pid}/stat").is_file():
+        try:
+            stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+            close = stat_line.rfind(")")
+            return stat_line[close + 2 :].split()[0] != "Z"
+        except (OSError, ValueError, IndexError):
+            return True
+    return True
+
+
+def _wait_for_process_tree(
+    process: subprocess.Popen[bytes], tracked: set[int], timeout_seconds: float
+) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        tracked.update(_proc_descendants(process.pid))
+        if (
+            process.poll() is not None
+            and not _process_group_alive(process)
+            and not any(_pid_alive(pid) for pid in tracked if pid != process.pid)
+        ):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            process.wait(timeout=min(0.05, remaining))
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen[bytes],
+    *,
+    tracked: set[int] | None = None,
+    grace_seconds: float,
+    description: str,
+) -> set[int]:
+    tracked = tracked if tracked is not None else set()
+    tracked.update({process.pid} | _proc_descendants(process.pid))
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    for pid in tracked:
+        if pid != process.pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    if _wait_for_process_tree(process, tracked, grace_seconds):
+        return tracked
+    print(f"[ios-simulator-process] {description} graceful-stop-expired", file=sys.stderr)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    tracked.update(_proc_descendants(process.pid))
+    for pid in tracked:
+        if pid != process.pid:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    if not _wait_for_process_tree(process, tracked, max(1.0, grace_seconds)):
+        raise IOSSimulatorAppContractError(f"{description} process tree survived forced termination")
+    return tracked
 
 
 class SubprocessCommandRunner:
     """Production executor for H4's ephemeral GitHub-hosted macOS job."""
 
-    def run(self, command: Sequence[str], *, cwd: Path | None = None) -> CommandResult:
-        completed = subprocess.run(
+    def __init__(self, raw_directory: Path | None = None) -> None:
+        configured = raw_directory or Path(
+            os.environ.get("TORTURER_IOS_RAW_LOG_DIR", ".torturer-ios-command-raw")
+        )
+        self.raw_directory = Path(configured)
+        self.raw_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(self.raw_directory, 0o700)
+        self._sequence = 0
+
+    def run(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        timeout_seconds: float | None = None,
+    ) -> CommandResult:
+        timeout = timeout_seconds if timeout_seconds is not None else DEFAULT_COMMAND_TIMEOUT_SECONDS
+        if timeout <= 0:
+            raise IOSSimulatorAppContractError("iOS command timeout must be positive")
+        process = subprocess.Popen(
             list(command),
             cwd=cwd,
-            check=False,
-            text=True,
+            stdin=None,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
-        print(f"[ios-simulator-command] returncode={completed.returncode} output-begin")
-        if completed.stdout:
-            sys.stdout.write(completed.stdout)
-            sys.stdout.flush()
-        print("[ios-simulator-command] output-end")
-        return CommandResult(returncode=completed.returncode, stdout=completed.stdout)
+        tracked = {process.pid}
+        try:
+            raw_output, _ = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            raw_output = error.output or b""
+            print(
+                f"[ios-simulator-command] timeout after {timeout:g}s; terminating process tree",
+                file=sys.stderr,
+            )
+            termination_error: IOSSimulatorAppContractError | None = None
+            try:
+                tracked = _terminate_process_tree(
+                    process,
+                    tracked=tracked,
+                    grace_seconds=min(COMMAND_TERMINATION_GRACE_SECONDS, max(1.0, timeout)),
+                    description="command",
+                )
+            except IOSSimulatorAppContractError as cleanup_error:
+                termination_error = cleanup_error
+            try:
+                recovered, _ = process.communicate(timeout=max(1.0, COMMAND_TERMINATION_GRACE_SECONDS))
+                raw_output += recovered or b""
+            except subprocess.TimeoutExpired as drain_error:
+                raw_output += drain_error.output or b""
+                termination_error = termination_error or IOSSimulatorAppContractError(
+                    "iOS command process tree and diagnostic pipe survived final cleanup"
+                )
+            try:
+                if not _wait_for_process_tree(process, tracked, 0.0):
+                    termination_error = termination_error or IOSSimulatorAppContractError(
+                        "iOS command process tree remained after final diagnostic drain"
+                    )
+            except IOSSimulatorAppContractError as cleanup_error:
+                termination_error = termination_error or cleanup_error
+            self._sequence += 1
+            raw_path = self.raw_directory / f"command-{secrets.token_hex(16)}.raw.log"
+            with raw_path.open("xb") as raw_handle:
+                raw_handle.write(raw_output)
+                raw_handle.flush()
+                os.fsync(raw_handle.fileno())
+            os.chmod(raw_path, 0o600)
+            detail = f"; cleanup={termination_error}" if termination_error is not None else ""
+            emit_evidence("ios-command", status="timed-out", payloads={"combined": raw_output})
+            raise IOSSimulatorAppContractError(
+                f"iOS command timed out after {timeout:g}s{detail}; complete diagnostics retained privately"
+            )
+        raw_output = raw_output or b""
+        self._sequence += 1
+        raw_path = self.raw_directory / f"command-{secrets.token_hex(16)}.raw.log"
+        with raw_path.open("xb") as raw_handle:
+            raw_handle.write(raw_output)
+            raw_handle.flush()
+            os.fsync(raw_handle.fileno())
+        os.chmod(raw_path, 0o600)
+        emit_evidence(
+            "ios-command",
+            status=("failed" if process.returncode else "completed"),
+            payloads={"combined": raw_output},
+        )
+        return CommandResult(
+            returncode=process.returncode if process.returncode is not None else -1,
+            stdout=raw_output.decode("utf-8", errors="replace"),
+            raw_log=raw_path,
+        )
 
 
 @dataclass(frozen=True)
@@ -230,87 +492,199 @@ def run_ios_simulator_app_contract(
     runner: CommandRunner,
     with_xctest: bool = False,
     contract: IOSSimulatorAppContract = PUBLIC_IOS_SIMULATOR_APP_CONTRACT,
+    budget: RunBudget | None = None,
 ) -> IOSSimulatorAppEvidence:
     """Build, inspect, install, launch and terminate the fixed Simulator app.
 
     ``with_xctest`` remains opt-in until DobbyVPN exposes the named app test
     target.  Its result is independently inspected and summarized when used.
     """
+    budget = budget or RunBudget()
     try:
         source = source_identity_from_simulator_checkout(
             candidate_root, repository=repository, expected_commit=commit_sha
         )
     except IOSSimulatorContractError as error:
         raise IOSSimulatorAppContractError(str(error)) from error
-    work_dir.mkdir(parents=True, exist_ok=True)
-    inventory = _require_success(runner, ["xcrun", "simctl", "list", "devices", "available", "-j"], "list Simulators")
-    simulator = select_available_iphone(inventory.stdout)
-    boot = runner.run(simctl_boot_command(simulator.udid))
-    if boot.returncode and "current state: Booted" not in boot.stdout:
-        raise IOSSimulatorAppContractError("boot Simulator failed")
-    _require_success(runner, simctl_bootstatus_command(simulator.udid), "wait for Simulator boot")
-    _require_success(
-        runner,
-        xcodebuild_app_command(
-            contract, candidate_root=candidate_root, device_udid=simulator.udid, work_dir=work_dir
-        ),
-        "build unsigned Simulator app",
-    )
-    try:
-        app = inspect_simulator_app(
-            contract.app_path(work_dir), source=source,
-            expected_bundle_identifier=contract.bundle_identifier,
-            architecture=contract.architecture,
-        )
-    except IOSSimulatorContractError as error:
-        raise IOSSimulatorAppContractError(str(error)) from error
-    _require_success(runner, simctl_install_command(simulator.udid, app.app_path), "install Simulator app")
-    _require_success(runner, simctl_launch_command(simulator.udid, contract.bundle_identifier), "launch Simulator app")
-    _terminate_simulator_app(runner, simulator.udid, contract.bundle_identifier)
 
-    xcresult: XCResultInspection | None = None
-    if with_xctest:
-        result_path = work_dir / "app-tests.xcresult"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    simulator: AvailableSimulator | None = None
+    app_launched = False
+    termination_attempted = False
+    failure: IOSSimulatorAppContractError | None = None
+    evidence: IOSSimulatorAppEvidence | None = None
+    try:
+        inventory = _require_success(
+            runner,
+            ["xcrun", "simctl", "list", "devices", "available", "-j"],
+            "list Simulators",
+            budget=budget,
+        )
+        simulator = select_available_iphone(inventory.stdout)
+        boot = runner.run(
+            simctl_boot_command(simulator.udid),
+            timeout_seconds=budget.operation_timeout(60),
+        )
+        if boot.returncode and "current state: Booted" not in boot.stdout:
+            raise IOSSimulatorAppContractError(
+                "boot Simulator failed; complete diagnostics retained privately"
+            )
         _require_success(
             runner,
-            xcodebuild_test_command(
-                contract.test_contract(candidate_root), device_udid=simulator.udid,
-                result_bundle=result_path,
+            simctl_bootstatus_command(simulator.udid),
+            "wait for Simulator boot",
+            budget=budget,
+        )
+        _require_success(
+            runner,
+            xcodebuild_app_command(
+                contract, candidate_root=candidate_root, device_udid=simulator.udid, work_dir=work_dir
             ),
-            "run named Simulator XCTest",
+            "build unsigned Simulator app",
+            budget=budget,
         )
         try:
-            xcresult = inspect_xcresult_bundle(
-                result_path, source=source, required_test_identifier=contract.test_identifier
+            app = inspect_simulator_app(
+                contract.app_path(work_dir), source=source,
+                expected_bundle_identifier=contract.bundle_identifier,
+                architecture=contract.architecture,
             )
         except IOSSimulatorContractError as error:
             raise IOSSimulatorAppContractError(str(error)) from error
-        summary = _require_success(runner, xcresult_summary_command(result_path), "read XCTest summary")
-        try:
-            validate_xcresult_summary(summary.stdout)
-        except IOSSimulatorContractError as error:
-            raise IOSSimulatorAppContractError(str(error)) from error
-    return IOSSimulatorAppEvidence(simulator=simulator, app=app, xcresult=xcresult)
+        _require_success(
+            runner,
+            simctl_install_command(simulator.udid, app.app_path),
+            "install Simulator app",
+            budget=budget,
+        )
+        _require_success(
+            runner,
+            simctl_launch_command(simulator.udid, contract.bundle_identifier),
+            "launch Simulator app",
+            budget=budget,
+        )
+        app_launched = True
+        _terminate_simulator_app(
+            runner,
+            simulator.udid,
+            contract.bundle_identifier,
+            budget=budget,
+        )
+        termination_attempted = True
+        app_launched = False
+
+        xcresult: XCResultInspection | None = None
+        if with_xctest:
+            result_path = work_dir / "app-tests.xcresult"
+            _require_success(
+                runner,
+                xcodebuild_test_command(
+                    contract.test_contract(candidate_root), device_udid=simulator.udid,
+                    result_bundle=result_path,
+                ),
+                "run named Simulator XCTest",
+                budget=budget,
+            )
+            try:
+                xcresult = inspect_xcresult_bundle(
+                    result_path, source=source, required_test_identifier=contract.test_identifier
+                )
+            except IOSSimulatorContractError as error:
+                raise IOSSimulatorAppContractError(str(error)) from error
+            summary = _require_success(
+                runner,
+                xcresult_summary_command(result_path),
+                "read XCTest summary",
+                budget=budget,
+            )
+            try:
+                validate_xcresult_summary(summary.stdout)
+            except IOSSimulatorContractError as error:
+                raise IOSSimulatorAppContractError(str(error)) from error
+        evidence = IOSSimulatorAppEvidence(simulator=simulator, app=app, xcresult=xcresult)
+    except IOSSimulatorAppContractError as error:
+        failure = error
+    except Exception as error:
+        failure = IOSSimulatorAppContractError(f"iOS Simulator command failed: {error}")
+    finally:
+        if simulator is not None and app_launched and not termination_attempted:
+            try:
+                _terminate_simulator_app(
+                    runner,
+                    simulator.udid,
+                    contract.bundle_identifier,
+                    budget=budget,
+                )
+            except IOSSimulatorAppContractError as cleanup_error:
+                failure = cleanup_error if failure is None else IOSSimulatorAppContractError(
+                    f"{failure}; app cleanup failed: {cleanup_error}"
+                )
+            except Exception as cleanup_error:
+                cleanup_failure = IOSSimulatorAppContractError(f"app cleanup failed: {cleanup_error}")
+                failure = cleanup_failure if failure is None else IOSSimulatorAppContractError(
+                    f"{failure}; {cleanup_failure}"
+                )
+        if simulator is not None:
+            try:
+                shutdown = runner.run(
+                    ["xcrun", "simctl", "shutdown", simulator.udid],
+                    timeout_seconds=budget.cleanup_timeout(),
+                )
+                if shutdown.returncode:
+                    cleanup_error = IOSSimulatorAppContractError(
+                        f"Simulator shutdown failed with exit code {shutdown.returncode}"
+                    )
+                    failure = cleanup_error if failure is None else IOSSimulatorAppContractError(
+                        f"{failure}; {cleanup_error}"
+                    )
+            except Exception as cleanup_error:
+                failure = IOSSimulatorAppContractError(
+                    f"{failure}; Simulator shutdown failed: {cleanup_error}"
+                ) if failure is not None else IOSSimulatorAppContractError(
+                    f"Simulator shutdown failed: {cleanup_error}"
+                )
+    if failure is not None:
+        raise failure
+    if evidence is None:
+        raise IOSSimulatorAppContractError("iOS Simulator contract produced no evidence")
+    budget.assert_within_deadline()
+    return evidence
 
 
-def _require_success(runner: CommandRunner, command: Sequence[str], stage: str) -> CommandResult:
-    result = runner.run(command)
+def _require_success(
+    runner: CommandRunner,
+    command: Sequence[str],
+    stage: str,
+    *,
+    budget: RunBudget | None = None,
+) -> CommandResult:
+    timeout = budget.operation_timeout(DEFAULT_COMMAND_TIMEOUT_SECONDS) if budget else DEFAULT_COMMAND_TIMEOUT_SECONDS
+    result = runner.run(command, timeout_seconds=timeout)
     if result.returncode:
-        # Do not echo candidate-controlled build/test output in public diagnostics.
-        raise IOSSimulatorAppContractError(f"{stage} failed with exit code {result.returncode}")
+        raise IOSSimulatorAppContractError(
+            f"{stage} failed with exit code {result.returncode}; complete diagnostics retained privately"
+        )
     return result
 
 
-def _terminate_simulator_app(runner: CommandRunner, device_udid: str, bundle_identifier: str) -> CommandResult:
+def _terminate_simulator_app(
+    runner: CommandRunner,
+    device_udid: str,
+    bundle_identifier: str,
+    *,
+    budget: RunBudget | None = None,
+) -> CommandResult:
     """Terminate a just-launched app, retrying one transient not-running result."""
     command = simctl_terminate_command(device_udid, bundle_identifier)
-    result = runner.run(command)
+    timeout = budget.operation_timeout(60) if budget else 60
+    result = runner.run(command, timeout_seconds=timeout)
     if result.returncode == _TERMINATE_NOT_RUNNING_EXIT_CODE:
         time.sleep(_TERMINATE_RETRY_DELAY_SECONDS)
-        result = runner.run(command)
+        retry_timeout = budget.operation_timeout(60) if budget else 60
+        result = runner.run(command, timeout_seconds=retry_timeout)
     if result.returncode:
-        # Do not echo candidate-controlled app output in public diagnostics.
-        raise IOSSimulatorAppContractError(
-            f"terminate Simulator app failed with exit code {result.returncode}"
-        )
+            raise IOSSimulatorAppContractError(
+                "terminate Simulator app failed with exit code "
+                f"{result.returncode}; complete diagnostics retained privately"
+            )
     return result

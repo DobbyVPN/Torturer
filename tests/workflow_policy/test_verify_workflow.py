@@ -109,7 +109,7 @@ class VerifyWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("submodules: recursive", candidate_checkout.group())
 
     def test_functional_platform_lanes_have_the_documented_30_minute_bound(self) -> None:
-        for job in ("ios_simulator", "android"):
+        for job in ("linux", "windows", "macos_arm64", "macos_intel", "ios_simulator", "android"):
             section = re.search(
                 rf"(?ms)^  {job}:\n.*?(?=^  [a-zA-Z0-9_]+:|\Z)",
                 self.text,
@@ -150,13 +150,53 @@ class VerifyWorkflowPolicyTest(unittest.TestCase):
             "golang.org/x/mobile/cmd/gomobile@v0.0.0-20260520154334-0e4426e1883d",
             self.text,
         )
+        self.assertIn(
+            "golang.org/x/mobile/cmd/gobind@v0.0.0-20260520154334-0e4426e1883d",
+            self.text,
+        )
+        self.assertIn("go mod download", self.text)
+        self.assertIn("go mod tidy", self.text)
+        self.assertIn("go version -m", self.text)
+        self.assertIn('grep -F "$mobile_version"', self.text)
+        self.assertNotIn("gomobile init", self.text)
         self.assertIn("/dev/kvm", self.text)
+        self.assertIn("TORTURER_ANDROID_RAW_LOG_DIR:", self.text)
         self.assertIn('"ndk;27.2.12479018"', self.text)
         self.assertIn('"build-tools;36.0.0"', self.text)
         self.assertRegex(
             self.text,
             r"actions/setup-go@[0-9a-f]{40}\n        with:\n"
             r"          go-version: .+\n          cache: false",
+        )
+
+    def test_ios_bootstrap_is_pinned_and_raw_diagnostics_are_retained_privately(self) -> None:
+        self.assertIn("TORTURER_IOS_RAW_LOG_DIR:", self.text)
+        self.assertIn(
+            "go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260520154334-0e4426e1883d",
+            self.text,
+        )
+        self.assertIn(
+            "go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260520154334-0e4426e1883d",
+            self.text,
+        )
+        self.assertIn("go version -m", self.text)
+        self.assertIn('export PATH="$tool_dir:$PATH"', self.text)
+        self.assertIn("build_ios_xcframework.sh", self.text)
+        self.assertGreaterEqual(
+            self.text.count('git -C "$CANDIDATE_DIR" diff --quiet --no-ext-diff --'),
+            2,
+        )
+        self.assertIn("candidate source mutated during pinned mobile preparation", self.text)
+        self.assertNotIn("gomobile init", self.text)
+
+    def test_mobile_bootstrap_mutation_probe_fails_closed_and_retains_full_diff(self) -> None:
+        mutation_probe = 'if ! git -C "$CANDIDATE_DIR" diff --quiet --no-ext-diff --; then'
+        full_diff = 'git -C "$CANDIDATE_DIR" diff --no-ext-diff -- >&2'
+        self.assertEqual(self.text.count(mutation_probe), 2)
+        self.assertEqual(self.text.count(full_diff), 2)
+        self.assertNotIn(
+            'if ! git -C "$CANDIDATE_DIR" diff --no-ext-diff --; then',
+            self.text,
         )
 
 

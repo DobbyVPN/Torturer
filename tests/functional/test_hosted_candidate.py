@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 
-from torturer_checks.hosted.candidate import CandidateClosureError, stage, verify
+import torturer_checks.hosted.candidate as candidate
+from torturer_checks.hosted.candidate import CandidateClosureError, closure_sha256, stage, verify
 
 
 SHA = "a" * 40
@@ -94,6 +98,36 @@ class HostedCandidateClosureTests(unittest.TestCase):
             with self.assertRaisesRegex(CandidateClosureError, "member allow-list mismatch"):
                 verify(stage_root, platform="macos", architecture="arm64", source_sha=SHA)
 
+    def test_closure_digest_is_order_independent_and_member_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            output = root / "output"
+            self._source(source, "macos")
+            manifest = stage(source, output, platform="macos", architecture="arm64", source_sha=SHA)
+            verified = verify(output, platform="macos", architecture="arm64", source_sha=SHA)
+            first = closure_sha256(verified)
+
+            reordered = dict(verified)
+            reordered["files"] = dict(reversed(list(verified["files"].items())))
+            manifest_path = output / "manifest.json"
+            manifest_path.write_text(json.dumps(reordered), encoding="utf-8")
+            second_verified = verify(output, platform="macos", architecture="arm64", source_sha=SHA)
+            self.assertEqual(first, closure_sha256(second_verified))
+            self.assertNotEqual(
+                first,
+                hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+                "the closure identity must not be the raw manifest-file digest",
+            )
+
+            tampered = dict(second_verified)
+            tampered["files"] = dict(second_verified["files"])
+            tampered["files"]["dobby-cli"] = dict(tampered["files"]["dobby-cli"])
+            tampered["files"]["dobby-cli"]["size"] += 1
+            manifest_path.write_text(json.dumps(tampered), encoding="utf-8")
+            with self.assertRaisesRegex(CandidateClosureError, "digest or size mismatch"):
+                verify(output, platform="macos", architecture="arm64", source_sha=SHA)
+
     def test_symlink_and_stale_identity_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -175,6 +209,93 @@ class HostedCandidateClosureTests(unittest.TestCase):
             manifest["files"]["dobby-cli"]["size"] = True
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             with self.assertRaisesRegex(CandidateClosureError, "size is invalid"):
+                verify(output, platform="macos", architecture="arm64", source_sha=SHA)
+
+    def _mutating_iterator_patch(self, target: Path, *, replacement: bool):
+        original_open = candidate._open_pinned
+        original_iter = candidate._iter_descriptor_bytes
+        target_descriptors: set[int] = set()
+        changed = threading.Event()
+
+        def open_pinned(path: Path, description: str):
+            descriptor, details = original_open(path, description)
+            if path == target:
+                target_descriptors.add(descriptor)
+            return descriptor, details
+
+        def iterator(descriptor: int):
+            for chunk in original_iter(descriptor):
+                if descriptor in target_descriptors and not changed.is_set():
+                    changed.set()
+                    mutation_started = threading.Event()
+
+                    def mutate() -> None:
+                        mutation_started.wait()
+                        if replacement:
+                            target.unlink()
+                        target.write_bytes(b"replacement-by-concurrent-writer")
+                        target.chmod(0o700)
+
+                    worker = threading.Thread(target=mutate, name="candidate-mutator")
+                    worker.start()
+                    mutation_started.set()
+                    worker.join()
+                yield chunk
+
+        return patch.object(candidate, "_open_pinned", side_effect=open_pinned), patch.object(
+            candidate, "_iter_descriptor_bytes", side_effect=iterator
+        )
+
+    def test_stage_rejects_concurrent_source_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            self._source(source, "macos")
+            target = source / "kmp_module/services/macos_grpcvpnserver"
+            open_patch, iterator_patch = self._mutating_iterator_patch(target, replacement=True)
+            with open_patch, iterator_patch, self.assertRaisesRegex(
+                CandidateClosureError, "(?:changed|replaced) while being read or copied"
+            ):
+                stage(source, root / "output", platform="macos", architecture="arm64", source_sha=SHA)
+
+    def test_stage_rejects_in_place_source_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            self._source(source, "macos")
+            target = source / "kmp_module/services/macos_grpcvpnserver"
+            open_patch, iterator_patch = self._mutating_iterator_patch(target, replacement=False)
+            with open_patch, iterator_patch, self.assertRaisesRegex(
+                CandidateClosureError, "changed while being read or copied"
+            ):
+                stage(source, root / "output", platform="macos", architecture="arm64", source_sha=SHA)
+
+    def test_verify_rejects_concurrent_artifact_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            output = root / "output"
+            self._source(source, "macos")
+            stage(source, output, platform="macos", architecture="arm64", source_sha=SHA)
+            target = output / "macos_grpcvpnserver"
+            open_patch, iterator_patch = self._mutating_iterator_patch(target, replacement=True)
+            with open_patch, iterator_patch, self.assertRaisesRegex(
+                CandidateClosureError, "(?:changed|replaced) while being read or copied"
+            ):
+                verify(output, platform="macos", architecture="arm64", source_sha=SHA)
+
+    def test_verify_rejects_in_place_artifact_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            output = root / "output"
+            self._source(source, "macos")
+            stage(source, output, platform="macos", architecture="arm64", source_sha=SHA)
+            target = output / "macos_grpcvpnserver"
+            open_patch, iterator_patch = self._mutating_iterator_patch(target, replacement=False)
+            with open_patch, iterator_patch, self.assertRaisesRegex(
+                CandidateClosureError, "changed while being read or copied"
+            ):
                 verify(output, platform="macos", architecture="arm64", source_sha=SHA)
 
 

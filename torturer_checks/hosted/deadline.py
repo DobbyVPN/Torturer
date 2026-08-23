@@ -1,20 +1,24 @@
 """Run one hosted command with a cross-platform hard deadline.
 
-The child inherits the caller's stdin, stdout, and stderr.  This wrapper never
-captures, filters, truncates, or discards diagnostics.
+The child streams are captured and retained in an owner-only runner-local
+evidence directory.  Public Actions receives only an opaque evidence id, byte
+count, digest, and stable status; raw diagnostics are never echoed.
 """
 from __future__ import annotations
 
 import argparse
 import os
-import signal
-import subprocess
+from pathlib import Path
 import sys
+import tempfile
 import time
+
+from .cli import HostedAdapterError, SubprocessRunner, _ensure_owner_only_directory
 
 
 _MAX_TIMEOUT_SECONDS = 30 * 60
 _MAX_GRACE_SECONDS = 60
+_MIN_CLEANUP_SECONDS = 0.01
 
 
 class DeadlineError(ValueError):
@@ -27,86 +31,56 @@ def _bounded(value: int, *, name: str, maximum: int) -> int:
     return value
 
 
-def _group_alive(process: subprocess.Popen[bytes]) -> bool:
-    """Return whether the POSIX process group still has a member."""
-    if os.name == "nt":
-        return process.poll() is None
-    try:
-        os.killpg(process.pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # We cannot prove that a group we cannot inspect has gone away.
-        return True
-    return True
+def _remaining_until(deadline: float, *, cap: float | None = None) -> float:
+    remaining = max(0.0, deadline - time.monotonic())
+    return remaining if cap is None else min(remaining, max(0.0, cap))
 
 
-def _wait_for_group(process: subprocess.Popen[bytes], timeout: float) -> bool:
-    """Wait until the leader and, on POSIX, its whole process group exit."""
-    deadline = time.monotonic() + timeout
-    while True:
-        leader_gone = process.poll() is not None
-        if leader_gone and not _group_alive(process):
-            return True
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        time.sleep(min(0.05, remaining))
-
-
-def _terminate(process: subprocess.Popen[bytes], grace_seconds: int) -> None:
-    if os.name == "nt":
-        if process.poll() is None:
-            try:
-                process.send_signal(signal.CTRL_BREAK_EVENT)
-            except (OSError, ValueError) as error:
-                print(f"hosted-deadline graceful-stop-error={type(error).__name__}", file=sys.stderr)
-        graceful = False
-        try:
-            graceful = _wait_for_group(process, grace_seconds)
-        except (OSError, ValueError) as error:
-            print(
-                f"hosted-deadline graceful-stop-wait-error={type(error).__name__}",
-                file=sys.stderr,
-            )
-        if not graceful:
-            print("hosted-deadline graceful-stop-expired", file=sys.stderr)
-        # The leader may have exited while descendants remain. Always ask
-        # taskkill for recursive tree cleanup; its complete diagnostics remain
-        # visible through inherited stdout/stderr.
-        killed = None
-        try:
-            killed = subprocess.run(
-                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
-                check=False,
-                timeout=grace_seconds,
-            )
-        except subprocess.TimeoutExpired:
-            print("hosted-deadline taskkill-expired", file=sys.stderr)
-        if killed is None or (killed.returncode != 0 and process.poll() is None):
-            process.kill()
+def _evidence_directory() -> Path:
+    configured = os.environ.get("TORTURER_HOSTED_DEADLINE_EVIDENCE_DIR")
+    if configured:
+        root = Path(configured).expanduser()
+        if not root.is_absolute():
+            raise DeadlineError("deadline evidence directory must be absolute")
+        _ensure_owner_only_directory(root)
+        return root
+    parent = os.environ.get("RUNNER_TEMP")
+    if parent:
+        parent_path = Path(parent).expanduser()
+        if not parent_path.is_absolute():
+            raise DeadlineError("runner temporary directory must be absolute")
+        parent_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        parent_path.chmod(0o700)
     else:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            if _wait_for_group(process, grace_seconds):
-                return
-        except (OSError, ValueError) as error:
-            print(
-                f"hosted-deadline graceful-stop-wait-error={type(error).__name__}",
-                file=sys.stderr,
-            )
-        print("hosted-deadline graceful-stop-expired", file=sys.stderr)
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    if _wait_for_group(process, 10):
-        return
-    print("hosted-deadline process-tree-still-present", file=sys.stderr)
-    raise DeadlineError("command process tree survived forced termination")
+        parent_path = None
+    directory = Path(tempfile.mkdtemp(prefix="torturer-hosted-deadline-", dir=parent_path))
+    directory.chmod(0o700)
+    _ensure_owner_only_directory(directory)
+    return directory
+
+
+def _publish_evidence(runner: SubprocessRunner, *, status: str) -> None:
+    records = runner.safe_evidence()
+    if not records:
+        raise DeadlineError("deadline evidence metadata is empty")
+    for record in records:
+        identifier = record.get("evidence_id")
+        size = record.get("evidence_bytes")
+        digest = record.get("evidence_sha256")
+        if (
+            not isinstance(identifier, str)
+            or len(identifier) != 32
+            or identifier[0] != "e"
+            or any(character not in "0123456789abcdef" for character in identifier[1:])
+            or not isinstance(size, int)
+            or not isinstance(digest, str)
+            or len(digest) != 64
+        ):
+            raise DeadlineError("deadline evidence metadata is incomplete")
+        print(
+            f"hosted-deadline evidence status={status} id={identifier} "
+            f"bytes={size} sha256={digest}"
+        )
 
 
 def run(command: list[str], *, timeout_seconds: int, grace_seconds: int) -> int:
@@ -122,27 +96,27 @@ def run(command: list[str], *, timeout_seconds: int, grace_seconds: int) -> int:
     )
     if not command or any(not isinstance(item, str) or not item for item in command):
         raise DeadlineError("command must contain non-empty argument strings")
-    # Never echo argv: hosted commands may contain credentials, private URLs,
-    # or profile material. The child still inherits the complete raw streams.
-    print(f"hosted-deadline timeout_seconds={timeout} command_arg_count={len(command)}")
-    process = subprocess.Popen(
-        command,
-        stdin=None,
-        stdout=None,
-        stderr=None,
-        start_new_session=os.name != "nt",
-        creationflags=(
-            subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-        ),
-    )
+    cleanup_reserve = min(float(grace), max(_MIN_CLEANUP_SECONDS, timeout / 2.0))
     try:
-        return_code = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        print("hosted-deadline expired", file=sys.stderr)
-        _terminate(process, grace)
-        return 124
-    print(f"hosted-deadline return_code={return_code}")
-    return return_code
+        evidence_directory = _evidence_directory()
+        runner = SubprocessRunner(
+            evidence_directory,
+            cleanup_reserve_seconds=cleanup_reserve,
+        )
+    except HostedAdapterError as error:
+        raise DeadlineError(error.code) from error
+    print(f"hosted-deadline status=started timeout_seconds={timeout} command_arg_count={len(command)}")
+    try:
+        result = runner.run(command, timeout_seconds=timeout)
+    except HostedAdapterError as error:
+        _publish_evidence(runner, status="failed")
+        if error.code == "COMMAND_TIMEOUT":
+            print("hosted-deadline status=timed-out")
+            return 124
+        raise DeadlineError(error.code) from error
+    _publish_evidence(runner, status=("failed" if result.returncode else "completed"))
+    print(f"hosted-deadline status=completed return_code={result.returncode}")
+    return result.returncode
 
 
 def parser() -> argparse.ArgumentParser:

@@ -18,12 +18,16 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
+import tempfile
 import time
-from typing import Iterable, Sequence, TextIO
+from typing import BinaryIO, Iterable, Sequence
 import xml.etree.ElementTree as ElementTree
 import zipfile
+
+from torturer_checks.public_output import emit_evidence
 
 
 ANDROID_NS = "http://schemas.android.com/apk/res/android"
@@ -36,10 +40,53 @@ INTERNAL_LIFECYCLE_TEST = (
     "com.dobby.feature.vpn_service.DobbyVpnServiceInstrumentationTest"
 )
 COMMIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
+MAX_RUN_SECONDS = 30 * 60
+CLEANUP_RESERVE_SECONDS = 120
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
+COMMAND_TERMINATION_GRACE_SECONDS = 15
 
 
 class AndroidContractError(RuntimeError):
     """An artifact or public Android contract does not match the expected shape."""
+
+
+class RunBudget:
+    """Track one Android lane's hard deadline and reserved cleanup window."""
+
+    def __init__(
+        self,
+        *,
+        max_seconds: float = MAX_RUN_SECONDS,
+        cleanup_reserve_seconds: float = CLEANUP_RESERVE_SECONDS,
+        clock=time.monotonic,
+    ) -> None:
+        if max_seconds <= 0 or cleanup_reserve_seconds < 0 or cleanup_reserve_seconds >= max_seconds:
+            raise ValueError("cleanup reserve must be non-negative and smaller than the run deadline")
+        self.max_seconds = float(max_seconds)
+        self.cleanup_reserve_seconds = float(cleanup_reserve_seconds)
+        self.clock = clock
+        self.started_at = clock()
+
+    @property
+    def deadline(self) -> float:
+        return self.started_at + self.max_seconds
+
+    def operation_timeout(self, requested: float | None = None) -> float:
+        remaining = self.deadline - self.clock() - self.cleanup_reserve_seconds
+        if remaining <= 0:
+            raise AndroidContractError("Android lane exhausted its functional budget before cleanup reserve")
+        if requested is None:
+            return remaining
+        if requested <= 0:
+            raise AndroidContractError("Android command timeout must be positive")
+        return min(float(requested), remaining)
+
+    def cleanup_timeout(self) -> float:
+        return max(0.0, min(self.cleanup_reserve_seconds, self.deadline - self.clock()))
+
+    def assert_within_deadline(self) -> None:
+        if self.clock() > self.deadline:
+            raise AndroidContractError("Android lane exceeded its strict 1800-second deadline")
 
 
 @dataclass(frozen=True)
@@ -103,38 +150,242 @@ def _require(condition: bool, message: str) -> None:
         raise AndroidContractError(message)
 
 
+def _safe_evidence_stem(value: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
+    return stem or "command"
+
+
+def _evidence_directory(requested: Path | None) -> Path | None:
+    if requested is None:
+        requested = Path(tempfile.mkdtemp(prefix="torturer-android-evidence-"))
+    if requested.is_symlink():
+        raise AndroidContractError("Android evidence directory must not be a symlink")
+    requested.mkdir(mode=0o700, parents=True, exist_ok=True)
+    requested.chmod(0o700)
+    return requested
+
+
+def _retain_bytes(directory: Path | None, label: str, payload: bytes) -> Path | None:
+    if directory is None:
+        raise AndroidContractError("Android diagnostics require an owner-only evidence directory")
+    directory = _evidence_directory(directory)
+    assert directory is not None
+    path = directory / f"{_safe_evidence_stem(label)}.raw.log"
+    if path.exists() or path.is_symlink():
+        raise AndroidContractError(f"refusing to overwrite existing Android evidence: {path}")
+    with path.open("xb", buffering=0) as output:
+        output.write(payload)
+        output.flush()
+        os.fsync(output.fileno())
+    path.chmod(0o600)
+    return path
+
+
+def _process_group_alive(process: subprocess.Popen[bytes]) -> bool:
+    if os.name == "nt":
+        return process.poll() is None
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _proc_descendants(root_pid: int) -> set[int]:
+    """Return recursive descendants, including children that create a new session."""
+
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        raise AndroidContractError("cannot inspect the Android process tree because /proc is unavailable")
+    parent_by_pid: dict[int, int] = {}
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat_line = (entry / "stat").read_text(encoding="ascii")
+            close = stat_line.rfind(")")
+            fields = stat_line[close + 2 :].split()
+            parent_by_pid[int(entry.name)] = int(fields[1])
+        except (OSError, ValueError, IndexError):
+            continue
+    descendants: set[int] = set()
+    frontier = [root_pid]
+    while frontier:
+        parent = frontier.pop()
+        for child, child_parent in parent_by_pid.items():
+            if child_parent == parent and child not in descendants:
+                descendants.add(child)
+                frontier.append(child)
+    return descendants
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        close = stat_line.rfind(")")
+        fields = stat_line[close + 2 :].split()
+        return bool(fields) and fields[0] != "Z"
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError, IndexError):
+        return True
+
+
+def _wait_for_process_tree(
+    process: subprocess.Popen[bytes], tracked: set[int], timeout_seconds: float
+) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        tracked.update(_proc_descendants(process.pid))
+        if (
+            process.poll() is not None
+            and not _process_group_alive(process)
+            and not any(_pid_alive(pid) for pid in tracked if pid != process.pid)
+        ):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            process.wait(timeout=min(0.05, remaining))
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen[bytes], *, grace_seconds: float, description: str,
+    tracked: set[int] | None = None,
+) -> set[int]:
+    tracked = tracked if tracked is not None else set()
+    tracked.update({process.pid} | _proc_descendants(process.pid))
+    if os.name == "nt":
+        process.terminate()
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        for pid in tracked:
+            if pid != process.pid:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+    if _wait_for_process_tree(process, tracked, grace_seconds):
+        return tracked
+    print(f"[android-process] {description} graceful-stop-expired", file=sys.stderr)
+    if os.name == "nt":
+        process.kill()
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        tracked.update(_proc_descendants(process.pid))
+        for pid in tracked:
+            if pid != process.pid:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+    if not _wait_for_process_tree(process, tracked, max(1.0, grace_seconds)):
+        raise AndroidContractError(f"{description} process tree survived forced termination")
+    return tracked
+
+
 def _run(
     command: Sequence[str | Path], *, cwd: Path | None = None, env: dict[str, str] | None = None,
     input_text: str | None = None, timeout: float | None = None, allow_nonzero: bool = False,
+    budget: RunBudget | None = None, evidence_directory: Path | None = None,
+    evidence_label: str = "command",
 ) -> subprocess.CompletedProcess[str]:
-    """Run an argument-vector command; candidate values are never shell-expanded.
-
-    ``allow_nonzero`` is only for status queries whose negative result is
-    meaningful, such as ``pidof`` after force-stopping a package.
-    """
+    """Run a bounded argument-vector command and retain complete original output."""
 
     rendered = [str(item) for item in command]
-    completed = subprocess.run(
-        rendered,
-        cwd=cwd,
-        env=env,
-        input=input_text,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=timeout,
-        check=False,
-    )
-    print(f"[android-contract-command] returncode={completed.returncode} output-begin")
-    if completed.stdout:
-        sys.stdout.write(completed.stdout)
-        sys.stdout.flush()
-    print("[android-contract-command] output-end")
-    if completed.returncode and not allow_nonzero:
-        raise AndroidContractError(
-            f"command failed ({completed.returncode}): {rendered!r}\n{completed.stdout}"
+    requested_timeout = timeout if timeout is not None else DEFAULT_COMMAND_TIMEOUT_SECONDS
+    command_timeout = budget.operation_timeout(requested_timeout) if budget else requested_timeout
+    evidence_directory = _evidence_directory(evidence_directory)
+    try:
+        process = subprocess.Popen(
+            rendered,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=os.name != "nt",
+            creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
         )
-    return completed
+    except OSError as error:
+        _retain_bytes(evidence_directory, f"{evidence_label}.exception", str(error).encode())
+        raise AndroidContractError(
+            f"Android command could not start ({type(error).__name__}); diagnostics retained privately"
+        ) from error
+    tracked: set[int] = {process.pid}
+    timed_out = False
+    output = b""
+    termination_error: AndroidContractError | None = None
+    try:
+        output, _ = process.communicate(
+            input=input_text.encode() if input_text is not None else None,
+            timeout=command_timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        timed_out = True
+        output = error.output or b""
+        print(
+            f"[android-contract-command] timeout after {command_timeout:g}s; terminating process tree",
+            file=sys.stderr,
+        )
+        try:
+            tracked = _terminate_process_tree(
+                process,
+                grace_seconds=min(COMMAND_TERMINATION_GRACE_SECONDS, max(1.0, command_timeout)),
+                description="command",
+                tracked=tracked,
+            )
+        except AndroidContractError as cleanup_error:
+            termination_error = cleanup_error
+        try:
+            recovered, _ = process.communicate(timeout=max(1.0, COMMAND_TERMINATION_GRACE_SECONDS))
+            output += recovered or b""
+        except subprocess.TimeoutExpired as drain_error:
+            output += drain_error.output or b""
+            termination_error = termination_error or AndroidContractError(
+                "Android command process tree and diagnostic pipe survived final cleanup"
+            )
+        try:
+            if not _wait_for_process_tree(process, tracked, 0.0):
+                termination_error = termination_error or AndroidContractError(
+                    "Android command process tree remained after final diagnostic drain"
+                )
+        except AndroidContractError as cleanup_error:
+            termination_error = termination_error or cleanup_error
+    _retain_bytes(evidence_directory, evidence_label, output)
+    emit_evidence(
+        "android-command",
+        status=("timed-out" if timed_out else ("failed" if process.returncode else "completed")),
+        payloads={"combined": output},
+    )
+    if timed_out:
+        cleanup_detail = f"; cleanup={termination_error}" if termination_error is not None else ""
+        raise AndroidContractError(
+            f"command timed out after {command_timeout:g}s{cleanup_detail}; "
+            "complete diagnostics retained privately"
+        )
+    if process.returncode and not allow_nonzero:
+        raise AndroidContractError(
+            f"Android command failed ({process.returncode}); complete diagnostics retained privately"
+        )
+    return subprocess.CompletedProcess(rendered, process.returncode, output.decode("utf-8", errors="replace"))
 
 
 def build_command(apks: CandidateApks) -> list[str]:
@@ -161,21 +412,49 @@ def lifecycle_test_command(apks: CandidateApks) -> list[str]:
     ]
 
 
-def verify_candidate_commit(candidate_root: Path, commit_sha: str) -> None:
+def verify_candidate_commit(
+    candidate_root: Path,
+    commit_sha: str,
+    *,
+    budget: RunBudget | None = None,
+    evidence_directory: Path | None = None,
+) -> None:
     """Ensure a build is made from the full SHA already selected by the caller."""
 
     _require(bool(COMMIT_SHA.fullmatch(commit_sha)), "commit_sha must be a lowercase full 40-character SHA")
-    resolved = _run(["git", "-C", candidate_root, "rev-parse", "HEAD"]).stdout.strip()
+    resolved = _run(
+        ["git", "-C", candidate_root, "rev-parse", "HEAD"],
+        timeout=30,
+        budget=budget,
+        evidence_directory=evidence_directory,
+        evidence_label="source-rev-parse",
+    ).stdout.strip()
     _require(resolved == commit_sha, f"candidate checkout is {resolved!r}, not requested commit {commit_sha!r}")
     tracked_state = _run(
-        ["git", "-C", candidate_root, "status", "--porcelain=v1", "--untracked-files=no"]
+        ["git", "-C", candidate_root, "status", "--porcelain=v1", "--untracked-files=all"],
+        timeout=30,
+        budget=budget,
+        evidence_directory=evidence_directory,
+        evidence_label="source-status",
     ).stdout
     _require(not tracked_state.strip(), "candidate checkout has modified tracked files")
 
 
-def build_candidate(apks: CandidateApks) -> None:
+def build_candidate(
+    apks: CandidateApks,
+    *,
+    budget: RunBudget | None = None,
+    evidence_directory: Path | None = None,
+) -> None:
     _require(apks.gradlew.is_file(), f"candidate Gradle wrapper is missing: {apks.gradlew}")
-    _run(build_command(apks), cwd=apks.root / "kmp_module")
+    _run(
+        build_command(apks),
+        cwd=apks.root / "kmp_module",
+        timeout=600,
+        budget=budget,
+        evidence_directory=evidence_directory,
+        evidence_label="gradle-build",
+    )
     _require(apks.app_apk.is_file(), f"Gradle did not produce the expected debug APK: {apks.app_apk}")
     _require(apks.test_apk.is_file(), f"Gradle did not produce the expected debug test APK: {apks.test_apk}")
 
@@ -213,8 +492,21 @@ def verify_apk_layout(apks: CandidateApks) -> None:
         _require(required in application, f"application APK is missing required native payload {required}")
 
 
-def _manifest_xml(apkanalyzer: Path, apk: Path) -> ElementTree.Element:
-    output = _run([apkanalyzer, "manifest", "print", apk]).stdout
+def _manifest_xml(
+    apkanalyzer: Path,
+    apk: Path,
+    *,
+    budget: RunBudget | None = None,
+    evidence_directory: Path | None = None,
+    evidence_label: str = "apkanalyzer",
+) -> ElementTree.Element:
+    output = _run(
+        [apkanalyzer, "manifest", "print", apk],
+        timeout=120,
+        budget=budget,
+        evidence_directory=evidence_directory,
+        evidence_label=evidence_label,
+    ).stdout
     try:
         return ElementTree.fromstring(output)
     except ElementTree.ParseError as error:
@@ -284,9 +576,31 @@ def verify_test_manifest(root: ElementTree.Element) -> None:
     _require(instrumentation.get(_android_attribute("name")) == INSTRUMENTATION_RUNNER, "test APK uses an unexpected instrumentation runner")
 
 
-def verify_manifests(apks: CandidateApks, apkanalyzer: Path) -> None:
-    verify_application_manifest(_manifest_xml(apkanalyzer, apks.app_apk))
-    verify_test_manifest(_manifest_xml(apkanalyzer, apks.test_apk))
+def verify_manifests(
+    apks: CandidateApks,
+    apkanalyzer: Path,
+    *,
+    budget: RunBudget | None = None,
+    evidence_directory: Path | None = None,
+) -> None:
+    verify_application_manifest(
+        _manifest_xml(
+            apkanalyzer,
+            apks.app_apk,
+            budget=budget,
+            evidence_directory=evidence_directory,
+            evidence_label="apkanalyzer-application",
+        )
+    )
+    verify_test_manifest(
+        _manifest_xml(
+            apkanalyzer,
+            apks.test_apk,
+            budget=budget,
+            evidence_directory=evidence_directory,
+            evidence_label="apkanalyzer-instrumentation",
+        )
+    )
 
 
 def _sdk_environment(tools: AndroidTools, avd_home: Path) -> dict[str, str]:
@@ -298,8 +612,14 @@ def _sdk_environment(tools: AndroidTools, avd_home: Path) -> dict[str, str]:
 
 
 def provision_emulator(
-    tools: AndroidTools, *, avd_name: str, avd_home: Path, api_level: int = 35
-) -> tuple[subprocess.Popen[str], TextIO, Path]:
+    tools: AndroidTools,
+    *,
+    avd_name: str,
+    avd_home: Path,
+    api_level: int = 35,
+    budget: RunBudget | None = None,
+    evidence_directory: Path | None = None,
+) -> tuple[subprocess.Popen[bytes], BinaryIO, Path]:
     """Provision and start a no-window x86_64 emulator suitable for GitHub-hosted Linux."""
 
     _require(re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", avd_name) is not None, "AVD name contains unsupported characters")
@@ -307,18 +627,42 @@ def provision_emulator(
     avd_home.mkdir(parents=True, exist_ok=True)
     env = _sdk_environment(tools, avd_home)
     image = "system-images;android-35;google_apis;x86_64"
-    _run([tools.sdkmanager, "--licenses"], env=env, input_text="y\n" * 128, timeout=180)
-    _run([tools.sdkmanager, "--install", image], env=env, timeout=900)
-    _run([tools.avdmanager, "create", "avd", "--force", "--name", avd_name, "--package", image, "--device", "pixel"], env=env, input_text="no\n", timeout=120)
+    _run(
+        [tools.sdkmanager, "--licenses"],
+        env=env,
+        input_text="y\n" * 128,
+        timeout=180,
+        budget=budget,
+        evidence_directory=evidence_directory,
+        evidence_label="sdkmanager-licenses",
+    )
+    _run(
+        [tools.sdkmanager, "--install", image],
+        env=env,
+        timeout=900,
+        budget=budget,
+        evidence_directory=evidence_directory,
+        evidence_label="sdkmanager-install",
+    )
+    _run(
+        [tools.avdmanager, "create", "avd", "--force", "--name", avd_name, "--package", image, "--device", "pixel"],
+        env=env,
+        input_text="no\n",
+        timeout=120,
+        budget=budget,
+        evidence_directory=evidence_directory,
+        evidence_label="avdmanager-create",
+    )
     log_path = avd_home.parent / "emulator.log"
-    log_handle = log_path.open("w", encoding="utf-8")
+    log_handle = log_path.open("xb")
+    os.chmod(log_path, 0o600)
     try:
         process = subprocess.Popen(
             [str(tools.emulator), "-avd", avd_name, "-port", "5554", "-no-window", "-no-audio", "-no-boot-anim", "-gpu", "swiftshader_indirect", "-no-snapshot", "-wipe-data"],
             env=env,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
-            text=True,
+            start_new_session=True,
         )
     except Exception:
         log_handle.close()
@@ -329,41 +673,127 @@ def provision_emulator(
 def wait_for_boot(
     tools: AndroidTools,
     *,
-    emulator: subprocess.Popen[str] | None = None,
+    emulator: subprocess.Popen[bytes] | None = None,
     timeout_seconds: int = 300,
+    budget: RunBudget | None = None,
+    evidence_directory: Path | None = None,
 ) -> None:
-    deadline = time.monotonic() + timeout_seconds
-    _run([tools.adb, "wait-for-device"], timeout=min(timeout_seconds, 120))
+    boot_timeout = budget.operation_timeout(timeout_seconds) if budget else timeout_seconds
+    deadline = time.monotonic() + boot_timeout
+    _run(
+        [tools.adb, "wait-for-device"],
+        timeout=min(boot_timeout, 120),
+        budget=budget,
+        evidence_directory=evidence_directory,
+        evidence_label="adb-wait-for-device",
+    )
+    probe_sequence = 0
     while time.monotonic() < deadline:
         if emulator is not None and emulator.poll() is not None:
             raise AndroidContractError(
                 f"Android emulator exited before boot with code {emulator.returncode}"
             )
-        if _run([tools.adb, "shell", "getprop", "sys.boot_completed"]).stdout.strip() == "1":
-            _run([tools.adb, "shell", "settings", "put", "global", "window_animation_scale", "0"])
-            _run([tools.adb, "shell", "settings", "put", "global", "transition_animation_scale", "0"])
-            _run([tools.adb, "shell", "settings", "put", "global", "animator_duration_scale", "0"])
+        probe_sequence += 1
+        if _run(
+            [tools.adb, "shell", "getprop", "sys.boot_completed"],
+            timeout=30,
+            budget=budget,
+            evidence_directory=evidence_directory,
+            evidence_label=f"adb-boot-state-{probe_sequence:03d}",
+        ).stdout.strip() == "1":
+            for setting, label in (
+                ("window_animation_scale", "adb-window-animation"),
+                ("transition_animation_scale", "adb-transition-animation"),
+                ("animator_duration_scale", "adb-animator-duration"),
+            ):
+                _run(
+                    [tools.adb, "shell", "settings", "put", "global", setting, "0"],
+                    timeout=30,
+                    budget=budget,
+                    evidence_directory=evidence_directory,
+                    evidence_label=label,
+                )
             return
         time.sleep(2)
     raise AndroidContractError("Android emulator did not complete boot within timeout")
 
 
-def install_and_check_package(tools: AndroidTools, apks: CandidateApks) -> None:
+def install_and_check_package(
+    tools: AndroidTools,
+    apks: CandidateApks,
+    *,
+    budget: RunBudget | None = None,
+    evidence_directory: Path | None = None,
+) -> None:
     """Install exact APK outputs and exercise only public package-facing behavior."""
 
-    _run([tools.adb, "install", "-r", apks.app_apk], timeout=180)
-    _run([tools.adb, "install", "-r", apks.test_apk], timeout=180)
-    enabled_packages = _run(enabled_package_command(tools.adb)).stdout
+    _run(
+        [tools.adb, "install", "-r", apks.app_apk],
+        timeout=180,
+        budget=budget,
+        evidence_directory=evidence_directory,
+        evidence_label="adb-install-application",
+    )
+    _run(
+        [tools.adb, "install", "-r", apks.test_apk],
+        timeout=180,
+        budget=budget,
+        evidence_directory=evidence_directory,
+        evidence_label="adb-install-instrumentation",
+    )
+    enabled_packages = _run(
+        enabled_package_command(tools.adb),
+        timeout=30,
+        budget=budget,
+        evidence_directory=evidence_directory,
+        evidence_label="adb-enabled-packages",
+    ).stdout
     _require(_contains_enabled_package(enabled_packages, PACKAGE_NAME), "installed application package is not enabled")
-    package_dump = _run([tools.adb, "shell", "dumpsys", "package", PACKAGE_NAME]).stdout
+    package_dump = _run(
+        [tools.adb, "shell", "dumpsys", "package", PACKAGE_NAME],
+        timeout=60,
+        budget=budget,
+        evidence_directory=evidence_directory,
+        evidence_label="adb-package-dump",
+    ).stdout
     _require(VPN_SERVICE in package_dump, "installed package does not expose the expected VPN service")
     _require("android.permission.BIND_VPN_SERVICE" in package_dump, "installed VPN service lacks its Android binding permission")
-    launch = _run([tools.adb, "shell", "am", "start", "-W", "-n", f"{PACKAGE_NAME}/{LAUNCHER_ACTIVITY}"]).stdout
+    launch = _run(
+        [tools.adb, "shell", "am", "start", "-W", "-n", f"{PACKAGE_NAME}/{LAUNCHER_ACTIVITY}"],
+        timeout=60,
+        budget=budget,
+        evidence_directory=evidence_directory,
+        evidence_label="adb-launch-application",
+    ).stdout
     _require("Status: ok" in launch or "Activity:" in launch, "launcher activity did not start successfully")
-    _require(bool(_run([tools.adb, "shell", "pidof", PACKAGE_NAME]).stdout.strip()), "application process did not start")
-    _run([tools.adb, "shell", "am", "force-stop", PACKAGE_NAME])
+    _require(
+        bool(
+            _run(
+                [tools.adb, "shell", "pidof", PACKAGE_NAME],
+                timeout=30,
+                budget=budget,
+                evidence_directory=evidence_directory,
+                evidence_label="adb-application-pid",
+            ).stdout.strip()
+        ),
+        "application process did not start",
+    )
+    _run(
+        [tools.adb, "shell", "am", "force-stop", PACKAGE_NAME],
+        timeout=30,
+        budget=budget,
+        evidence_directory=evidence_directory,
+        evidence_label="adb-force-stop",
+    )
     time.sleep(1)
-    stopped = _run([tools.adb, "shell", "pidof", PACKAGE_NAME], allow_nonzero=True)
+    stopped = _run(
+        [tools.adb, "shell", "pidof", PACKAGE_NAME],
+        timeout=30,
+        allow_nonzero=True,
+        budget=budget,
+        evidence_directory=evidence_directory,
+        evidence_label="adb-stopped-pid",
+    )
     _require(not stopped.stdout.strip(), "application process remained after force-stop")
 
 
@@ -379,10 +809,22 @@ def enabled_package_command(adb: Path) -> list[str]:
     return [str(adb), "shell", "pm", "list", "packages", "-e", PACKAGE_NAME]
 
 
-def run_internal_lifecycle_test(apks: CandidateApks) -> None:
+def run_internal_lifecycle_test(
+    apks: CandidateApks,
+    *,
+    budget: RunBudget | None = None,
+    evidence_directory: Path | None = None,
+) -> None:
     """Run candidate-owned safe instrumentation, not a Torturer copy of its seam."""
 
-    _run(lifecycle_test_command(apks), cwd=apks.root / "kmp_module", timeout=600)
+    _run(
+        lifecycle_test_command(apks),
+        cwd=apks.root / "kmp_module",
+        timeout=600,
+        budget=budget,
+        evidence_directory=evidence_directory,
+        evidence_label="gradle-lifecycle-test",
+    )
 
 
 def _default_sdk_root(candidate_root: Path) -> Path:
@@ -407,38 +849,68 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--static-only", action="store_true", help="build and validate artifacts without provisioning an emulator")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
+    budget = RunBudget()
     apks = CandidateApks.from_candidate_root(args.candidate_root)
-    verify_candidate_commit(apks.root, args.commit_sha)
-    build_candidate(apks)
+    evidence_directory = Path(
+        os.environ.get("TORTURER_ANDROID_RAW_LOG_DIR", str(args.work_dir.resolve() / "raw"))
+    )
+    evidence_directory = _evidence_directory(evidence_directory)
+    verify_candidate_commit(apks.root, args.commit_sha, budget=budget, evidence_directory=evidence_directory)
+    build_candidate(apks, budget=budget, evidence_directory=evidence_directory)
     tools = AndroidTools.discover(args.sdk_root or _default_sdk_root(apks.root))
     verify_apk_layout(apks)
-    verify_manifests(apks, tools.apkanalyzer)
+    verify_manifests(apks, tools.apkanalyzer, budget=budget, evidence_directory=evidence_directory)
     if args.static_only:
+        budget.assert_within_deadline()
         return 0
 
     emulator, emulator_log, emulator_log_path = provision_emulator(
         tools,
         avd_name=args.avd_name,
         avd_home=args.work_dir.resolve() / "avd",
+        budget=budget,
+        evidence_directory=evidence_directory,
     )
+    failure: AndroidContractError | None = None
     try:
-        wait_for_boot(tools, emulator=emulator)
-        install_and_check_package(tools, apks)
-        run_internal_lifecycle_test(apks)
+        wait_for_boot(tools, emulator=emulator, budget=budget, evidence_directory=evidence_directory)
+        install_and_check_package(tools, apks, budget=budget, evidence_directory=evidence_directory)
+        run_internal_lifecycle_test(apks, budget=budget, evidence_directory=evidence_directory)
     except Exception as error:
-        emulator_log.flush()
-        diagnostics = emulator_log_path.read_text(encoding="utf-8", errors="replace")
-        raise AndroidContractError(
-            f"{error}\nemulator log:\n{diagnostics[-32768:]}"
-        ) from error
+        failure = AndroidContractError(
+            f"{error}; complete emulator diagnostics retained privately"
+        )
     finally:
-        emulator.terminate()
         try:
-            emulator.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            emulator.kill()
-            emulator.wait(timeout=10)
+            _terminate_process_tree(
+                emulator,
+                grace_seconds=budget.cleanup_timeout(),
+                description="Android emulator",
+            )
+        except Exception as error:
+            cleanup_error = AndroidContractError(f"Android emulator cleanup failed: {error}")
+            failure = cleanup_error if failure is None else AndroidContractError(f"{failure}; {cleanup_error}")
+        emulator_log.flush()
+        os.fsync(emulator_log.fileno())
+        try:
+            evidence_path = evidence_directory / "emulator.raw.log"
+            if not evidence_path.exists() and not evidence_path.is_symlink():
+                emulator_payload = emulator_log_path.read_bytes()
+                _retain_bytes(evidence_directory, "emulator", emulator_payload)
+                emit_evidence(
+                    "android-emulator",
+                    status=("failed" if failure is not None else "retained"),
+                    payloads={"combined": emulator_payload},
+                )
+        except (OSError, AndroidContractError) as retention_error:
+            cleanup_error = AndroidContractError(
+                f"emulator diagnostics retention failed ({type(retention_error).__name__})"
+            )
+            failure = cleanup_error if failure is None else AndroidContractError(f"{failure}; {cleanup_error}")
         emulator_log.close()
+    if failure is not None:
+        raise failure
+    budget.assert_within_deadline()
     return 0
 
 
@@ -446,5 +918,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (AndroidContractError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-        print(f"Android Torturer check failed: {error}", file=sys.stderr)
+        print(f"android_contract status=failed code={type(error).__name__}", file=sys.stderr)
         raise SystemExit(1) from error

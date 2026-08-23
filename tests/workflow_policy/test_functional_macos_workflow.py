@@ -99,7 +99,8 @@ class FunctionalMacOSWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("preflight_service_stop_verified=true", preflight_handoff)
         self.assertIn('sudo -n kill -TERM "$service_pid"', preflight_handoff)
         self.assertIn("PREFLIGHT_SERVICE_CONTROL_SOCKET", preflight_handoff)
-        self.assertIn('test -z "$children"', preflight_handoff)
+        self.assertIn('emit_private_evidence preflight-service-children "$children_snapshot"', preflight_handoff)
+        self.assertIn('test "$children_count" -eq 0', preflight_handoff)
         self.assertIn("GH_TOKEN", token_region)
         self.assertIn("github.token", token_region)
         for forbidden in ("windows_grpcvpnserver.exe", "macos_grpcvpnserver", "dobby-cli", "Start-Process", "taskkill.exe", "PREFLIGHT_SERVICE_PID"):
@@ -144,6 +145,14 @@ class FunctionalMacOSWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("sudo -n id", self.text)
         self.assertIn("control_socket_ready=1", self.text)
         self.assertIn("SERVICE_CONTROL_SOCKET=%s", self.text)
+        self.assertIn("emit_private_evidence", self.text)
+        self.assertGreaterEqual(self.text.count("umask 077"), 4)
+        self.assertNotIn('cat "$service_log"', self.text)
+        self.assertNotIn('cat "$service_err"', self.text)
+        self.assertNotIn('| tee "$SERVICE_DIR/preflight-control-status.raw.log"', self.text)
+        self.assertNotIn('| tee "$SERVICE_DIR/control-status.raw.log"', self.text)
+        self.assertIn('ps -axo pid=,ppid=,command= > "$children_snapshot" 2>&1', self.text)
+        self.assertIn('emit_private_evidence service-children "$children_snapshot"', self.text)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ jobs:
     env:
       SOURCE_REPOSITORY: ${{ inputs.source_repository }}
       SOURCE_SHA: ${{ inputs.commit_sha }}
+      TORTURER_SHA: ${{ github.sha }}
 
     steps:
       - name: Validate exact public candidate identity
@@ -65,6 +66,14 @@ jobs:
           ref: ${{ github.sha }}
           path: torturer
           persist-credentials: false
+
+      - name: Verify exact trusted Torturer helper checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C torturer rev-parse HEAD)" = "$TORTURER_SHA"
+          git -C torturer status --porcelain=v1 --untracked-files=all
+          test -z "$(git -C torturer status --porcelain=v1 --untracked-files=all)"
 
       - name: Verify checkout and build Windows candidate
         shell: bash
@@ -153,7 +162,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" | tee "$HANDOFF_DIR/origin-run.json"
+          "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" 30 origin-run "$HANDOFF_DIR/origin-run.json" \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           python - "$HANDOFF_DIR/origin-run.json" <<'PY'
           import datetime, json, os, sys
           from pathlib import Path
@@ -199,10 +209,10 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          openssl req -x509 -newkey rsa:3072 -nodes -days 1 \
+          timeout --foreground --signal=KILL 60s openssl req -x509 -newkey rsa:3072 -nodes -days 1 \
             -subj "/CN=dobbyvpn-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             -keyout "$HANDOFF_DIR/recipient.key" -out "$HANDOFF_DIR/recipient.crt"
-          lease_run_id="$(python -c 'import hashlib,os; print(hashlib.sha256(":".join(os.environ[name] for name in ("GITHUB_RUN_ID","GITHUB_RUN_ATTEMPT","PLATFORM","TORTURER_SHA")).encode()).hexdigest()[:32])')"
+          lease_run_id="$(python -c 'import hashlib,os; print(hashlib.sha256(":".join(os.environ[name] for name in ("GITHUB_RUN_ID","GITHUB_RUN_ATTEMPT","PLATFORM","TORTURER_SHA","SOURCE_SHA")).encode()).hexdigest()[:32])')"
           request_name="render-request-${lease_run_id}-${PLATFORM}"
           python - "$HANDOFF_DIR/request.json" "$lease_run_id" "$request_name" <<'PY'
           import json, os, re, sys
@@ -210,7 +220,7 @@ jobs:
           path, run_id, name = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
           if not re.fullmatch(r"[0-9a-f]{32}", run_id) or name != f"render-request-{run_id}-windows":
               raise SystemExit("lease request identity is invalid")
-          path.write_text(json.dumps({"schema": 1, "kind": "dobbyvpn.render-lease-request", "run_id": run_id, "platform": "windows", "image_digest": os.environ["SERVER_IMAGE_DIGEST"]}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          path.write_text(json.dumps({"schema": 1, "kind": "dobbyvpn.render-lease-request", "run_id": run_id, "platform": "windows", "source_sha": os.environ["SOURCE_SHA"], "image_digest": os.environ["SERVER_IMAGE_DIGEST"]}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
           path.chmod(0o600)
           with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as env:
               env.write(f"LEASE_RUN_ID={run_id}\nREQUEST_ARTIFACT_NAME={name}\n")
@@ -221,6 +231,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
+          emit_private_evidence() {
+            label="$1"
+            file="$2"
+            if [ -f "$file" ]; then
+              bytes="$(wc -c < "$file" | tr -d '[:space:]')"
+              digest="$(sha256sum "$file" | awk '{print $1}')"
+              evidence_id="$(printf '%s:%s' "$GITHUB_RUN_ID" "$label" | sha256sum | cut -c1-16)"
+              printf 'diagnostic_evidence label=%s id=%s bytes=%s sha256=%s\n' \
+                "$label" "$evidence_id" "$bytes" "$digest"
+            else
+              printf 'diagnostic_evidence label=%s state=missing\n' "$label"
+            fi
+          }
           # These single-quoted commands are interpreted by PowerShell, not Bash.
           # The preflight process is stopped and verified before any token-bearing Render step.
           # shellcheck disable=SC2016
@@ -241,27 +265,63 @@ jobs:
             remaining=$((RUN_DEADLINE_EPOCH - $(date +%s)))
             if [ "$remaining" -le 180 ]; then printf 'preflight readiness reached cleanup reserve: remaining=%s\n' "$remaining" >&2; exit 1; fi
             # shellcheck disable=SC2016
-            if ! powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("preflight_service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid"; then
-              printf 'preflight candidate service exited before readiness\n' >&2; cat "$service_log" "$service_err"; exit 1
+            probe_log="$SERVICE_DIR/preflight-service-probe-${attempt}.raw.log"
+            probe_status=0
+            powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("preflight_service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid" > "$probe_log" 2>&1 || probe_status=$?
+            if [ "$probe_status" -ne 0 ]; then
+              emit_private_evidence preflight-service-probe "$probe_log"
+              emit_private_evidence preflight-service-log "$service_log"
+              emit_private_evidence preflight-service-error "$service_err"
+              printf 'preflight_service_readiness=failed code=SERVICE_EXITED status=%s\n' "$probe_status" >&2
+              exit 1
             fi
-            # shellcheck disable=SC2016
-            if powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$c=Test-NetConnection -ComputerName 127.0.0.1 -Port 50051; Write-Output $c; if ($c.TcpTestSucceeded) { exit 0 }; exit 1'; then ready=true; break; fi
+            network_probe_log="$SERVICE_DIR/preflight-network-probe-${attempt}.raw.log"
+            network_probe_status=0
+            powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$c=Test-NetConnection -ComputerName 127.0.0.1 -Port 50051; Write-Output $c; if ($c.TcpTestSucceeded) { exit 0 }; exit 1' > "$network_probe_log" 2>&1 || network_probe_status=$?
+            if [ "$network_probe_status" -eq 0 ]; then ready=true; break; fi
+            emit_private_evidence preflight-network-probe "$network_probe_log"
             sleep 1
           done
-          if [ "$ready" != true ]; then printf 'preflight candidate service did not open loopback control port\n' >&2; cat "$service_log" "$service_err"; exit 1; fi
+          if [ "$ready" != true ]; then
+            emit_private_evidence preflight-service-timeout "$service_log"
+            emit_private_evidence preflight-service-error "$service_err"
+            printf 'preflight_service_readiness=failed code=CONTROL_PORT_TIMEOUT\n' >&2
+            exit 1
+          fi
           control_token="$PROGRAMDATA/DobbyVPN/control.token"
           test -s "$control_token"
           token_value="$(tr -d '\r\n' < "$control_token")"
           [[ "$token_value" =~ ^[0-9a-fA-F]{64}$ ]]
-          printf 'preflight_control_token_ready=1 path=%s bytes=%s\n' "$control_token" "${#token_value}"
-          "$GITHUB_WORKSPACE/candidate/dobby-cli.exe" status | tee "$SERVICE_DIR/preflight-control-status.raw.log"
-          printf 'preflight_service_ready=true pid=%s service_control_address=%s\n' "$service_pid" "$SERVICE_CONTROL_ADDRESS"
+          printf 'preflight_control_token_ready=1\n'
+          status_log="$SERVICE_DIR/preflight-control-status.raw.log"
+          status_code=0
+          "$GITHUB_WORKSPACE/candidate/dobby-cli.exe" status > "$status_log" 2>&1 || status_code=$?
+          emit_private_evidence preflight-control-status "$status_log"
+          if [ "$status_code" -ne 0 ]; then
+            printf 'preflight_control_status=failed code=CLI_STATUS status=%s\n' "$status_code" >&2
+            exit "$status_code"
+          fi
+          printf 'preflight_service_ready=true\n'
 
       - name: Stop Windows preflight candidate before Render handoff
         if: always()
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
+          emit_private_evidence() {
+            label="$1"
+            file="$2"
+            if [ -f "$file" ]; then
+              bytes="$(wc -c < "$file" | tr -d '[:space:]')"
+              digest="$(sha256sum "$file" | awk '{print $1}')"
+              evidence_id="$(printf '%s:%s' "$GITHUB_RUN_ID" "$label" | sha256sum | cut -c1-16)"
+              printf 'diagnostic_evidence label=%s id=%s bytes=%s sha256=%s\n' \
+                "$label" "$evidence_id" "$bytes" "$digest"
+            else
+              printf 'diagnostic_evidence label=%s state=missing\n' "$label"
+            fi
+          }
           # No candidate process may remain while the Render handoff uses the GitHub credential.
           service_pid="${PREFLIGHT_SERVICE_PID:-}"
           if [ -f "${PREFLIGHT_SERVICE_PID_FILE:-}" ]; then service_pid="$(cat "$PREFLIGHT_SERVICE_PID_FILE")"; fi
@@ -270,17 +330,30 @@ jobs:
             0|*[!0-9]*) printf 'invalid preflight cleanup pid=%s\n' "$service_pid" >&2; exit 1;;
           esac
           running=false
-          # shellcheck disable=SC2016
-          if powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("preflight_service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid"; then
+          cleanup_probe_log="$SERVICE_DIR/preflight-cleanup-probe-initial.raw.log"
+          cleanup_probe_status=0
+          powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("preflight_service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid" > "$cleanup_probe_log" 2>&1 || cleanup_probe_status=$?
+          emit_private_evidence preflight-cleanup-probe "$cleanup_probe_log"
+          if [ "$cleanup_probe_status" -eq 0 ]; then
             running=true
-            taskkill.exe /PID "$service_pid" /T /F
+            taskkill_log="$SERVICE_DIR/preflight-taskkill.raw.log"
+            taskkill_status=0
+            taskkill.exe /PID "$service_pid" /T /F > "$taskkill_log" 2>&1 || taskkill_status=$?
+            emit_private_evidence preflight-taskkill "$taskkill_log"
+            if [ "$taskkill_status" -ne 0 ]; then
+              printf 'preflight_service_cleanup=failed code=TASKKILL status=%s\n' "$taskkill_status" >&2
+              exit "$taskkill_status"
+            fi
           fi
           stopped=false
           if [ "$running" = true ]; then
             for attempt in $(seq 1 30); do
               printf 'preflight_service_stop_attempt=%s\n' "$attempt"
-              # shellcheck disable=SC2016
-              if ! powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("preflight_service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid"; then stopped=true; break; fi
+              cleanup_probe_log="$SERVICE_DIR/preflight-cleanup-probe-${attempt}.raw.log"
+              cleanup_probe_status=0
+              powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("preflight_service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid" > "$cleanup_probe_log" 2>&1 || cleanup_probe_status=$?
+              emit_private_evidence preflight-cleanup-probe "$cleanup_probe_log"
+              if [ "$cleanup_probe_status" -ne 0 ]; then stopped=true; break; fi
               sleep 1
             done
           else
@@ -318,7 +391,16 @@ jobs:
             fi
             attempt_dir="$HANDOFF_DIR/lease-response-attempt-$attempt"
             mkdir -p "$attempt_dir"
-            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${response_name}" | tee "$attempt_dir/poll.json"
+            api_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 181))
+            if [ "$api_remaining" -le 0 ]; then
+              printf 'lease response polling reached the cleanup reserve: remaining=%s\n' "$api_remaining" >&2
+              break
+            fi
+            api_timeout=30
+            if [ "$api_timeout" -gt "$api_remaining" ]; then api_timeout="$api_remaining"; fi
+            timeout --foreground --signal=TERM --kill-after=1s "${api_timeout}s" \
+              "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" "$api_timeout" artifact-poll "$attempt_dir/poll.json" \
+                "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${response_name}"
             if lease_workflow_run_id="$(python - "$attempt_dir/poll.json" "$response_name" <<'PY'
           import json, sys
           from pathlib import Path
@@ -330,7 +412,16 @@ jobs:
           print(run_id)
           PY
             )"; then
-              gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${lease_workflow_run_id}" | tee "$attempt_dir/lease-workflow-run.json"
+              api_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 181))
+              if [ "$api_remaining" -le 0 ]; then
+                printf 'lease workflow lookup reached the cleanup reserve: remaining=%s\n' "$api_remaining" >&2
+                break
+              fi
+              api_timeout=30
+              if [ "$api_timeout" -gt "$api_remaining" ]; then api_timeout="$api_remaining"; fi
+              timeout --foreground --signal=TERM --kill-after=1s "${api_timeout}s" \
+                "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" "$api_timeout" lease-workflow-run "$attempt_dir/lease-workflow-run.json" \
+                  "repos/${GITHUB_REPOSITORY}/actions/runs/${lease_workflow_run_id}"
               python - "$attempt_dir/lease-workflow-run.json" "$lease_workflow_run_id" "$expected_title" <<'PY'
           import json, os, sys
           from pathlib import Path
@@ -367,13 +458,16 @@ jobs:
           import json, os, re, sys
           from pathlib import Path
           value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          expected = {"schema": 1, "kind": "dobbyvpn.render-lease", "run_id": os.environ["LEASE_RUN_ID"], "platform": "windows", "image_digest": os.environ["SERVER_IMAGE_DIGEST"], "state": "issued"}
+          expected = {"schema": 1, "kind": "dobbyvpn.render-lease", "run_id": os.environ["LEASE_RUN_ID"], "platform": "windows", "source_sha": os.environ["SOURCE_SHA"], "image_digest": os.environ["SERVER_IMAGE_DIGEST"], "state": "issued"}
           for key, wanted in expected.items():
               if value.get(key) != wanted: raise SystemExit(f"lease field {key} is invalid")
           if not re.fullmatch(r"srv-[A-Za-z0-9][A-Za-z0-9_-]{1,99}", str(value.get("service_id"))): raise SystemExit("lease service id is invalid")
           print("lease_record=validated")
           PY
-          openssl cms -decrypt -binary -inform DER -in "$LEASE_RESPONSE_DIR/profile.cms" \
+          openssl_timeout=$((RUN_DEADLINE_EPOCH - $(date +%s) - 1))
+          if [ "$openssl_timeout" -le 0 ]; then printf "%s\n" "profile decryption reached the hard workflow deadline" >&2; exit 1; fi
+          if [ "$openssl_timeout" -gt 60 ]; then openssl_timeout=60; fi
+          timeout --foreground --signal=TERM --kill-after=1s "${openssl_timeout}s" openssl cms -decrypt -binary -inform DER -in "$LEASE_RESPONSE_DIR/profile.cms" \
             -recip "$HANDOFF_DIR/recipient.crt" -inkey "$HANDOFF_DIR/recipient.key" -out "$HANDOFF_DIR/profile.toml"
           chmod 600 "$HANDOFF_DIR/profile.toml"
           test -s "$HANDOFF_DIR/profile.toml"
@@ -382,6 +476,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
+          emit_private_evidence() {
+            label="$1"
+            file="$2"
+            if [ -f "$file" ]; then
+              bytes="$(wc -c < "$file" | tr -d '[:space:]')"
+              digest="$(sha256sum "$file" | awk '{print $1}')"
+              evidence_id="$(printf '%s:%s' "$GITHUB_RUN_ID" "$label" | sha256sum | cut -c1-16)"
+              printf 'diagnostic_evidence label=%s id=%s bytes=%s sha256=%s\n' \
+                "$label" "$evidence_id" "$bytes" "$digest"
+            else
+              printf 'diagnostic_evidence label=%s state=missing\n' "$label"
+            fi
+          }
           # These single-quoted commands are interpreted by PowerShell, not Bash.
           # This is the second start: all Render credential-bearing operations have finished.
           # shellcheck disable=SC2016
@@ -401,22 +509,43 @@ jobs:
             printf 'service_readiness_attempt=%s\n' "$attempt"
             remaining=$((RUN_DEADLINE_EPOCH - $(date +%s)))
             if [ "$remaining" -le 180 ]; then printf 'service readiness reached cleanup reserve: remaining=%s\n' "$remaining" >&2; exit 1; fi
-            # shellcheck disable=SC2016
-            if ! powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid"; then
-              printf 'candidate service exited before readiness\n' >&2; cat "$service_log" "$service_err"; exit 1
+            probe_log="$SERVICE_DIR/service-probe-${attempt}.raw.log"
+            probe_status=0
+            powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid" > "$probe_log" 2>&1 || probe_status=$?
+            if [ "$probe_status" -ne 0 ]; then
+              emit_private_evidence service-probe "$probe_log"
+              emit_private_evidence service-log "$service_log"
+              emit_private_evidence service-error "$service_err"
+              printf 'service_readiness=failed code=SERVICE_EXITED status=%s\n' "$probe_status" >&2
+              exit 1
             fi
-            # shellcheck disable=SC2016
-            if powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$c=Test-NetConnection -ComputerName 127.0.0.1 -Port 50051; Write-Output $c; if ($c.TcpTestSucceeded) { exit 0 }; exit 1'; then ready=true; break; fi
+            network_probe_log="$SERVICE_DIR/network-probe-${attempt}.raw.log"
+            network_probe_status=0
+            powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$c=Test-NetConnection -ComputerName 127.0.0.1 -Port 50051; Write-Output $c; if ($c.TcpTestSucceeded) { exit 0 }; exit 1' > "$network_probe_log" 2>&1 || network_probe_status=$?
+            if [ "$network_probe_status" -eq 0 ]; then ready=true; break; fi
+            emit_private_evidence network-probe "$network_probe_log"
             sleep 1
           done
-          if [ "$ready" != true ]; then printf 'candidate service did not open loopback control port\n' >&2; cat "$service_log" "$service_err"; exit 1; fi
+          if [ "$ready" != true ]; then
+            emit_private_evidence service-readiness-timeout "$service_log"
+            emit_private_evidence service-error-timeout "$service_err"
+            printf 'service_readiness=failed code=CONTROL_PORT_TIMEOUT\n' >&2
+            exit 1
+          fi
           control_token="$PROGRAMDATA/DobbyVPN/control.token"
           test -s "$control_token"
           token_value="$(tr -d '\r\n' < "$control_token")"
           [[ "$token_value" =~ ^[0-9a-fA-F]{64}$ ]]
-          printf 'control_token_ready=1 path=%s bytes=%s\n' "$control_token" "${#token_value}"
-          "$GITHUB_WORKSPACE/candidate/dobby-cli.exe" status | tee "$SERVICE_DIR/control-status.raw.log"
-          printf 'service_ready_for_functional_run=true pid=%s service_control_address=%s\n' "$service_pid" "$SERVICE_CONTROL_ADDRESS"
+          printf 'control_token_ready=1\n'
+          status_log="$SERVICE_DIR/control-status.raw.log"
+          status_code=0
+          "$GITHUB_WORKSPACE/candidate/dobby-cli.exe" status > "$status_log" 2>&1 || status_code=$?
+          emit_private_evidence control-status "$status_log"
+          if [ "$status_code" -ne 0 ]; then
+            printf 'control_status=failed code=CLI_STATUS status=%s\n' "$status_code" >&2
+            exit "$status_code"
+          fi
+          printf 'service_ready_for_functional_run=true\n'
 
       - name: Run canonical Windows functional scenarios
         id: functional
@@ -431,6 +560,7 @@ jobs:
           python -m torturer_checks.hosted.deadline --timeout-seconds "$remaining" --kill-grace-seconds 30 \
             python -m torturer_checks.hosted.run --platform windows --cli "$GITHUB_WORKSPACE/candidate/dobby-cli.exe" \
             --profile "$HANDOFF_DIR/profile.toml" --source-repository "$SOURCE_REPOSITORY" --source-sha "$SOURCE_SHA" \
+            --platform-version "windows-2022" \
             --candidate-manifest "$GITHUB_WORKSPACE/candidate/manifest.json" --server-image-digest "$SERVER_IMAGE_DIGEST" --output "$RESULT_PATH" \
             --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" --download-url "https://proof.ovh.net/files/1Mb.dat" \
             --upload-url "https://speed.cloudflare.com/__up" --service-pid "$SERVICE_PID" --service-binary "$SERVICE_BINARY" \
@@ -441,19 +571,46 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
+          emit_private_evidence() {
+            label="$1"
+            file="$2"
+            if [ -f "$file" ]; then
+              bytes="$(wc -c < "$file" | tr -d '[:space:]')"
+              digest="$(sha256sum "$file" | awk '{print $1}')"
+              evidence_id="$(printf '%s:%s' "$GITHUB_RUN_ID" "$label" | sha256sum | cut -c1-16)"
+              printf 'diagnostic_evidence label=%s id=%s bytes=%s sha256=%s\n' \
+                "$label" "$evidence_id" "$bytes" "$digest"
+            else
+              printf 'diagnostic_evidence label=%s state=missing\n' "$label"
+            fi
+          }
           # These single-quoted commands are interpreted by PowerShell, not Bash.
           # shellcheck disable=SC2016
           service_pid="${SERVICE_PID:-}"
           if [ -f "${SERVICE_PID_FILE:-}" ]; then service_pid="$(cat "$SERVICE_PID_FILE")"; fi
           case "$service_pid" in "") exit 0;; 0|*[!0-9]*) printf 'invalid cleanup pid=%s\n' "$service_pid" >&2; exit 1;; esac
-          # shellcheck disable=SC2016
-          if powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid"; then
-            taskkill.exe /PID "$service_pid" /T /F
+          cleanup_probe_log="$SERVICE_DIR/cleanup-probe-initial.raw.log"
+          cleanup_probe_status=0
+          powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid" > "$cleanup_probe_log" 2>&1 || cleanup_probe_status=$?
+          emit_private_evidence cleanup-probe "$cleanup_probe_log"
+          if [ "$cleanup_probe_status" -eq 0 ]; then
+            taskkill_log="$SERVICE_DIR/taskkill.raw.log"
+            taskkill_status=0
+            taskkill.exe /PID "$service_pid" /T /F > "$taskkill_log" 2>&1 || taskkill_status=$?
+            emit_private_evidence taskkill "$taskkill_log"
+            if [ "$taskkill_status" -ne 0 ]; then
+              printf 'service_cleanup=failed code=TASKKILL status=%s\n' "$taskkill_status" >&2
+              exit "$taskkill_status"
+            fi
             stopped=false
             for attempt in $(seq 1 30); do
               printf 'service_cleanup_attempt=%s\n' "$attempt"
-              # shellcheck disable=SC2016
-              if ! powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid"; then stopped=true; break; fi
+              cleanup_probe_log="$SERVICE_DIR/cleanup-probe-${attempt}.raw.log"
+              cleanup_probe_status=0
+              powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid" > "$cleanup_probe_log" 2>&1 || cleanup_probe_status=$?
+              emit_private_evidence cleanup-probe "$cleanup_probe_log"
+              if [ "$cleanup_probe_status" -ne 0 ]; then stopped=true; break; fi
               sleep 1
             done
             test "$stopped" = true
@@ -505,21 +662,31 @@ jobs:
       actions: write
     env:
       PLATFORM: windows
+      SOURCE_SHA: ${{ inputs.commit_sha }}
       TORTURER_SHA: ${{ github.sha }}
       SERVER_IMAGE_DIGEST: ${{ vars.RENDER_IMAGE_DIGEST }}
 
     steps:
+      - name: Check out exact trusted Torturer output helper
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: DobbyVPN/Torturer
+          ref: ${{ github.sha }}
+          path: torturer
+          persist-credentials: false
+
       - name: Validate controller inputs
         run: |
-          set -euo pipefail
+         set -euo pipefail
           [[ "$TORTURER_SHA" =~ ^[0-9a-f]{40}$ ]]
+         [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SERVER_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           printf 'controller_inputs=validated platform=%s\n' "$PLATFORM"
 
       - name: Derive one origin and Windows lease correlation
         run: |
           set -euo pipefail
-          lease_run_id="$(printf '%s:%s:%s:%s' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PLATFORM" "$TORTURER_SHA" | sha256sum | cut -c1-32)"
+          lease_run_id="$(printf '%s:%s:%s:%s:%s' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PLATFORM" "$TORTURER_SHA" "$SOURCE_SHA" | sha256sum | cut -c1-32)"
           printf 'LEASE_RUN_ID=%s\nREQUEST_ARTIFACT_NAME=render-request-%s-%s\n' "$lease_run_id" "$lease_run_id" "$PLATFORM" >> "$GITHUB_ENV"
 
       - name: Wait for Windows client request artifact
@@ -528,10 +695,28 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/controller"
+          "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" 30 controller-run "$RUNNER_TEMP/controller/controller-run.json" \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          python - "$RUNNER_TEMP/controller/controller-run.json" <<'PY'
+          import datetime, json, os, sys
+          from pathlib import Path
+          run = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if run.get("id") != int(os.environ["GITHUB_RUN_ID"]): raise SystemExit("controller run identity mismatch")
+          started = datetime.datetime.fromisoformat(run["run_started_at"].replace("Z", "+00:00"))
+          deadline = int(started.timestamp()) + 30 * 60
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as env: env.write(f"CONTROLLER_DEADLINE_EPOCH={deadline}\n")
+          print(f"controller_deadline_epoch={deadline}")
+          PY
           found=false
           for attempt in $(seq 1 360); do
+            remaining=$((CONTROLLER_DEADLINE_EPOCH - $(date +%s) - 120))
+            if [ "$remaining" -le 1 ]; then printf 'controller request wait reached finalization reserve: remaining=%s\n' "$remaining" >&2; break; fi
             response="$RUNNER_TEMP/controller/request-${attempt}.json"
-            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${REQUEST_ARTIFACT_NAME}" | tee "$response"
+            api_timeout=30
+            if [ "$api_timeout" -gt "$((remaining - 1))" ]; then api_timeout="$((remaining - 1))"; fi
+            timeout --foreground --signal=TERM --kill-after=1s "${api_timeout}s" \
+              "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" "$api_timeout" request-artifact-poll "$response" \
+                "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${REQUEST_ARTIFACT_NAME}"
             if python - "$response" "$GITHUB_RUN_ID" "$REQUEST_ARTIFACT_NAME" <<'PY'
           import json, sys
           from pathlib import Path
@@ -541,7 +726,11 @@ jobs:
           PY
             then found=true; break; fi
             printf 'request_artifact_attempt=%s status=pending\n' "$attempt"
-            sleep 5
+            sleep_seconds=5
+            remaining=$((CONTROLLER_DEADLINE_EPOCH - $(date +%s) - 120))
+            if [ "$remaining" -le 0 ]; then break; fi
+            if [ "$sleep_seconds" -gt "$remaining" ]; then sleep_seconds="$remaining"; fi
+            sleep "$sleep_seconds"
           done
           test "$found" = true
 
@@ -550,8 +739,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh api --method POST "repos/${GITHUB_REPOSITORY}/actions/workflows/server-lease.yml/dispatches" \
+          remaining=$((CONTROLLER_DEADLINE_EPOCH - $(date +%s) - 1))
+          if [ "$remaining" -le 0 ]; then printf '%s\n' 'controller dispatch reached the hard workflow deadline' >&2; exit 1; fi
+          dispatch_timeout=30
+          if [ "$dispatch_timeout" -gt "$remaining" ]; then dispatch_timeout="$remaining"; fi
+          "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" "$dispatch_timeout" lease-dispatch "$RUNNER_TEMP/controller/lease-dispatch.json" \
+            --method POST "repos/${GITHUB_REPOSITORY}/actions/workflows/server-lease.yml/dispatches" \
             -f "ref=${GITHUB_REF_NAME}" -f "inputs[mode]=acquire" -f "inputs[origin_run_id]=${GITHUB_RUN_ID}" \
             -f "inputs[origin_run_attempt]=${GITHUB_RUN_ATTEMPT}" -f "inputs[origin_torturer_sha]=${TORTURER_SHA}" \
+            -f "inputs[origin_source_sha]=${SOURCE_SHA}" \
             -f "inputs[origin_workflow_path]=.github/workflows/functional-windows.yml" -f "inputs[lease_run_id]=${LEASE_RUN_ID}" \
             -f "inputs[platform]=${PLATFORM}" -f "inputs[request_artifact_name]=${REQUEST_ARTIFACT_NAME}" -f "inputs[trusted_ref]=${GITHUB_REF_NAME}"

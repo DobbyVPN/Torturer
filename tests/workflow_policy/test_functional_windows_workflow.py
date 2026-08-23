@@ -140,6 +140,15 @@ class FunctionalWindowsWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("Prove Windows runner architecture and elevation", self.text)
         self.assertIn("is_administrator=", self.text)
         self.assertIn("control_token_ready=1", self.text)
+        self.assertIn("emit_private_evidence", self.text)
+        self.assertGreaterEqual(self.text.count("umask 077"), 4)
+        self.assertNotIn('cat "$service_log"', self.text)
+        self.assertNotIn('cat "$service_err"', self.text)
+        self.assertNotIn('| tee "$SERVICE_DIR/preflight-control-status.raw.log"', self.text)
+        self.assertNotIn('| tee "$SERVICE_DIR/control-status.raw.log"', self.text)
+        self.assertIn('taskkill.exe /PID "$service_pid" /T /F > "$taskkill_log" 2>&1', self.text)
+        self.assertIn('emit_private_evidence preflight-taskkill "$taskkill_log"', self.text)
+        self.assertIn('emit_private_evidence taskkill "$taskkill_log"', self.text)
 
 
 if __name__ == "__main__":

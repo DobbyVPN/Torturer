@@ -28,7 +28,8 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("deadline = int(started.timestamp()) + 30 * 60", self.text)
         self.assertIn("RUN_DEADLINE_EPOCH", self.text)
         self.assertIn("RUN_DEADLINE_EPOCH - $(date +%s) - 120", self.text)
-        self.assertIn('timeout --foreground --signal=TERM --kill-after=30s "${remaining}s"', self.text)
+        self.assertIn("torturer_checks.hosted.deadline", self.text)
+        self.assertIn('--timeout-seconds "$remaining" --kill-grace-seconds 30', self.text)
         self.assertIn("PLATFORM: linux", self.text)
 
     def test_linux_lane_runs_every_applicable_canonical_scenario(self) -> None:
@@ -39,10 +40,19 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         for option in (
             "--download-url", "--upload-url", "--service-pid",
             "--service-binary", "--service-socket", "--service-library-path",
-            "--service-pid-file",
+            "--service-pid-file", "--network-interface",
         ):
             self.assertIn(option, block)
-        self.assertNotIn("--network-interface", block)
+        discovery = self.text.index("- name: Discover physical default-route interface for network transition")
+        self.assertLess(discovery, start)
+        discovery_block = self.text[discovery:start]
+        self.assertIn("ip -o route show table main default", discovery_block)
+        self.assertIn('NETWORK_INTERFACE=%s\\n', discovery_block)
+        self.assertIn('ip link show dev "$network_interface"', discovery_block)
+        self.assertIn('timeout --foreground --signal=TERM --kill-after=1s 10s', discovery_block)
+        self.assertNotIn("> /dev/null", discovery_block)
+        self.assertNotIn("2> /dev/null", discovery_block)
+        self.assertIn('--network-interface "$NETWORK_INTERFACE"', block)
         self.assertIn('--download-url "https://proof.ovh.net/files/1Mb.dat"', block)
         self.assertNotRegex(block, r'--(?:download|upload)-url\s+"[^"\n]*[?#]')
         self.assertNotIn("speed.cloudflare.com/__down?", block)
@@ -93,7 +103,8 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertNotIn("github.token", runtime)
         controller = self.text[self.text.index("\n\n  controller:"):]
         self.assertIn("actions: write", controller)
-        self.assertNotIn("actions/checkout", controller)
+        self.assertEqual(controller.count("actions/checkout"), 1)
+        self.assertIn("repository: DobbyVPN/Torturer", controller)
         self.assertNotIn("desktop_build.py", controller)
         self.assertIn("Dispatch exactly one trusted Render lease", controller)
 
@@ -133,7 +144,7 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertIn('--candidate-manifest "$GITHUB_WORKSPACE/candidate/manifest.json"', self.text)
         self.assertIn("render-complete-${{ env.LEASE_RUN_ID }}-linux", self.text)
         self.assertIn("actual_exe=", self.text)
-        self.assertIn("candidate service left child processes", self.text)
+        self.assertIn("candidate_service_cleanup=failed code=CHILD_PROCESSES", self.text)
 
 
     def test_service_pid_is_exact_and_cleanup_tracks_restarts(self) -> None:
@@ -163,6 +174,14 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
 
     def test_diagnostic_suppression_is_not_added(self) -> None:
         self.assertNotRegex(self.text, r">\s*/dev/null|2>\s*/dev/null|--quiet(?:\s|$)")
+        self.assertIn("emit_private_evidence", self.text)
+        self.assertIn("umask 077", self.text[self.text.index("- name: Start the candidate Linux service"):])
+        self.assertNotIn('sudo -n cat "$service_log"', self.text)
+        self.assertNotIn('sudo -n ps -o pid,ppid,uid,gid,state,etime,args -p "$service_pid"\n', self.text)
+        stop = self.text.index("- name: Stop candidate service and verify process cleanup")
+        cleanup = self.text[stop:]
+        self.assertIn('ps -eo pid=,ppid=,args= > "$children_snapshot" 2>&1', cleanup)
+        self.assertIn('emit_private_evidence service-children "$children_snapshot"', cleanup)
 
 
 if __name__ == "__main__":

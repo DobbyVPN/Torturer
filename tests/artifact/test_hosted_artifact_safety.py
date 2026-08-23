@@ -5,11 +5,13 @@ import json
 from pathlib import Path
 import stat
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from urllib.request import Request
 import zipfile
 
+import torturer_checks.hosted.artifacts as artifacts
 from torturer_checks.hosted.artifacts import (
     ArtifactDownloadError,
     _CredentialSafeRedirectHandler,
@@ -41,6 +43,72 @@ class HostedArtifactSafetyTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_get_has_true_total_deadline_for_slow_chunk(self) -> None:
+        class SlowChunkResponse:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                self.close()
+
+            def read(self, _size: int) -> bytes:
+                while not self.closed:
+                    time.sleep(0.01)
+                return b""
+
+            def close(self) -> None:
+                self.closed = True
+
+        response = SlowChunkResponse()
+        started = time.monotonic()
+        with patch.dict("os.environ", {"GH_TOKEN": "synthetic-token"}), patch(
+            "torturer_checks.hosted.artifacts._OPENER.open", return_value=response
+        ) as opener:
+            with self.assertRaisesRegex(ArtifactDownloadError, "ARTIFACT_TRANSFER_TIMEOUT"):
+                artifacts._get("https://api.github.com/synthetic", timeout_seconds=0.05)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.5)
+        self.assertTrue(response.closed)
+        self.assertLessEqual(opener.call_args.kwargs["timeout"], 0.05)
+
+    def test_download_has_one_aggregate_deadline_for_list_download_extract(self) -> None:
+        archive = _zip([("manifest.json", b"{}", stat.S_IFREG)])
+        deadlines: list[float] = []
+        calls = 0
+
+        def slow_get(_url: str, *, deadline: float | None = None, **_kwargs: object) -> bytes:
+            nonlocal calls
+            calls += 1
+            self.assertIsNotNone(deadline)
+            assert deadline is not None
+            deadlines.append(deadline)
+            time.sleep(0.02)
+            if time.monotonic() >= deadline:
+                raise ArtifactDownloadError("ARTIFACT_TRANSFER_TIMEOUT")
+            return self.listing if calls == 1 else archive
+
+        def slow_extract(*_args: object, **_kwargs: object) -> None:
+            time.sleep(0.2)
+
+        started = time.monotonic()
+        with patch("torturer_checks.hosted.artifacts._get", side_effect=slow_get), patch(
+            "torturer_checks.hosted.artifacts._extract", side_effect=slow_extract
+        ):
+            with self.assertRaisesRegex(ArtifactDownloadError, "ARTIFACT_TRANSFER_TIMEOUT"):
+                download_artifact(
+                    repository="o/r", artifact_name="candidate", run_id=77,
+                    output_dir=self.root / "out", expected_files=("manifest.json",),
+                    metadata_path=self.root / "listing.json", archive_path=self.root / "archive.zip",
+                    timeout_seconds=0.1,
+                )
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.2)
+        self.assertEqual(calls, 2)
+        self.assertEqual(len(set(deadlines)), 1)
 
     def _download(self, archive: bytes, *, output: Path | None = None, expected: tuple[str, ...] = ("manifest.json",)) -> None:
         with patch("torturer_checks.hosted.artifacts._get", side_effect=[self.listing, archive]):
@@ -125,7 +193,8 @@ class HostedArtifactSafetyTests(unittest.TestCase):
         self.assertFalse((mixed_output / "manifest.json").exists())
 
     def test_duplicate_zip_members_are_rejected_before_writes(self) -> None:
-        duplicate = _zip([("manifest.json", b"one", stat.S_IFREG), ("manifest.json", b"two", stat.S_IFREG)])
+        with self.assertWarnsRegex(UserWarning, "Duplicate name"):
+            duplicate = _zip([("manifest.json", b"one", stat.S_IFREG), ("manifest.json", b"two", stat.S_IFREG)])
         with patch("torturer_checks.hosted.artifacts._get", side_effect=[self.listing, duplicate]):
             with self.assertRaisesRegex(ArtifactDownloadError, "duplicate members"):
                 self._download(duplicate)
@@ -158,6 +227,37 @@ class HostedArtifactSafetyTests(unittest.TestCase):
         self.assertIsNone(redirected.get_header("Authorization"))
         self.assertIsNone(redirected.get_header("X-Github-Api-Version"))
         self.assertEqual(redirected.get_header("Accept"), "application/vnd.github+json")
+
+    def test_cli_public_output_contains_only_opaque_archive_metadata(self) -> None:
+        archive = self.root / "archive.zip"
+        archive.write_bytes(b"private archive bytes")
+        with patch(
+            "torturer_checks.hosted.artifacts.download_artifact",
+            return_value={
+                "name": "private-artifact-name",
+                "run_id": 987654,
+                "files": ["private-member.json"],
+            },
+        ), patch("sys.stdout", new_callable=io.StringIO) as output:
+            result = artifacts.main(
+                [
+                    "--repository", "o/r",
+                    "--artifact-name", "private-artifact-name",
+                    "--run-id", "987654",
+                    "--output-dir", str(self.root / "out"),
+                    "--metadata", str(self.root / "metadata.json"),
+                    "--archive", str(archive),
+                    "--expect-file", "private-member.json",
+                ]
+            )
+        self.assertEqual(result, 0)
+        rendered = output.getvalue()
+        self.assertIn("artifact-download", rendered)
+        self.assertRegex(rendered, r"id=[0-9a-f]{32}")
+        self.assertRegex(rendered, r"archive_bytes=21")
+        self.assertNotIn("private-artifact-name", rendered)
+        self.assertNotIn("987654", rendered)
+        self.assertNotIn("private-member.json", rendered)
 
     def test_redirect_refuses_https_downgrade(self) -> None:
         request = Request(

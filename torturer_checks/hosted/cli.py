@@ -10,6 +10,7 @@ folder for the duration of a trusted job; only canonical results are emitted.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import ipaddress
 import json
 import os
@@ -18,6 +19,7 @@ import re
 import signal
 import stat
 import subprocess
+import threading
 import time
 from typing import Protocol, Sequence
 from urllib.parse import urlparse
@@ -29,6 +31,29 @@ from torturer_contract.functional.scenarios import ScenarioStep
 
 
 _MIN_ENDURANCE_SAMPLE_SECONDS = 5.0
+_DEFAULT_CLEANUP_RESERVE_SECONDS = 5.0
+_MIN_PROCESS_CLEANUP_SECONDS = 0.01
+_PROCESS_REAP_RESERVE_SECONDS = 0.05
+
+
+def _opaque_evidence_id() -> str:
+    """Return a schema-safe opaque id with no ordinal or filename meaning."""
+
+    return "e" + uuid.uuid4().hex[:31]
+
+
+def _remaining_until(deadline: float, *, cap: float | None = None) -> float:
+    """Return time left without manufacturing a post-deadline minimum."""
+
+    remaining = max(0.0, deadline - time.monotonic())
+    return remaining if cap is None else min(remaining, max(0.0, cap))
+
+
+def _current_uid() -> int | None:
+    """Return the POSIX owner id when the host exposes one."""
+
+    getter = getattr(os, "getuid", None)
+    return int(getter()) if getter is not None else None
 
 
 class HostedAdapterError(RuntimeError):
@@ -58,13 +83,90 @@ class CommandRunner(Protocol):
     def run(self, command: Sequence[str], *, timeout_seconds: float) -> CommandResult: ...
 
 
+def _ensure_owner_only_directory(path: Path) -> None:
+    """Create and validate a private evidence directory without following links.
+
+    Evidence must be private at the directory boundary.  Existing ancestors
+    are inspected with ``lstat`` so a user-controlled symlink or non-directory
+    cannot be silently followed by ``mkdir(parents=True)``.  A sticky system
+    directory such as ``/tmp`` is an acceptable *outer* parent; the evidence
+    directory itself and any user-owned parent must still be owner-only.
+    """
+
+    if not path.is_absolute():
+        raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
+    missing: list[Path] = []
+    cursor = path
+    while True:
+        try:
+            info = cursor.lstat()
+        except FileNotFoundError:
+            missing.append(cursor)
+            if cursor == cursor.parent:
+                raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
+            cursor = cursor.parent
+            continue
+        except OSError as error:
+            raise HostedAdapterError("EVIDENCE_PATH_UNSAFE") from error
+        if cursor.is_symlink() or not stat.S_ISDIR(info.st_mode):
+            raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
+        break
+
+    current_uid = _current_uid()
+    for directory in reversed(missing):
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            pass
+        try:
+            info = directory.lstat()
+        except OSError as error:
+            raise HostedAdapterError("EVIDENCE_PATH_UNSAFE") from error
+        if directory.is_symlink() or not stat.S_ISDIR(info.st_mode):
+            raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
+        if current_uid is not None and info.st_uid != current_uid:
+            raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
+        os.chmod(directory, 0o700)
+
+    try:
+        info = path.lstat()
+        parent_info = path.parent.lstat()
+    except OSError as error:
+        raise HostedAdapterError("EVIDENCE_PATH_UNSAFE") from error
+    if (
+        path.is_symlink()
+        or not stat.S_ISDIR(info.st_mode)
+        or current_uid is not None and info.st_uid != current_uid
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
+    if path.parent.is_symlink() or not stat.S_ISDIR(parent_info.st_mode):
+        raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
+    parent_mode = stat.S_IMODE(parent_info.st_mode)
+    parent_is_sticky = bool(parent_mode & stat.S_ISVTX)
+    if current_uid is not None and parent_info.st_uid != current_uid and not parent_is_sticky:
+        raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
+    if parent_mode & 0o077 and not parent_is_sticky:
+        raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
+    os.chmod(path, 0o700)
+
+
 class SubprocessRunner:
     """Execute argument vectors and retain complete output in a private folder."""
 
-    def __init__(self, raw_directory: Path) -> None:
+    def __init__(
+        self,
+        raw_directory: Path,
+        *,
+        cleanup_reserve_seconds: float = _DEFAULT_CLEANUP_RESERVE_SECONDS,
+    ) -> None:
+        if cleanup_reserve_seconds <= 0:
+            raise HostedAdapterError("INVALID_CLEANUP_RESERVE")
         self.raw_directory = raw_directory
-        self.raw_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(self.raw_directory, 0o700)
+        _ensure_owner_only_directory(self.raw_directory)
+        self.cleanup_reserve_seconds = float(cleanup_reserve_seconds)
         self._sequence = 0
         self._evidence: list[dict[str, object]] = []
 
@@ -74,6 +176,19 @@ class SubprocessRunner:
         argv = tuple(command)
         self._sequence += 1
         started = time.monotonic()
+        # The supplied command timeout is the complete lane budget for this
+        # invocation.  Reserve a bounded tail for tree termination, output
+        # draining, and proof; a timeout must never start an unbounded second
+        # wait after the functional deadline has expired.
+        cleanup_reserve = min(
+            self.cleanup_reserve_seconds,
+            max(_MIN_PROCESS_CLEANUP_SECONDS, timeout_seconds / 2.0),
+        )
+        deadline = started + timeout_seconds
+        work_timeout = _remaining_until(
+            deadline,
+            cap=max(0.0, timeout_seconds - cleanup_reserve),
+        )
         try:
             process = subprocess.Popen(
                 list(argv),
@@ -81,52 +196,165 @@ class SubprocessRunner:
                 stderr=subprocess.PIPE,
                 **_process_group_kwargs(),
             )
-            stdout, stderr = process.communicate(timeout=timeout_seconds)
+            snapshot_provider = _ProcessSnapshotProvider()
+            monitor = _ProcessTreeMonitor(process.pid, snapshot_provider)
+            monitor.start()
+            stdout, stderr = process.communicate(timeout=work_timeout)
+            monitor_stopped = monitor.stop(
+                _remaining_until(deadline, cap=cleanup_reserve)
+            )
+            tree_diagnostics, tree_status = _finish_process_tree(
+                process,
+                monitor.identities,
+                _remaining_until(deadline),
+                monitor_complete=monitor_stopped,
+                snapshot_provider=snapshot_provider,
+            )
+            tree_diagnostics += snapshot_provider.diagnostics
             result = CommandResult(argv, process.returncode, stdout, stderr)
+            self._retain(result, time.monotonic() - started, tree_diagnostics)
+            if time.monotonic() > deadline:
+                self._evidence[-1]["deadline_exceeded"] = True
+                raise HostedAdapterError("COMMAND_DEADLINE_EXCEEDED")
+            if tree_status != "gone":
+                raise HostedAdapterError("PROCESS_TREE_UNPROVEN")
+            return result
         except subprocess.TimeoutExpired as error:
             partial_stdout = _output_bytes(error.stdout)
             partial_stderr = _output_bytes(error.stderr)
-            kill_diagnostics = _kill_process_tree(process)
+            cleanup_deadline = deadline
+            # Every timeout cleanup phase shares one absolute deadline.  Keep
+            # an explicit tail exclusively for waitpid()/Popen reaping; a
+            # tree census or pipe drain must not consume the only interval in
+            # which the leader can be reaped without a ResourceWarning.
+            reap_reserve = min(_PROCESS_REAP_RESERVE_SECONDS, cleanup_reserve)
+            cleanup_work_deadline = max(
+                time.monotonic(), cleanup_deadline - reap_reserve,
+            )
+            monitor_stopped = monitor.stop(
+                _remaining_until(cleanup_work_deadline, cap=cleanup_reserve)
+            )
+            # Leave a small, explicit tail for reaping the Popen leader.  A
+            # process census can reach its deadline while the leader has
+            # already exited but has not yet been waitpid(2)-reaped; giving
+            # the tree killer the entire reserve would then leak a live
+            # Popen object and its final diagnostic warning.
+            tree_cleanup_timeout = _remaining_until(cleanup_work_deadline)
+            kill_diagnostics = _kill_process_tree(
+                process,
+                tree_cleanup_timeout,
+                identities=monitor.identities,
+                snapshot_provider=snapshot_provider,
+            )
+            kill_diagnostics += snapshot_provider.diagnostics
+            if not monitor_stopped:
+                kill_diagnostics += b"PROCESS_TREE_MONITOR_STOP_TIMEOUT=1\n"
+                kill_diagnostics += b"EVIDENCE_INCOMPLETE=1 reason=tree-monitor\n"
+            if b"PROCESS_TREE_STATUS=gone" not in kill_diagnostics:
+                kill_diagnostics += b"EVIDENCE_INCOMPLETE=1 reason=process-tree\n"
             try:
-                recovered_stdout, recovered_stderr = process.communicate(timeout=5)
+                recovered_stdout, recovered_stderr = process.communicate(
+                    timeout=_remaining_until(cleanup_work_deadline)
+                )
             except subprocess.TimeoutExpired as recovery_error:
-                kill_diagnostics += b"communicate-after-kill-timeout\n"
+                kill_diagnostics += b"OUTPUT_DRAIN_TIMEOUT=1\n"
+                kill_diagnostics += b"EVIDENCE_INCOMPLETE=1 reason=output-drain\n"
                 kill_diagnostics += _kill_process(process)
                 recovered_stdout = _output_bytes(recovery_error.stdout)
                 recovered_stderr = _output_bytes(recovery_error.stderr)
-                try:
-                    final_stdout, final_stderr = process.communicate(timeout=5)
-                except subprocess.TimeoutExpired as final_error:
-                    kill_diagnostics += b"communicate-after-second-kill-timeout\\n"
-                    recovered_stdout = _merge_output(
-                        recovered_stdout, _output_bytes(final_error.stdout)
-                    )
-                    recovered_stderr = _merge_output(
-                        recovered_stderr, _output_bytes(final_error.stderr)
-                    )
-                except OSError as final_error:
-                    kill_diagnostics += (
-                        b"communicate-after-final-kill-error="
-                        + repr(final_error).encode("utf-8", errors="replace")
-                        + b"\n"
-                    )
+                reaped, drained_stdout, drained_stderr, reap_notes = _bounded_reap_process(
+                    process, _remaining_until(cleanup_deadline, cap=reap_reserve)
+                )
+                recovered_stdout = _merge_output(recovered_stdout, drained_stdout)
+                recovered_stderr = _merge_output(recovered_stderr, drained_stderr)
+                kill_diagnostics += reap_notes
+                if not reaped:
+                    kill_diagnostics += b"PROCESS_REAP_TIMEOUT=1\n"
+                    kill_diagnostics += b"EVIDENCE_INCOMPLETE=1 reason=process-reap\n"
                 else:
-                    recovered_stdout = _merge_output(recovered_stdout, final_stdout)
-                    recovered_stderr = _merge_output(recovered_stderr, final_stderr)
+                    kill_diagnostics += b"PROCESS_REAP_STATUS=gone\n"
+                final_status = _tree_status(
+                    process.pid,
+                    _tracked_processes(process.pid, snapshot_provider),
+                    snapshot_provider,
+                )
+                kill_diagnostics += (
+                    b"PROCESS_TREE_FINAL_STATUS="
+                    + final_status.encode("ascii")
+                    + b"\n"
+                )
+                if final_status != "gone":
+                    kill_diagnostics += b"EVIDENCE_INCOMPLETE=1 reason=final-tree\n"
+            except OSError as recovery_error:
+                kill_diagnostics += (
+                    b"OUTPUT_DRAIN_ERROR="
+                    + repr(recovery_error).encode("utf-8", errors="replace")
+                    + b"\n"
+                )
+                recovered_stdout = b""
+                recovered_stderr = b""
+                reaped, drained_stdout, drained_stderr, reap_notes = _bounded_reap_process(
+                    process, _remaining_until(cleanup_deadline, cap=reap_reserve)
+                )
+                recovered_stdout = _merge_output(recovered_stdout, drained_stdout)
+                recovered_stderr = _merge_output(recovered_stderr, drained_stderr)
+                kill_diagnostics += reap_notes
+                if not reaped:
+                    kill_diagnostics += b"PROCESS_REAP_TIMEOUT=1\n"
+                    kill_diagnostics += b"EVIDENCE_INCOMPLETE=1 reason=process-reap\n"
+            # ``communicate`` normally reaps the leader, but a zero-length
+            # cleanup tail (or a race with a just-exiting leader) can leave a
+            # Popen object unreaped even after the process census says the
+            # tree is gone.  Close that gap with one final bounded reap.  A
+            # failed reap is evidence-incomplete; never turn it into an
+            # unbounded wait or silently let the Popen destructor report it.
+            if process.poll() is None:
+                kill_diagnostics += _kill_process(process)
+                reaped, drained_stdout, drained_stderr, reap_notes = _bounded_reap_process(
+                    process, _remaining_until(cleanup_deadline, cap=reap_reserve)
+                )
+                recovered_stdout = _merge_output(recovered_stdout, drained_stdout)
+                recovered_stderr = _merge_output(recovered_stderr, drained_stderr)
+                kill_diagnostics += reap_notes
+                if not reaped:
+                    kill_diagnostics += b"PROCESS_REAP_TIMEOUT=1\n"
+                    kill_diagnostics += b"EVIDENCE_INCOMPLETE=1 reason=process-reap\n"
+                else:
+                    kill_diagnostics += b"PROCESS_REAP_STATUS=gone\n"
             stdout = _merge_output(partial_stdout, recovered_stdout)
             stderr = _merge_output(partial_stderr, recovered_stderr)
             result = CommandResult(argv, 124, stdout, stderr, timed_out=True)
+            if time.monotonic() > deadline:
+                kill_diagnostics += b"COMMAND_DEADLINE_EXCEEDED=1\n"
             self._retain(result, time.monotonic() - started, kill_diagnostics)
+            if time.monotonic() > deadline:
+                self._evidence[-1]["deadline_exceeded"] = True
             raise HostedAdapterError("COMMAND_TIMEOUT")
         except OSError as error:
             self._retain_exception(argv, error, time.monotonic() - started)
             raise HostedAdapterError("COMMAND_UNAVAILABLE") from error
-        self._retain(result, time.monotonic() - started, b"")
+        self._retain(result, time.monotonic() - started, b"PROCESS_TREE_STATUS=gone\n")
         return result
 
     def safe_evidence(self) -> tuple[dict[str, object], ...]:
-        """Return diagnostics metadata without command arguments or payloads."""
-        return tuple(dict(item) for item in self._evidence)
+        """Return diagnostics metadata without private filenames or payloads."""
+        return tuple(
+            {key: value for key, value in item.items() if key != "evidence_file"}
+            for item in self._evidence
+        )
+
+    def retain_external_evidence(self, path: Path, *, evidence_kind: str) -> None:
+        """Publish metadata for a completed service-owned raw evidence file."""
+
+        evidence_bytes, evidence_sha256 = _evidence_metadata(path)
+        self._evidence.append({
+            "sequence": self._sequence,
+            "evidence_id": _opaque_evidence_id(),
+            "evidence_file": path.name,
+            "evidence_kind": evidence_kind,
+            "evidence_bytes": evidence_bytes,
+            "evidence_sha256": evidence_sha256,
+        })
 
     def _retain(
         self,
@@ -149,14 +377,18 @@ class SubprocessRunner:
             output.flush()
             os.fsync(output.fileno())
         os.chmod(path, 0o600)
+        evidence_bytes, evidence_sha256 = _evidence_metadata(path)
         self._evidence.append({
             "sequence": self._sequence,
+            "evidence_id": _opaque_evidence_id(),
             "evidence_file": path.name,
             "returncode": result.returncode,
             "timed_out": result.timed_out,
             "duration_ms": max(0, int(duration_seconds * 1000)),
             "stdout_bytes": len(result.stdout),
             "stderr_bytes": len(result.stderr),
+            "evidence_bytes": evidence_bytes,
+            "evidence_sha256": evidence_sha256,
         })
 
     def _retain_exception(self, command: Sequence[str], error: OSError, duration_seconds: float) -> None:
@@ -170,8 +402,10 @@ class SubprocessRunner:
             output.flush()
             os.fsync(output.fileno())
         os.chmod(path, 0o600)
+        evidence_bytes, evidence_sha256 = _evidence_metadata(path)
         self._evidence.append({
             "sequence": self._sequence,
+            "evidence_id": _opaque_evidence_id(),
             "evidence_file": path.name,
             "returncode": None,
             "timed_out": False,
@@ -179,29 +413,57 @@ class SubprocessRunner:
             "stdout_bytes": 0,
             "stderr_bytes": 0,
             "exception": type(error).__name__,
+            "evidence_bytes": evidence_bytes,
+            "evidence_sha256": evidence_sha256,
         })
 
     def _allocate_evidence(self, label: str, suffix: str) -> tuple[Path, int]:
         """Reserve a fresh evidence file without ever replacing an old one."""
 
-        base = self.raw_directory / f"{label}{suffix}"
-        candidates = (base,)
         for _ in range(100):
-            for path in candidates:
-                try:
-                    descriptor = os.open(
-                        path,
-                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                        0o600,
-                    )
-                except FileExistsError:
-                    continue
-                os.fchmod(descriptor, 0o600)
-                return path, descriptor
-            candidates = (
-                self.raw_directory / f"{label}-{uuid.uuid4().hex}{suffix}",
-            )
+            path = self.raw_directory / f"{label}-{uuid.uuid4().hex}{suffix}"
+            try:
+                descriptor = os.open(
+                    path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                continue
+            os.fchmod(descriptor, 0o600)
+            return path, descriptor
         raise HostedAdapterError("EVIDENCE_UNAVAILABLE")
+
+
+def _evidence_metadata(path: Path) -> tuple[int, str]:
+    """Hash one retained raw file after validating its private inode."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        current_uid = _current_uid()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_IMODE(info.st_mode) & 0o077
+            or current_uid is not None and info.st_uid != current_uid
+        ):
+            raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            raise HostedAdapterError("EVIDENCE_FSYNC_FAILED") from error
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            digest.update(chunk)
+        return total, digest.hexdigest()
+    finally:
+        os.close(descriptor)
 
 
 def _output_bytes(value: bytes | str | None) -> bytes:
@@ -229,6 +491,451 @@ def _process_group_kwargs() -> dict[str, int | bool]:
     return {"start_new_session": True}
 
 
+@dataclass(frozen=True)
+class _ProcessIdentity:
+    pid: int
+    start_time: str
+    process_group: int | None = None
+
+
+class _ProcessTreeMonitor:
+    """Continuously retain process identities before a leader can disappear."""
+
+    def __init__(
+        self,
+        root_pid: int,
+        snapshot_provider: _ProcessSnapshotProvider | None = None,
+    ) -> None:
+        self.root_pid = root_pid
+        self.snapshot_provider = snapshot_provider
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._seen: dict[tuple[int, str], _ProcessIdentity] = {}
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"dobbyvpn-process-tree-{root_pid}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._sample()
+        self._thread.start()
+
+    def _sample(self) -> None:
+        for identity in _tracked_processes(self.root_pid, self.snapshot_provider):
+            with self._lock:
+                self._seen[(identity.pid, identity.start_time)] = identity
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._sample()
+            self._stop.wait(0.005)
+
+    def stop(self, timeout: float) -> bool:
+        self._stop.set()
+        self._thread.join(timeout=max(0.0, timeout))
+        return not self._thread.is_alive()
+
+    @property
+    def identities(self) -> tuple[_ProcessIdentity, ...]:
+        with self._lock:
+            return tuple(self._seen.values())
+
+
+def _proc_stat(pid: int) -> tuple[int, int, str, str] | None:
+    """Read one Linux process identity without treating a vanished PID as live."""
+
+    try:
+        value = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        _comm, fields = value.rsplit(") ", 1)
+        columns = fields.split()
+        # After the closing parenthesis: state=0, ppid=1, pgrp=2,
+        # starttime=19.  The start time prevents a reused PID from being
+        # mistaken for the timed-out child.
+        return int(columns[1]), int(columns[2]), columns[19], columns[0]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _windows_process_start_time(pid: int) -> str | None:
+    """Read a Windows creation timestamp to distinguish PID reuse."""
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        creation = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel_time = wintypes.FILETIME()
+        user_time = wintypes.FILETIME()
+        try:
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel_time),
+                ctypes.byref(user_time),
+            ):
+                return None
+            return str((creation.dwHighDateTime << 32) | creation.dwLowDateTime)
+        finally:
+            kernel32.CloseHandle(handle)
+    except (AttributeError, OSError):
+        return None
+
+
+def _windows_process_snapshot() -> dict[int, tuple[int, int, str, str]] | None:
+    """Enumerate Windows parent links without relying on a leader-only probe."""
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class ProcessEntry(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_void_p),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        snapshot_handle = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+        invalid = ctypes.c_void_p(-1).value
+        if snapshot_handle in (None, invalid):
+            return None
+        entry = ProcessEntry()
+        entry.dwSize = ctypes.sizeof(ProcessEntry)
+        result: dict[int, tuple[int, int, str, str]] = {}
+        try:
+            first = kernel32.Process32FirstW(snapshot_handle, ctypes.byref(entry))
+            while first:
+                pid = int(entry.th32ProcessID)
+                start_time = _windows_process_start_time(pid)
+                if start_time is not None:
+                    result[pid] = (int(entry.th32ParentProcessID), 0, start_time, "R")
+                first = kernel32.Process32NextW(snapshot_handle, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot_handle)
+        return result
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _process_snapshot() -> dict[int, tuple[int, int, str, str]] | None:
+    if os.name == "nt":
+        return _windows_process_snapshot()
+    if os.name != "posix" or not Path("/proc").is_dir():
+        return None
+    snapshot: dict[int, tuple[int, int, str, str]] = {}
+    try:
+        entries = tuple(Path("/proc").iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        stat_value = _proc_stat(int(entry.name))
+        if stat_value is not None:
+            snapshot[int(entry.name)] = stat_value
+    return snapshot
+
+
+_MACOS_PROCESS_CENSUS_COMMAND = (
+    "ps", "-axo", "pid=,ppid=,pgid=,lstart="
+)
+_MACOS_PROCESS_CENSUS_TIMEOUT_SECONDS = 0.25
+
+
+def _parse_macos_process_snapshot(stdout: bytes) -> dict[int, tuple[int, int, str, str]]:
+    """Parse a complete BSD ``ps`` census with PID/start-time identities."""
+
+    snapshot: dict[int, tuple[int, int, str, str]] = {}
+    for line in stdout.decode("utf-8", errors="replace").splitlines():
+        fields = line.split()
+        if len(fields) < 4 or not all(field.isdigit() for field in fields[:3]):
+            continue
+        pid, parent, process_group = (int(field) for field in fields[:3])
+        start_time = " ".join(fields[3:])
+        if pid > 0 and parent >= 0 and process_group >= 0 and start_time:
+            snapshot[pid] = (parent, process_group, start_time, "R")
+    return snapshot
+
+
+class _ProcessSnapshotProvider:
+    """Provide bounded process snapshots and retain macOS probe bytes."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cached_at = 0.0
+        self._cached: dict[int, tuple[int, int, str, str]] | None = None
+        self._has_cached = False
+        self._diagnostics = bytearray()
+
+    def __call__(self) -> dict[int, tuple[int, int, str, str]] | None:
+        if os.name != "posix" or Path("/proc").is_dir():
+            return _process_snapshot()
+        now = time.monotonic()
+        with self._lock:
+            if self._has_cached and now - self._cached_at < 0.05:
+                return self._cached
+            stdout = b""
+            stderr = b""
+            returncode: int | None = None
+            timed_out = False
+            try:
+                completed = subprocess.run(
+                    _MACOS_PROCESS_CENSUS_COMMAND,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=_MACOS_PROCESS_CENSUS_TIMEOUT_SECONDS,
+                )
+                stdout = completed.stdout
+                stderr = completed.stderr
+                returncode = completed.returncode
+            except subprocess.TimeoutExpired as error:
+                timed_out = True
+                stdout = _output_bytes(error.stdout)
+                stderr = _output_bytes(error.stderr)
+            except OSError as error:
+                stderr = repr(error).encode("utf-8", errors="replace")
+            self._diagnostics.extend(
+                b"MAC_PROCESS_CENSUS_BEGIN\n"
+                + b"returncode=" + str(returncode).encode("ascii")
+                + b" timed_out=" + str(timed_out).encode("ascii") + b"\n"
+                + b"stdout-begin\n" + stdout + b"\nstdout-end\n"
+                + b"stderr-begin\n" + stderr + b"\nstderr-end\n"
+                + b"MAC_PROCESS_CENSUS_END\n"
+            )
+            snapshot = (
+                _parse_macos_process_snapshot(stdout)
+                if not timed_out and returncode == 0
+                else None
+            )
+            self._cached = snapshot
+            self._cached_at = time.monotonic()
+            self._has_cached = True
+            return snapshot
+
+    @property
+    def diagnostics(self) -> bytes:
+        with self._lock:
+            return bytes(self._diagnostics)
+
+
+def _tracked_processes(
+    root_pid: int,
+    snapshot_provider: _ProcessSnapshotProvider | None = None,
+) -> tuple[_ProcessIdentity, ...]:
+    snapshot = snapshot_provider() if snapshot_provider is not None else _process_snapshot()
+    if snapshot is None:
+        return ()
+    children: dict[int, list[int]] = {}
+    for pid, (ppid, _pgrp, _start, _state) in snapshot.items():
+        children.setdefault(ppid, []).append(pid)
+    pending = [root_pid]
+    seen: set[int] = set()
+    identities: list[_ProcessIdentity] = []
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        value = snapshot.get(pid)
+        if value is None:
+            continue
+        _ppid, pgrp, start_time, _state = value
+        identities.append(_ProcessIdentity(pid, str(start_time), pgrp))
+        pending.extend(children.get(pid, ()))
+    return tuple(identities)
+
+
+def _identity_live(
+    identity: _ProcessIdentity,
+    snapshot_provider: _ProcessSnapshotProvider | None = None,
+) -> bool | None:
+    if os.name == "nt":
+        snapshot = _process_snapshot()
+        if snapshot is None:
+            return None
+        value = snapshot.get(identity.pid)
+        if value is None:
+            return False
+        _ppid, _pgrp, start_time, _state = value
+        if start_time != identity.start_time:
+            return False
+        return True
+    if snapshot_provider is not None and not Path("/proc").is_dir():
+        snapshot = snapshot_provider()
+        if snapshot is None:
+            return None
+        value = snapshot.get(identity.pid)
+        if value is None:
+            return False
+        _ppid, pgrp, start_time, state = value
+        if str(start_time) != identity.start_time:
+            return False
+        if identity.process_group is not None and pgrp != identity.process_group:
+            return False
+        return state != "Z"
+    value = _proc_stat(identity.pid)
+    if value is None:
+        return False
+    _ppid, pgrp, start_time, state = value
+    if str(start_time) != identity.start_time:
+        return False
+    if identity.process_group is not None and pgrp != identity.process_group:
+        return False
+    return state != "Z"
+
+
+def _tree_status(
+    root_pid: int,
+    identities: tuple[_ProcessIdentity, ...],
+    snapshot_provider: _ProcessSnapshotProvider | None = None,
+) -> str:
+    if os.name in {"posix", "nt"}:
+        snapshot = snapshot_provider() if snapshot_provider is not None else _process_snapshot()
+        if snapshot is None:
+            return "unknown"
+        if os.name == "nt" and not identities:
+            return "unknown"
+        live = [_identity_live(identity, snapshot_provider) for identity in identities]
+        if any(value is None for value in live):
+            return "unknown"
+        if any(value for value in live):
+            return "alive"
+        if os.name == "posix":
+            # Catch a child created just after the initial recursive snapshot
+            # but before the leader was terminated. Detached descendants remain
+            # in the tracked identity set above; same-group late children are
+            # covered here.
+            if any(
+                pgrp == root_pid and state != "Z"
+                for _pid, (_ppid, pgrp, _start, state) in snapshot.items()
+            ):
+                return "alive"
+        return "gone"
+    return "unknown"
+
+
+def _merge_process_identities(
+    *groups: tuple[_ProcessIdentity, ...],
+) -> tuple[_ProcessIdentity, ...]:
+    merged: dict[tuple[int, str], _ProcessIdentity] = {}
+    for group in groups:
+        for identity in group:
+            merged[(identity.pid, identity.start_time)] = identity
+    return tuple(merged.values())
+
+
+def _finish_process_tree(
+    process: subprocess.Popen[bytes],
+    observed: tuple[_ProcessIdentity, ...],
+    timeout: float,
+    *,
+    monitor_complete: bool,
+    snapshot_provider: _ProcessSnapshotProvider | None = None,
+) -> tuple[bytes, str]:
+    """Prove a normally-returned leader left no observed descendant behind."""
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    identities = _merge_process_identities(
+        observed,
+        _tracked_processes(process.pid, snapshot_provider),
+    )
+    diagnostics = bytearray(
+        b"PROCESS_TREE_TRACKED="
+        + b",".join(str(identity.pid).encode("ascii") for identity in identities)
+        + b"\n"
+    )
+    initial_status = (
+        _tree_status(process.pid, identities, snapshot_provider)
+        if monitor_complete else "unknown"
+    )
+    status = initial_status
+    if status != "gone":
+        diagnostics.extend(
+            _kill_process_tree(
+                process,
+                _remaining_until(deadline),
+                identities=identities,
+                snapshot_provider=snapshot_provider,
+            )
+        )
+        status = _tree_status(process.pid, identities, snapshot_provider)
+    if status == "gone":
+        diagnostics.extend(b"PROCESS_TREE_STATUS=gone\n")
+    else:
+        diagnostics.extend(
+            b"PROCESS_TREE_FINAL_STATUS=" + status.encode("ascii") + b"\n"
+        )
+        diagnostics.extend(b"EVIDENCE_INCOMPLETE=1 reason=process-tree\n")
+    if initial_status != "gone":
+        diagnostics.extend(b"PROCESS_TREE_SURVIVOR_DETECTED=1\n")
+        diagnostics.extend(b"EVIDENCE_INCOMPLETE=1 reason=process-tree\n")
+        return bytes(diagnostics), "survivor"
+    return bytes(diagnostics), status
+
+
+def _wait_tree_gone(
+    root_pid: int,
+    identities: tuple[_ProcessIdentity, ...],
+    deadline: float,
+    snapshot_provider: _ProcessSnapshotProvider | None = None,
+) -> str:
+    while time.monotonic() < deadline:
+        status = _tree_status(root_pid, identities, snapshot_provider)
+        if status != "alive":
+            return status
+        time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+    return _tree_status(root_pid, identities, snapshot_provider)
+
+
+def _signal_tracked(
+    identities: tuple[_ProcessIdentity, ...],
+    signum: int,
+    snapshot_provider: _ProcessSnapshotProvider | None = None,
+) -> bytes:
+    diagnostics = bytearray()
+    for identity in identities:
+        live = _identity_live(identity, snapshot_provider)
+        if live is False:
+            continue
+        if live is None:
+            diagnostics.extend(
+                b"PROCESS_IDENTITY_UNKNOWN pid="
+                + str(identity.pid).encode("ascii")
+                + b"\n"
+            )
+            continue
+        try:
+            os.kill(identity.pid, signum)
+        except ProcessLookupError:
+            continue
+        except OSError as error:
+            diagnostics.extend(
+                b"PROCESS_ID_SIGNAL_FAILURE pid="
+                + str(identity.pid).encode("ascii")
+                + b" error="
+                + repr(error).encode("utf-8", errors="replace")
+                + b"\n"
+            )
+    return bytes(diagnostics)
+
+
 def _kill_process(process: subprocess.Popen[bytes]) -> bytes:
     try:
         process.kill()
@@ -237,23 +944,139 @@ def _kill_process(process: subprocess.Popen[bytes]) -> bytes:
     return b""
 
 
-def _kill_process_tree(process: subprocess.Popen[bytes]) -> bytes:
-    """Terminate the process and all children created in its process group."""
+def _bounded_reap_process(
+    process: subprocess.Popen[bytes], timeout: float,
+) -> tuple[bool, bytes, bytes, bytes]:
+    """Drain and reap a killed leader without an unbounded wait."""
+
+    try:
+        stdout, stderr = process.communicate(timeout=max(0.0, timeout))
+        return True, _output_bytes(stdout), _output_bytes(stderr), b""
+    except subprocess.TimeoutExpired as error:
+        return (
+            False,
+            _output_bytes(error.stdout),
+            _output_bytes(error.stderr),
+            b"",
+        )
+    except OSError as error:
+        return (
+            False,
+            b"",
+            b"",
+            b"PROCESS_REAP_ERROR="
+            + repr(error).encode("utf-8", errors="replace")
+            + b"\n",
+        )
+    finally:
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+    return process.returncode is not None
+
+
+def _bounded_capture(
+    command: Sequence[str], timeout: float
+) -> tuple[int | None, bytes, bytes, bool]:
+    """Run a cleanup helper with a hard timeout and retain all available bytes."""
+
+    started = time.monotonic()
+    deadline = started + max(0.0, timeout)
+    helper = subprocess.Popen(
+        list(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE, **_process_group_kwargs()
+    )
+    try:
+        stdout, stderr = helper.communicate(
+            timeout=_remaining_until(deadline)
+        )
+        return helper.returncode, stdout, stderr, False
+    except subprocess.TimeoutExpired as error:
+        partial_stdout = _output_bytes(error.stdout)
+        partial_stderr = _output_bytes(error.stderr)
+        try:
+            helper.kill()
+        except OSError:
+            pass
+        try:
+            stdout, stderr = helper.communicate(timeout=_remaining_until(deadline))
+        except subprocess.TimeoutExpired as final_error:
+            reaped, drained_stdout, drained_stderr, reap_notes = _bounded_reap_process(
+                helper, _remaining_until(deadline)
+            )
+            return (
+                None,
+                _merge_output(
+                    partial_stdout,
+                    _merge_output(_output_bytes(final_error.stdout), drained_stdout),
+                ),
+                _merge_output(
+                    partial_stderr,
+                    _merge_output(_output_bytes(final_error.stderr), drained_stderr),
+                ) + reap_notes,
+                True,
+            )
+        return (
+            helper.returncode,
+            _merge_output(partial_stdout, stdout),
+            _merge_output(partial_stderr, stderr),
+            True,
+        )
+
+
+def _windows_pid_present(pid: int, timeout: float) -> bool | None:
+    if os.name != "nt":
+        return False
+    try:
+        code, stdout, _stderr, timed_out = _bounded_capture(
+            ("tasklist.exe", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"), timeout
+        )
+    except OSError:
+        return None
+    if timed_out or code is None:
+        return None
+    return code == 0 and str(pid).encode("ascii") in stdout
+
+
+def _kill_process_tree(
+    process: subprocess.Popen[bytes],
+    timeout: float = _DEFAULT_CLEANUP_RESERVE_SECONDS,
+    *,
+    identities: tuple[_ProcessIdentity, ...] = (),
+    snapshot_provider: _ProcessSnapshotProvider | None = None,
+) -> bytes:
+    """Terminate, drain, and prove disappearance of the complete child tree."""
 
     diagnostics = bytearray()
+    timeout = max(0.0, timeout)
+    deadline = time.monotonic() + timeout
+    identities = _merge_process_identities(
+        identities,
+        _tracked_processes(process.pid, snapshot_provider),
+    )
+    diagnostics.extend(
+        b"PROCESS_TREE_TRACKED="
+        + b",".join(str(identity.pid).encode("ascii") for identity in identities)
+        + b"\n"
+    )
     if os.name == "nt":
+        taskkill_timed_out = False
         try:
-            result = subprocess.run(
+            returncode, stdout, stderr, taskkill_timed_out = _bounded_capture(
                 ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                _remaining_until(deadline),
             )
-            diagnostics.extend(b"taskkill-stdout=" + result.stdout + b"\n")
-            diagnostics.extend(b"taskkill-stderr=" + result.stderr + b"\n")
-            if result.returncode != 0:
+            diagnostics.extend(b"taskkill-stdout=" + stdout + b"\n")
+            diagnostics.extend(b"taskkill-stderr=" + stderr + b"\n")
+            if taskkill_timed_out:
+                diagnostics.extend(b"TASKKILL_TIMEOUT=1\n")
+            if returncode != 0:
                 diagnostics.extend(
-                    b"taskkill-returncode=" + str(result.returncode).encode("ascii") + b"\n"
+                    b"TASKKILL_RETURN_CODE="
+                    + str(returncode).encode("ascii")
+                    + b"\n"
                 )
                 diagnostics.extend(_kill_process(process))
         except OSError as error:
@@ -261,17 +1084,119 @@ def _kill_process_tree(process: subprocess.Popen[bytes]) -> bytes:
                 b"taskkill-error=" + repr(error).encode("utf-8", errors="replace") + b"\n"
             )
             diagnostics.extend(_kill_process(process))
+        status = _wait_tree_gone(process.pid, identities, deadline, snapshot_provider)
+        if status != "gone":
+            # A detached child is no longer reachable through the leader's
+            # /T traversal.  Kill each identity captured while the leader was
+            # alive, with the same hard cleanup deadline, and verify again.
+            for identity in identities:
+                if time.monotonic() >= deadline:
+                    break
+                if _identity_live(identity, snapshot_provider) is not True:
+                    continue
+                try:
+                    code, stdout, stderr, timed_out = _bounded_capture(
+                        ["taskkill", "/PID", str(identity.pid), "/T", "/F"],
+                        _remaining_until(deadline),
+                    )
+                    diagnostics.extend(
+                        b"taskkill-descendant-stdout=" + stdout + b"\n"
+                    )
+                    diagnostics.extend(
+                        b"taskkill-descendant-stderr=" + stderr + b"\n"
+                    )
+                    if timed_out:
+                        diagnostics.extend(b"TASKKILL_DESCENDANT_TIMEOUT=1\n")
+                    if code not in (0, None):
+                        diagnostics.extend(
+                            b"TASKKILL_DESCENDANT_RETURN_CODE="
+                            + str(code).encode("ascii")
+                            + b"\n"
+                        )
+                except OSError as error:
+                    diagnostics.extend(
+                        b"taskkill-descendant-error="
+                        + repr(error).encode("utf-8", errors="replace")
+                        + b"\n"
+                    )
+            status = _wait_tree_gone(process.pid, identities, deadline, snapshot_provider)
+        if status != "gone":
+            diagnostics.extend(b"PROCESS_TREE_KILL_FAILURE=1\n")
+            diagnostics.extend(b"PROCESS_TREE_SURVIVORS=1\n")
+        else:
+            diagnostics.extend(b"PROCESS_TREE_STATUS=gone\n")
         return bytes(diagnostics)
+    diagnostics.extend(_signal_tracked(identities, signal.SIGTERM, snapshot_provider))
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
-        pass
+        diagnostics.extend(b"PROCESS_GROUP_TERM=gone\n")
     except OSError as error:
         diagnostics.extend(
-            b"killpg-error=" + repr(error).encode("utf-8", errors="replace") + b"\n"
+            b"PROCESS_GROUP_TERM_FAILURE="
+            + repr(error).encode("utf-8", errors="replace")
+            + b"\n"
         )
-        diagnostics.extend(_kill_process(process))
+    status = _wait_tree_gone(
+        process.pid,
+        identities,
+        min(deadline, time.monotonic() + max(0.0, timeout / 3.0)),
+        snapshot_provider,
+    )
+    if status == "alive":
+        diagnostics.extend(_signal_tracked(identities, signal.SIGKILL, snapshot_provider))
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            diagnostics.extend(b"PROCESS_GROUP_KILL=gone\n")
+        except OSError as error:
+            diagnostics.extend(
+                b"PROCESS_GROUP_KILL_FAILURE="
+                + repr(error).encode("utf-8", errors="replace")
+                + b"\n"
+            )
+        status = _wait_tree_gone(process.pid, identities, deadline, snapshot_provider)
+    if status != "gone":
+        diagnostics.extend(b"PROCESS_TREE_SURVIVORS=1\n")
+        if status == "unknown":
+            diagnostics.extend(b"PROCESS_TREE_STATUS=unknown\n")
+        else:
+            diagnostics.extend(b"PROCESS_TREE_KILL_FAILURE=1\n")
+    else:
+        diagnostics.extend(b"PROCESS_TREE_STATUS=gone\n")
     return bytes(diagnostics)
+
+
+def _allocate_owner_only_path(directory: Path, stem: str, suffix: str) -> Path:
+    """Reserve a private path with O_EXCL; never reuse an old evidence file."""
+
+    try:
+        info = directory.lstat()
+    except OSError as error:
+        raise HostedAdapterError("EVIDENCE_PATH_UNSAFE") from error
+    if (
+        directory.is_symlink()
+        or not stat.S_ISDIR(info.st_mode)
+        or _current_uid() is not None and info.st_uid != _current_uid()
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
+    for candidate in (
+        directory / f"{stem}{suffix}",
+        directory / f"{stem}-{uuid.uuid4().hex}{suffix}",
+    ):
+        try:
+            descriptor = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            continue
+        os.fchmod(descriptor, 0o600)
+        os.close(descriptor)
+        return candidate
+    raise HostedAdapterError("EVIDENCE_UNAVAILABLE")
 
 
 def _https_endpoint(value: str | None, name: str) -> str:
@@ -327,8 +1252,7 @@ class HostedServiceProcessController:
             raise HostedAdapterError("SERVICE_PATH_INVALID")
         if not raw_directory.is_absolute():
             raise HostedAdapterError("SERVICE_EVIDENCE_PATH_INVALID")
-        raw_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(raw_directory, 0o700)
+        _ensure_owner_only_directory(raw_directory)
         self.pid = pid
         self.binary = binary
         self.pid_file = pid_file
@@ -702,8 +1626,10 @@ class HostedCLIAdapter:
         raw_directory = getattr(self.runner, "raw_directory", None)
         if not isinstance(raw_directory, Path):
             raise ScenarioExecutionError("THROUGHPUT_UPLOAD_UNAVAILABLE")
-        raw_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(raw_directory, 0o700)
+        try:
+            _ensure_owner_only_directory(raw_directory)
+        except HostedAdapterError as error:
+            raise ScenarioExecutionError(error.code) from error
         payload = raw_directory / "traffic-upload.bin"
         if not payload.exists():
             with payload.open("wb") as output:

@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from torturer_provider.lease import (  # noqa: E402
+    LeaseCleanupError,
     LeaseState,
     LeaseStateError,
     RenderLease,
@@ -31,9 +32,16 @@ RUN_ID = "a" * 32
 
 
 class FakeLeaseAPI:
-    def __init__(self, *, failed_deploy: bool = False, fail_create: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        failed_deploy: bool = False,
+        fail_create: bool = False,
+        retain_deleted_records: bool = False,
+    ) -> None:
         self.failed_deploy = failed_deploy
         self.fail_create = fail_create
+        self.retain_deleted_records = retain_deleted_records
         self.created = False
         self.deleted = False
         self.delete_calls: list[str] = []
@@ -59,10 +67,12 @@ class FakeLeaseAPI:
     def delete_service(self, service_id: str) -> bool:
         self.delete_calls.append(service_id)
         self.deleted = True
+        if not self.retain_deleted_records:
+            self.records = tuple(record for record in self.records if record.service_id != service_id)
         return True
 
     def exists(self, service_id: str) -> bool:
-        return not self.deleted
+        return self.retain_deleted_records or not self.deleted
 
     def list_services(self, owner_id: str) -> tuple[RenderServiceRecord, ...]:
         return self.records
@@ -185,6 +195,84 @@ class RenderLeaseTests(unittest.TestCase):
                 self.assertEqual(api.delete_calls, ["srv-orphan123"])
                 self.assertIs(lease.state, LeaseState.ABSENT)
                 self.assertEqual(lease.journal.records()[-1].cleanup_result, "verified-namespace")
+            finally:
+                holder.cleanup()
+
+    def test_lost_create_response_fails_closed_when_fresh_namespace_absence_is_not_proven(self) -> None:
+        api = FakeLeaseAPI(fail_create=True, retain_deleted_records=True)
+        old = datetime.fromtimestamp(time.time() - 5, timezone.utc).isoformat().replace("+00:00", "Z")
+        prefix = f"dobby-torturer-{RUN_ID}-"
+        api.records = (
+            RenderServiceRecord(
+                "srv-stuck123",
+                prefix + "linux",
+                "tea-test123",
+                "web_service",
+                old,
+            ),
+        )
+        with tempfile.TemporaryDirectory(prefix="render-lease-unverified-namespace-test.") as directory:
+            holder = tempfile.TemporaryDirectory(dir=directory)
+            try:
+                lease = make_lease(api, holder)
+                with self.assertRaises(LeaseCleanupError):
+                    lease.acquire(timeout_seconds=5, poll_seconds=1)
+                self.assertEqual(lease.state, LeaseState.DELETING)
+                self.assertEqual(lease.journal.records()[-1].cleanup_result, "unverified-no-service-id")
+            finally:
+                holder.cleanup()
+
+    def test_cancellation_during_readiness_cleans_service_and_reraises(self) -> None:
+        class Cancelled(BaseException):
+            pass
+
+        class CancellableAPI(FakeLeaseAPI):
+            def service(self, service_id: str) -> dict[str, object]:
+                raise Cancelled()
+
+        api = CancellableAPI()
+        with tempfile.TemporaryDirectory(prefix="render-lease-cancel-test.") as directory:
+            holder = tempfile.TemporaryDirectory(dir=directory)
+            try:
+                lease = make_lease(api, holder)
+                with self.assertRaises(Cancelled):
+                    lease.acquire(timeout_seconds=5, poll_seconds=1)
+                self.assertEqual(api.delete_calls, ["srv-lease123"])
+                self.assertEqual(lease.state, LeaseState.ABSENT)
+            finally:
+                holder.cleanup()
+
+    def test_exact_service_cleanup_fails_closed_when_absence_is_not_verified(self) -> None:
+        api = FakeLeaseAPI(retain_deleted_records=True)
+        with tempfile.TemporaryDirectory(prefix="render-lease-sticky-delete-test.") as directory:
+            holder = tempfile.TemporaryDirectory(dir=directory)
+            try:
+                lease = make_lease(api, holder)
+                lease.acquire(timeout_seconds=5, poll_seconds=1)
+                lease.mark_issued()
+                with self.assertRaises(LeaseCleanupError):
+                    lease.cleanup()
+                self.assertEqual(lease.state, LeaseState.DELETING)
+                self.assertEqual(api.delete_calls, ["srv-lease123"])
+            finally:
+                holder.cleanup()
+
+    def test_reaper_rejects_malformed_timestamp_in_its_dedicated_namespace(self) -> None:
+        class MalformedRecord:
+            service_id = "srv-malformed123"
+            name = f"dobby-torturer-{RUN_ID}-linux"
+            owner_id = "tea-test123"
+            created_at = "not-a-timestamp"
+
+        api = FakeLeaseAPI()
+        api.records = (MalformedRecord(),)
+        with tempfile.TemporaryDirectory(prefix="render-lease-malformed-reaper-test.") as directory:
+            holder = tempfile.TemporaryDirectory(dir=directory)
+            try:
+                lease = make_lease(api, holder)
+                with self.assertRaisesRegex(RenderAPIError, "INVALID_SERVICE_TIMESTAMP"):
+                    lease.reap_orphans(older_than_seconds=0)
+                self.assertEqual(api.delete_calls, [])
             finally:
                 holder.cleanup()
 

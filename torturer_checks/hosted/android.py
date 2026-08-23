@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import time
 from typing import Mapping
+import uuid
 
 from torturer_contract.functional.android_observation import (
     AndroidObservationError,
@@ -29,6 +31,7 @@ from .cli import (
     CommandResult,
     CommandRunner,
     HostedAdapterError,
+    _ensure_owner_only_directory,
     _owner_only_profile,
     _executable_file,
     _https_endpoint,
@@ -65,6 +68,12 @@ _CORE_CAPABILITIES = frozenset(
         Capability.RESOURCE_CLEANUP,
     }
 )
+_LANE_MAX_SECONDS = 1_800.0
+_DIAGNOSTICS_RESERVE_FRACTION = 0.125
+_CLEANUP_RESERVE_FRACTION = 0.125
+_MIN_FINALIZATION_RESERVE_SECONDS = 1.0
+_MAX_FINALIZATION_RESERVE_SECONDS = 60.0
+_FINALIZATION_COMMAND_MAX_SECONDS = 5.0
 
 
 def _remaining(deadline: float, code: str) -> float:
@@ -72,6 +81,66 @@ def _remaining(deadline: float, code: str) -> float:
     if value <= 0:
         raise ScenarioExecutionError(code)
     return value
+
+
+def _scenario_deadlines(
+    started: float, scenario_seconds: float
+) -> tuple[float, float, float]:
+    """Return work, diagnostics, and cleanup deadlines within one lane.
+
+    The canonical engine measures the complete adapter call against the
+    scenario bound, so finalization reserves are carved out of that bound
+    rather than extending it. The reserve scales for the short configure
+    scenario while remaining non-zero and never exceeds the hard 1,800-second
+    Android lane.
+    """
+    if scenario_seconds <= 0 or scenario_seconds > _LANE_MAX_SECONDS:
+        raise ScenarioExecutionError("SCENARIO_TIMEOUT_INVALID")
+    diagnostics_reserve = max(
+        _MIN_FINALIZATION_RESERVE_SECONDS,
+        scenario_seconds * _DIAGNOSTICS_RESERVE_FRACTION,
+    )
+    cleanup_reserve = max(
+        _MIN_FINALIZATION_RESERVE_SECONDS,
+        scenario_seconds * _CLEANUP_RESERVE_FRACTION,
+    )
+    finalization_scale = min(
+        1.0,
+        _MAX_FINALIZATION_RESERVE_SECONDS
+        / (diagnostics_reserve + cleanup_reserve),
+    )
+    diagnostics_reserve *= finalization_scale
+    cleanup_reserve *= finalization_scale
+    finalization_reserve = diagnostics_reserve + cleanup_reserve
+    if finalization_reserve >= scenario_seconds:
+        # There must still be a positive work window. This only applies to a
+        # malformed future scenario whose bound is too short to qualify.
+        raise ScenarioExecutionError("SCENARIO_TIMEOUT_INVALID")
+    work_deadline = started + scenario_seconds - finalization_reserve
+    diagnostics_deadline = work_deadline + diagnostics_reserve
+    cleanup_deadline = diagnostics_deadline + cleanup_reserve
+    if cleanup_deadline > started + _LANE_MAX_SECONDS:
+        raise ScenarioExecutionError("SCENARIO_TIMEOUT_INVALID")
+    return work_deadline, diagnostics_deadline, cleanup_deadline
+
+
+def _finalization_error(
+    diagnostic_error: ScenarioExecutionError | None,
+    cleanup_error: ScenarioExecutionError | None,
+) -> ScenarioExecutionError | None:
+    """Map all finalization failures to stable public reason codes."""
+    if diagnostic_error is not None and cleanup_error is not None:
+        return ScenarioExecutionError("ANDROID_FINALIZATION_FAILED")
+    if diagnostic_error is not None:
+        return ScenarioExecutionError("ANDROID_DIAGNOSTICS_FAILED")
+    if cleanup_error is not None:
+        return ScenarioExecutionError("ANDROID_CLEANUP_FAILED")
+    return None
+
+
+def _finalization_timeout(deadline: float, code: str) -> float:
+    """Bound each evidence/cleanup command while retaining later attempts."""
+    return min(_remaining(deadline, code), _FINALIZATION_COMMAND_MAX_SECONDS)
 
 
 class AndroidHostedAdapter:
@@ -156,7 +225,7 @@ class AndroidHostedAdapter:
         """Stage one opaque profile and ordered command, then parse safe facts."""
         if not self._ready:
             raise CapabilityUnavailable()
-        if scenario.max_duration_seconds > 1_800:
+        if scenario.max_duration_seconds > _LANE_MAX_SECONDS:
             raise ScenarioExecutionError("SCENARIO_TIMEOUT_INVALID")
         command_file, profile_name, output_name = self._write_command(scenario)
         staged_profile = f"/data/local/tmp/{profile_name}"
@@ -164,10 +233,10 @@ class AndroidHostedAdapter:
         device_profile = f"files/{profile_name}"
         device_command = f"files/{command_file.name}"
         device_output = f"files/{output_name}"
-        deadline = time.monotonic() + min(
-            1_800.0, float(scenario.max_duration_seconds)
+        started = time.monotonic()
+        deadline, diagnostic_deadline, cleanup_deadline = _scenario_deadlines(
+            started, float(scenario.max_duration_seconds)
         )
-        failure: ScenarioExecutionError | None = None
         try:
             self._adb(
                 ("push", str(self.profile), staged_profile),
@@ -243,18 +312,18 @@ class AndroidHostedAdapter:
                 return observation.to_observations()
             except AndroidObservationError as error:
                 raise ScenarioExecutionError("ANDROID_OBSERVATION_ERROR") from error
-        except ScenarioExecutionError as error:
-            failure = error
-            raise
         finally:
-            diagnostic_error = self._capture_diagnostics(deadline)
+            diagnostic_error = self._capture_diagnostics(diagnostic_deadline)
             cleanup_error = self._cleanup_device(
-                (profile_name, command_file.name, output_name), deadline
+                (profile_name, command_file.name, output_name), cleanup_deadline
             )
-            if diagnostic_error is not None and failure is None:
-                raise diagnostic_error
-            if cleanup_error is not None and failure is None:
-                raise cleanup_error
+            finalization_error = _finalization_error(diagnostic_error, cleanup_error)
+            if finalization_error is not None:
+                # Do not suppress finalization evidence when the product
+                # operation already failed. The runner has retained every
+                # command stream; this stable code makes the failure visible
+                # in the canonical result as well.
+                raise finalization_error
 
     def reset(self, timeout_seconds: float = 5.0) -> None:
         if not self._ready:
@@ -271,10 +340,14 @@ class AndroidHostedAdapter:
         raw_directory = getattr(self.runner, "raw_directory", None)
         if not isinstance(raw_directory, Path):
             raise ScenarioExecutionError("ANDROID_EVIDENCE_UNAVAILABLE")
+        try:
+            _ensure_owner_only_directory(raw_directory)
+        except HostedAdapterError as error:
+            raise ScenarioExecutionError(error.code) from error
         assert self.source_sha is not None
         token = hashlib.sha256(
             f"{scenario.id}:{self.source_sha}".encode("utf-8")
-        ).hexdigest()[:16]
+        ).hexdigest()[:16] + "-" + uuid.uuid4().hex[:12]
         profile_name = f"android-hosted-{token}.profile"
         command_name = f"android-hosted-{token}.command.json"
         output_name = f"android-hosted-{token}.observation.json"
@@ -302,10 +375,24 @@ class AndroidHostedAdapter:
             "operations": operations,
         }
         command_file = raw_directory / command_name
-        command_file.write_text(
-            json.dumps(command, sort_keys=True, separators=(",", ":")) + "\n",
-            encoding="utf-8",
-        )
+        try:
+            descriptor = os.open(
+                command_file,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError as error:
+            raise ScenarioExecutionError("ANDROID_EVIDENCE_COLLISION") from error
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                descriptor = -1
+                output.write(json.dumps(command, sort_keys=True, separators=(",", ":")) + "\n")
+                output.flush()
+                os.fsync(output.fileno())
+        finally:
+            if descriptor != -1:
+                os.close(descriptor)
         command_file.chmod(0o600)
         return command_file, profile_name, output_name
 
@@ -342,7 +429,7 @@ class AndroidHostedAdapter:
             try:
                 self._adb(
                     command,
-                    _remaining(deadline, "ANDROID_DIAGNOSTICS_TIMEOUT"),
+                    _finalization_timeout(deadline, "ANDROID_DIAGNOSTICS_TIMEOUT"),
                     "ANDROID_DIAGNOSTICS_FAILED",
                 )
             except ScenarioExecutionError as failure:
@@ -377,9 +464,24 @@ class AndroidHostedAdapter:
             try:
                 self._adb(
                     command,
-                    _remaining(deadline, "ANDROID_CLEANUP_TIMEOUT"),
+                    _finalization_timeout(deadline, "ANDROID_CLEANUP_TIMEOUT"),
                     "ANDROID_CLEANUP_FAILED",
                 )
             except ScenarioExecutionError as failure:
                 error = error or failure
+        # ADB may leave an instrumentation/service descendant behind even
+        # after the app force-stop returns success.  Require an explicit empty
+        # process query; a non-empty result is a cleanup failure, while the
+        # runner retains the complete stdout/stderr and any timeout bytes.
+        try:
+            process_result = self._adb(
+                ("shell", "pidof", _PACKAGE_NAME),
+                _finalization_timeout(deadline, "ANDROID_CLEANUP_TIMEOUT"),
+                "ANDROID_CLEANUP_FAILED",
+                allow_nonzero=True,
+            )
+            if process_result.stdout.strip():
+                raise ScenarioExecutionError("ANDROID_PROCESS_TREE_SURVIVED")
+        except ScenarioExecutionError as failure:
+            error = error or failure
         return error

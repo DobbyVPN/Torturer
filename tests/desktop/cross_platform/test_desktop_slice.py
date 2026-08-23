@@ -1,26 +1,37 @@
 from __future__ import annotations
 
+import gc
 import io
+import json
 import os
 from pathlib import Path
 import stat
+import signal
 import sys
 import tempfile
+import time
 import unittest
+import warnings
 from contextlib import redirect_stderr, redirect_stdout
+from unittest.mock import patch
 
 
 TORTURER_ROOT = Path(__file__).resolve().parents[3]
 if str(TORTURER_ROOT) not in sys.path:
     sys.path.insert(0, str(TORTURER_ROOT))
 
+import torturer_checks.desktop_slice as desktop_slice
 from torturer_checks.desktop_slice import (
     BUILD_SCRIPT_RELATIVE_PATH,
+    CLEANUP_RESERVE_SECONDS,
     GRADLE_RELATIVE_PATH,
+    MAX_RUN_SECONDS,
     MALFORMED_CONFIG,
     SERVICE_RELATIVE_PATHS,
+    RunBudget,
     WINDOWS_GRADLE_RELATIVE_PATH,
     CommandResult,
+    ProcessTreeResult,
     SliceFailure,
     app_build_command,
     build_runtime_paths,
@@ -37,6 +48,7 @@ from torturer_checks.desktop_slice import (
     wait_for_tcp,
     wait_for_unix_socket,
 )
+from torturer_checks.source_checkout import _pid_alive
 
 
 class DesktopSliceHelperTest(unittest.TestCase):
@@ -203,14 +215,229 @@ class DesktopSliceHelperTest(unittest.TestCase):
         with redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
             result = run_command(command, cwd=Path.cwd(), env=os.environ.copy())
         self.assertEqual(result.returncode, 0)
-        self.assertIn("child stdout", captured_stdout.getvalue())
-        self.assertIn("child stderr", captured_stderr.getvalue())
-        self.assertIn("stdout-begin", captured_stderr.getvalue())
-        self.assertIn("stderr-end", captured_stderr.getvalue())
+        self.assertIn("diagnostic_evidence kind=desktop-command", captured_stdout.getvalue())
+        self.assertNotIn("child stdout", captured_stdout.getvalue())
+        self.assertNotIn("child stderr", captured_stderr.getvalue())
+
+    @unittest.skipIf(os.name == "nt", "the SIGTERM-resistant descendant regression uses POSIX process groups")
+    def test_run_command_timeout_kills_descendants_and_retains_complete_streams(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="desktop-timeout-regression-") as temporary:
+            root = Path(temporary)
+            pid_file = root / "descendant.pid"
+            evidence = root / "evidence"
+            command = (
+                sys.executable,
+                "-c",
+                (
+                    "import os, signal, sys, time; "
+                    f"pid = os.fork(); "
+                    f"marker=open({str(pid_file)!r}, 'w', encoding='ascii'); marker.write(str(os.getpid()) if pid == 0 else str(pid)); marker.close(); "
+                    "print('parent-or-descendant-stdout', flush=True); "
+                    "print('parent-or-descendant-stderr', file=sys.stderr, flush=True); "
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN) if pid == 0 else None; "
+                    "time.sleep(60)"
+                ),
+            )
+            captured_stdout = io.StringIO()
+            captured_stderr = io.StringIO()
+            with redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
+                with self.assertRaisesRegex(SliceFailure, "command timed out"):
+                    run_command(
+                        command,
+                        cwd=root,
+                        env=os.environ.copy(),
+                        timeout_seconds=0.2,
+                        evidence_directory=evidence,
+                        evidence_label="sigterm-resistant-descendant",
+                    )
+            self.assertIn("diagnostic_evidence kind=desktop-command", captured_stdout.getvalue())
+            self.assertNotIn("parent-or-descendant-stdout", captured_stdout.getvalue())
+            self.assertNotIn("parent-or-descendant-stderr", captured_stderr.getvalue())
+            self.assertEqual(
+                (evidence / "sigterm-resistant-descendant.stdout.raw.log").read_bytes(),
+                b"parent-or-descendant-stdout\n" * 2,
+            )
+            self.assertEqual(
+                (evidence / "sigterm-resistant-descendant.stderr.raw.log").read_bytes(),
+                b"parent-or-descendant-stderr\n" * 2,
+            )
+            descendant_pid = int(pid_file.read_text(encoding="ascii"))
+            for _ in range(40):
+                try:
+                    os.kill(descendant_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail(f"SIGTERM-resistant descendant {descendant_pid} survived process-group cleanup")
+
+    @unittest.skipIf(os.name == "nt", "the detached descendant regression uses POSIX sessions")
+    def test_zero_exit_leader_cleans_detached_resistant_descendant(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="desktop-zero-exit-", dir="/tmp") as temporary:
+            root = Path(temporary)
+            evidence = root / "evidence"
+            child_pid_file = root / "child.pid"
+            command = (
+                sys.executable,
+                "-c",
+                (
+                    "import os, signal, time; "
+                    f"pid=os.fork(); "
+                    f"marker=open({str(child_pid_file)!r}, 'w', encoding='ascii'); marker.write(str(os.getpid()) if pid == 0 else str(pid)); marker.close(); "
+                    "(os.setsid(), "
+                    "os.close(1), os.close(2), signal.signal(signal.SIGTERM, signal.SIG_IGN), time.sleep(60)) "
+                    "if pid == 0 else (print('leader-ok', flush=True), time.sleep(0.25))"
+                ),
+            )
+            with self.assertRaisesRegex(SliceFailure, "normal completion left"):
+                run_command(
+                    command,
+                    cwd=root,
+                    env=os.environ.copy(),
+                    timeout_seconds=5,
+                    evidence_directory=evidence,
+                    evidence_label="zero-exit-detached",
+                )
+            child_pid = int(child_pid_file.read_text(encoding="ascii"))
+            cleanup = json.loads(
+                (evidence / "zero-exit-detached.cleanup.raw.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(cleanup["process_tree_proven"], cleanup)
+            self.assertTrue(cleanup["diagnostics"])
+            for _ in range(40):
+                if not _pid_alive(child_pid):
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail(f"detached resistant descendant {child_pid} survived normal-completion cleanup")
+
+    @unittest.skipIf(os.name == "nt", "the pipe-survivor regression uses POSIX process groups")
+    def test_repeated_pipe_survivor_cleanup_has_no_resource_warnings(self) -> None:
+        """Repeated failed drains close Popen pipes and reap the leader."""
+
+        with tempfile.TemporaryDirectory(prefix="desktop-pipe-load-", dir="/tmp") as temporary:
+            root = Path(temporary)
+            for index in range(6):
+                run_root = root / str(index)
+                run_root.mkdir()
+                child_pid_file = run_root / "child.pid"
+                evidence = run_root / "evidence"
+                command = (
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os, signal, time; "
+                        "pid=os.fork(); "
+                        f"marker=open({str(child_pid_file)!r}, 'w', encoding='ascii'); marker.write(str(os.getpid()) if pid == 0 else str(pid)); marker.close(); "
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN) if pid == 0 else None; "
+                        "time.sleep(60)"
+                    ),
+                )
+
+                def fake_cleanup(
+                    process: object,
+                    *,
+                    grace_seconds: float,
+                    description: str,
+                    force_immediately: bool = False,
+                    evidence_directory: Path | None = None,
+                ) -> ProcessTreeResult:
+                    process.kill()  # type: ignore[attr-defined]
+                    return ProcessTreeResult(False, (process.pid,), ("injected survivor",))  # type: ignore[attr-defined]
+
+                with warnings.catch_warnings(record=True) as captured:
+                    warnings.simplefilter("always", ResourceWarning)
+                    try:
+                        with patch.object(desktop_slice, "_terminate_process_tree", side_effect=fake_cleanup):
+                            with self.assertRaisesRegex(SliceFailure, "injected survivor"):
+                                run_command(
+                                    command,
+                                    cwd=run_root,
+                                    env=os.environ.copy(),
+                                    timeout_seconds=0.2,
+                                    evidence_directory=evidence,
+                                    evidence_label="pipe-survivor-load",
+                                )
+                        gc.collect()
+                        self.assertEqual(
+                            [warning for warning in captured if issubclass(warning.category, ResourceWarning)],
+                            [],
+                        )
+                    finally:
+                        if child_pid_file.exists():
+                            try:
+                                os.kill(int(child_pid_file.read_text(encoding="ascii")), signal.SIGKILL)
+                            except (OSError, ValueError):
+                                pass
+
+    def test_default_evidence_is_durable_reported_private_and_non_overwriting(self) -> None:
+        captured_stderr = io.StringIO()
+        command = (sys.executable, "-c", "print('default-evidence')")
+        with redirect_stderr(captured_stderr):
+            result = run_command(
+                command,
+                cwd=Path.cwd(),
+                env=os.environ.copy(),
+                evidence_label="default-persistent",
+            )
+        self.assertIsNotNone(result.evidence_directory)
+        self.assertIsNotNone(result.stdout_path)
+        self.assertIsNotNone(result.stderr_path)
+        self.assertIsNotNone(result.cleanup_path)
+        evidence = result.evidence_directory
+        self.assertFalse(evidence.is_symlink())
+        self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(result.stdout_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(result.stderr_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(result.cleanup_path.stat().st_mode), 0o600)
+        self.assertNotIn(str(evidence), captured_stderr.getvalue())
+        self.assertEqual(result.stdout_path.read_bytes(), b"default-evidence\n")
+        with self.assertRaisesRegex(SliceFailure, "overwrite existing"):
+            run_command(
+                command,
+                cwd=Path.cwd(),
+                env=os.environ.copy(),
+                evidence_directory=evidence,
+                evidence_label="default-persistent",
+            )
+
+    def test_run_budget_enforces_1800_seconds_and_preserves_cleanup_reserve(self) -> None:
+        self.assertEqual(MAX_RUN_SECONDS, 1800)
+        self.assertGreater(CLEANUP_RESERVE_SECONDS, 0)
+        clock = _FakeClock()
+        budget = RunBudget(max_seconds=10, cleanup_reserve_seconds=2, clock=clock)
+        self.assertEqual(budget.operation_timeout(), 8)
+        clock.value = 7
+        self.assertEqual(budget.operation_timeout(), 1)
+        clock.value = 8.1
+        with self.assertRaisesRegex(SliceFailure, "functional budget"):
+            budget.operation_timeout()
+        self.assertLessEqual(budget.cleanup_timeout(), 2)
+
+    @unittest.skipIf(os.name == "nt", "the wall-clock probe uses POSIX process groups")
+    def test_total_command_timeout_includes_cleanup_and_does_not_run_grace_after_deadline(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="desktop-total-bound-", dir="/tmp") as temporary:
+            evidence = Path(temporary) / "evidence"
+            started = time.monotonic()
+            with self.assertRaisesRegex(SliceFailure, "command timed out"):
+                run_command(
+                    (sys.executable, "-c", "import time; print('bounded', flush=True); time.sleep(60)"),
+                    cwd=Path(temporary),
+                    env=os.environ.copy(),
+                    timeout_seconds=0.4,
+                    evidence_directory=evidence,
+                    evidence_label="total-bound",
+                )
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 1.2)
+            cleanup = json.loads(
+                (evidence / "total-bound.cleanup.raw.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("process_tree_proven", cleanup)
 
     def test_result_assertions_report_command_output(self) -> None:
         failure = CommandResult(("tool",), 1, "out", "err")
-        with self.assertRaisesRegex(SliceFailure, "exit code: 1"):
+        with self.assertRaisesRegex(SliceFailure, "exit_code=1"):
             require_success(failure, "phase")
         with self.assertRaisesRegex(SliceFailure, "unexpectedly succeeded"):
             require_nonzero(CommandResult(("tool",), 0, "", ""), "phase")

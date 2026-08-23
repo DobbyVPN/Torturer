@@ -23,7 +23,7 @@ jobs:
   linux:
     name: Torturer / artifact contract (Linux)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - name: Check out pinned Torturer helpers
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
@@ -129,7 +129,7 @@ jobs:
   windows:
     name: Torturer / artifact contract (Windows)
     runs-on: windows-2022
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - name: Check out pinned Torturer helpers
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
@@ -189,7 +189,7 @@ jobs:
   macos_arm64:
     name: Torturer / artifact contract (macOS arm64)
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - name: Check out pinned Torturer helpers
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
@@ -262,7 +262,7 @@ jobs:
   macos_intel:
     name: Torturer / artifact contract (macOS Intel)
     runs-on: macos-15-intel
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - name: Check out pinned Torturer helpers
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
@@ -436,13 +436,34 @@ jobs:
         env:
           CANDIDATE_DIR: ${{ github.workspace }}/candidate
         run: |
+          set -euo pipefail
           test -f "$CANDIDATE_DIR/go_module/sessionapi/v2/api.go"
           test -f "$CANDIDATE_DIR/go_module/sessionapi/runtime/lifecycle.go"
           test ! -e "$CANDIDATE_DIR/go_module/modules/Cloak"
           cd "$CANDIDATE_DIR/go_module"
           go mod download
+          go mod tidy
+          mobile_version='v0.0.0-20260520154334-0e4426e1883d'
           go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260520154334-0e4426e1883d
-          "$(go env GOPATH)/bin/gomobile" init
+          go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260520154334-0e4426e1883d
+          gopath="$(go env GOPATH)"
+          tool_dir="$gopath/bin"
+          mkdir -p "$gopath/pkg/gomobile"
+          export PATH="$tool_dir:$PATH"
+          echo "$tool_dir" >> "$GITHUB_PATH"
+          for tool in gomobile gobind; do
+            test -x "$tool_dir/$tool"
+            go version -m "$tool_dir/$tool" | \
+              grep -F 'golang.org/x/mobile' | \
+              grep -F "$mobile_version"
+          done
+          go get "golang.org/x/mobile/bind@$(go list -m -f '{{.Version}}' golang.org/x/mobile)"
+          if ! git -C "$CANDIDATE_DIR" diff --quiet --no-ext-diff --; then
+            echo "candidate source mutated during pinned mobile preparation" >&2
+            git -C "$CANDIDATE_DIR" diff --no-ext-diff -- >&2
+            exit 1
+          fi
+          test -z "$(git -C "$CANDIDATE_DIR" status --porcelain=v1 --untracked-files=all)"
           ./scripts/build_ios_xcframework.sh
           ditto DobbyVPNRuntime.xcframework ../swift_module/DobbyVPNRuntime.xcframework
 
@@ -476,6 +497,7 @@ jobs:
           SOURCE_REPOSITORY: ${{ inputs.source_repository }}
           EXPECTED_COMMIT: ${{ inputs.commit_sha }}
           TORTURER_IOS_WORK_DIR: ${{ runner.temp }}/torturer-ios-simulator
+          TORTURER_IOS_RAW_LOG_DIR: ${{ runner.temp }}/torturer-ios-command-raw
           TORTURER_IOS_SIMULATOR_ARCH: arm64
         working-directory: torturer
         run: |
@@ -581,12 +603,41 @@ jobs:
             "cmake;3.22.1" \
             "system-images;android-35;google_apis;x86_64"
 
-      - name: Initialise gomobile
+      - name: Download candidate Go modules
+        working-directory: candidate/go_module
+        run: |
+          set -euo pipefail
+          go mod download
+          go mod tidy
+
+      - name: Install pinned gomobile toolchain
         env:
+          CANDIDATE_DIR: ${{ github.workspace }}/candidate
           ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018
         run: |
+          set -euo pipefail
+          mobile_version='v0.0.0-20260520154334-0e4426e1883d'
           go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260520154334-0e4426e1883d
-          "$(go env GOPATH)/bin/gomobile" init
+          go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260520154334-0e4426e1883d
+          gopath="$(go env GOPATH)"
+          tool_dir="$gopath/bin"
+          mkdir -p "$gopath/pkg/gomobile"
+          export PATH="$tool_dir:$PATH"
+          echo "$tool_dir" >> "$GITHUB_PATH"
+          for tool in gomobile gobind; do
+            test -x "$tool_dir/$tool"
+            go version -m "$tool_dir/$tool" | \
+              grep -F 'golang.org/x/mobile' | \
+              grep -F "$mobile_version"
+          done
+          cd "$GITHUB_WORKSPACE/candidate/go_module"
+          go get "golang.org/x/mobile/bind@$(go list -m -f '{{.Version}}' golang.org/x/mobile)"
+          if ! git -C "$CANDIDATE_DIR" diff --quiet --no-ext-diff --; then
+            echo "candidate source mutated during pinned mobile preparation" >&2
+            git -C "$CANDIDATE_DIR" diff --no-ext-diff -- >&2
+            exit 1
+          fi
+          test -z "$(git -C "$CANDIDATE_DIR" status --porcelain=v1 --untracked-files=all)"
 
       - name: Enable KVM for the job-local emulator
         run: sudo chmod a+rw /dev/kvm
@@ -596,6 +647,7 @@ jobs:
           CANDIDATE_DIR: ${{ github.workspace }}/candidate
           EXPECTED_COMMIT: ${{ inputs.commit_sha }}
           ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018
+          TORTURER_ANDROID_RAW_LOG_DIR: ${{ runner.temp }}/torturer-android-command-raw
         working-directory: torturer
         run: |
           python3 tests/android/run_contract.py \

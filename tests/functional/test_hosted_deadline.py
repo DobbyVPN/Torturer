@@ -14,7 +14,7 @@ from torturer_checks.hosted.deadline import DeadlineError, main, run
 
 
 class HostedDeadlineTests(unittest.TestCase):
-    def test_child_output_is_inherited_and_success_is_preserved(self) -> None:
+    def test_child_output_is_retained_privately_and_success_is_preserved(self) -> None:
         code = run(
             [
                 sys.executable,
@@ -51,7 +51,8 @@ class HostedDeadlineTests(unittest.TestCase):
         sys.stderr.flush()
         self.assertEqual(completed.returncode, 0, completed.stderr)
         combined = completed.stdout + completed.stderr
-        self.assertIn("deadline-cli-child", combined)
+        self.assertNotIn("deadline-cli-child", combined)
+        self.assertIn("evidence status=completed", combined)
         self.assertIn("command_arg_count=4", combined)
         self.assertNotIn(secret_argument, combined)
         self.assertNotIn("print('deadline-cli-child', flush=True)", combined)
@@ -94,6 +95,18 @@ class HostedDeadlineTests(unittest.TestCase):
                 except ProcessLookupError:
                     pass
                 self.fail("deadline left a child process running")
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-tree timing probe")
+    def test_timeout_total_wall_clock_includes_cleanup_and_reap(self) -> None:
+        started = time.monotonic()
+        code = run(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            timeout_seconds=1,
+            grace_seconds=1,
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(code, 124)
+        self.assertLess(elapsed, 1.8)
 
     def test_invalid_bounds_and_empty_commands_fail_closed(self) -> None:
         for timeout in (0, 1801):

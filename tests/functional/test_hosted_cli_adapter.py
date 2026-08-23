@@ -1,16 +1,27 @@
 from __future__ import annotations
 
+import gc
+import hashlib
 import os
 import socket
 from pathlib import Path
+import subprocess
 import tempfile
 import sys
 import time
 import unittest
+import warnings
 from unittest import mock
 
 from torturer_checks.hosted.android import AndroidHostedAdapter
-from torturer_checks.hosted.cli import CommandResult, HostedAdapterError, HostedCLIAdapter, SubprocessRunner
+from torturer_checks.hosted.cli import (
+    CommandResult,
+    HostedAdapterError,
+    HostedCLIAdapter,
+    SubprocessRunner,
+    _ProcessSnapshotProvider,
+    _parse_macos_process_snapshot,
+)
 from torturer_checks.hosted.linux import (
     LinuxHostedAdapter,
     LinuxServiceProcessController,
@@ -20,12 +31,17 @@ from torturer_checks.hosted.macos import MacOSHostedAdapter
 from torturer_checks.hosted.windows import WindowsHostedAdapter
 from torturer_checks.hosted.run import (
     _partition_applicable,
+    _qualification_exit_code,
     _run_scenarios,
     _select_scenarios,
     build_parser,
 )
 from torturer_contract.functional.capabilities import Capability
-from torturer_contract.functional.engine import FunctionalEngine, ScenarioExecutionError
+from torturer_contract.functional.engine import (
+    CapabilityUnavailable,
+    FunctionalEngine,
+    ScenarioExecutionError,
+)
 from torturer_contract.functional.scenarios import ScenarioStep, get_scenario, scenario_catalog
 
 
@@ -181,6 +197,40 @@ class HostedCLIAdapterTests(unittest.TestCase):
         result = adapter.execute(ScenarioStep(id="network", operation="network_transition", timeout_seconds=5))
         self.assertEqual(result, {"network_transition_verified": True})
 
+    def test_linux_network_transition_is_unavailable_without_exact_interface(self) -> None:
+        adapter = LinuxHostedAdapter(cli=self.cli, profile=self.profile, runner=self.runner)
+        self.assertNotIn(Capability.NETWORK_TRANSITION, adapter.capabilities)
+        with self.assertRaises(CapabilityUnavailable):
+            adapter.execute(
+                ScenarioStep(id="network", operation="network_transition", timeout_seconds=5)
+            )
+
+    def test_linux_explicit_interface_keeps_all_ten_catalog_ids_and_applies_network_transition(self) -> None:
+        adapter = LinuxHostedAdapter(
+            cli=self.cli,
+            profile=self.profile,
+            runner=self.runner,
+            network_interface="eth0",
+        )
+        selected = _select_scenarios(None)
+        self.assertEqual(len(selected), 10)
+        self.assertEqual(
+            {scenario.id for scenario in selected},
+            {scenario.id for scenario in scenario_catalog()},
+        )
+        applicable, unsupported = _partition_applicable(selected, adapter.capabilities)
+        self.assertIn("functional.network-transition", {scenario.id for scenario in applicable})
+        self.assertNotIn(
+            "functional.network-transition",
+            {item["scenario_id"] for item in unsupported},
+        )
+        network_result = FunctionalEngine("1" * 64).run(
+            get_scenario("functional.network-transition"),
+            adapter,
+            _provenance(adapter),
+        )
+        self.assertEqual(network_result.outcome, "passed")
+
     def test_shared_desktop_endurance_is_url_gated_and_bounded(self) -> None:
         adapter = HostedCLIAdapter(
             cli=self.cli, profile=self.profile, runner=self.runner,
@@ -239,6 +289,7 @@ class HostedCLIAdapterTests(unittest.TestCase):
         parsed = build_parser().parse_args([
             "--platform", "linux", "--cli", str(self.cli), "--profile", str(self.profile),
             "--source-repository", "DobbyVPN/DobbyVPN", "--source-sha", "a" * 40,
+            "--platform-version", "24.04",
             "--candidate-manifest", str(self.cli), "--server-image-digest", "sha256:" + "b" * 64,
             "--output", str(self.directory.name + "/result.json"), "--scenario-id",
             "functional.configure", "--scenario-id", "functional.disconnect-cleanup",
@@ -278,6 +329,28 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertIn("functional.sleep-wake", unsupported_ids)
         self.assertIn("functional.network-transition", unsupported_ids)
         self.assertIn("functional.bounded-endurance", unsupported_ids)
+        self.assertTrue(
+            all(item["reason_code"] == "CAPABILITY_UNAVAILABLE" for item in unsupported)
+        )
+
+    def test_unsupported_scenarios_are_unavailable_results_and_fail_gate(self) -> None:
+        scenario = get_scenario("functional.sleep-wake")
+        results, reset_failures, reset_count = _run_scenarios(
+            FunctionalEngine("1" * 64), (scenario,), self.adapter, _provenance(self.adapter)
+        )
+        self.assertEqual(reset_count, 1)
+        self.assertEqual(reset_failures, [])
+        self.assertEqual(results[0]["scenario_id"], scenario.id)
+        self.assertEqual(results[0]["outcome"], "unavailable")
+        self.assertEqual(results[0]["reason_code"], "CAPABILITY_UNAVAILABLE")
+        self.assertEqual(
+            _qualification_exit_code(
+                [{"outcome": "passed"}],
+                [{"scenario_id": scenario.id, "reason_code": "CAPABILITY_UNAVAILABLE"}],
+                [],
+            ),
+            2,
+        )
 
     def test_hosted_runner_accepts_all_feasible_cli_scenarios_in_one_lane(self) -> None:
         selected = _select_scenarios([
@@ -369,6 +442,26 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertEqual(service.timeouts, [9.0])
         self.assertEqual(self.runner.timeouts, [8.0, 7.0, 6.0])
 
+    def test_linux_process_loss_rejects_expired_deadline_instead_of_using_minimum(self) -> None:
+        class FakeService:
+            def __init__(self) -> None:
+                self.timeouts: list[float] = []
+
+            def restart_after_loss(self, timeout: float) -> None:
+                self.timeouts.append(timeout)
+
+        adapter = LinuxHostedAdapter(cli=self.cli, profile=self.profile, runner=self.runner)
+        service = FakeService()
+        adapter.service = service  # type: ignore[assignment]
+        with mock.patch(
+            "torturer_checks.hosted.linux.time.monotonic",
+            side_effect=[100.0, 100.02],
+        ):
+            with self.assertRaisesRegex(ScenarioExecutionError, "PROCESS_LOSS_TIMEOUT"):
+                adapter._process_loss(0.01)
+        self.assertEqual(service.timeouts, [])
+        self.assertEqual(self.runner.calls, [])
+
     def test_linux_restart_launcher_tracks_exact_child_pid(self) -> None:
         root = Path(self.directory.name)
         binary = root / "service"
@@ -383,6 +476,10 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.addCleanup(listener.close)
         pid_file = root / "service.pid"
         raw_directory = root / "service-raw"
+        reused_log = raw_directory / "service-restart-001.raw.log"
+        raw_directory.mkdir(mode=0o700)
+        reused_log.write_bytes(b"previous service evidence\n")
+        reused_log.chmod(0o600)
 
         class ServiceRunner:
             def __init__(self) -> None:
@@ -435,6 +532,10 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertEqual(launcher[6], str(binary))
         self.assertEqual(launcher[7], str(socket_path))
         self.assertEqual(launcher[9], str(library))
+        launched_log = Path(launcher[10])
+        self.assertNotEqual(launched_log, reused_log)
+        self.assertEqual(reused_log.read_bytes(), b"previous service evidence\n")
+        self.assertEqual(launched_log.stat().st_mode & 0o777, 0o600)
 
     def test_subprocess_runner_retains_complete_stdout_and_stderr_bytes(self) -> None:
         raw = Path(self.directory.name) / "raw"
@@ -450,12 +551,41 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertIn(b"err\n", retained)
         evidence = runner.safe_evidence()
         self.assertEqual(evidence[0]["returncode"], 0)
-        self.assertEqual(evidence[0]["evidence_file"], retained_path.name)
+        self.assertEqual(len(evidence[0]["evidence_id"]), 32)
+        self.assertTrue(all(character in "0123456789abcdef" for character in evidence[0]["evidence_id"]))
         self.assertEqual(evidence[0]["stdout_bytes"], 14)
+        original_length = len(retained)
+        self.assertEqual(evidence[0]["evidence_bytes"], original_length)
+        self.assertEqual(
+            evidence[0]["evidence_sha256"],
+            hashlib.sha256(retained).hexdigest(),
+        )
         self.assertNotIn("198.51.100.10", repr(evidence[0]))
         self.assertNotIn("stdout_sha256", evidence[0])
         self.assertNotIn("stderr_sha256", evidence[0])
         self.assertNotIn("python3", repr(evidence[0]))
+        retained_path.write_bytes(b"mutated-after-retention\n")
+        self.assertEqual(evidence[0]["evidence_bytes"], original_length)
+        self.assertNotEqual(
+            evidence[0]["evidence_sha256"], hashlib.sha256(retained_path.read_bytes()).hexdigest()
+        )
+
+    def test_macos_process_census_is_bounded_and_retained(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ("ps",),
+            0,
+            b"123 1 123 Mon Aug 23 10:00:00 2026\n",
+            b"ps diagnostic\n",
+        )
+        with (
+            mock.patch.object(Path, "is_dir", return_value=False),
+            mock.patch("torturer_checks.hosted.cli.subprocess.run", return_value=completed) as run,
+        ):
+            provider = _ProcessSnapshotProvider()
+            snapshot = provider()
+        self.assertEqual(snapshot, _parse_macos_process_snapshot(completed.stdout))
+        self.assertEqual(run.call_args.kwargs["timeout"], 0.25)
+        self.assertIn(b"ps diagnostic\n", provider.diagnostics)
 
     def test_subprocess_runner_never_overwrites_another_runner_sequence(self) -> None:
         raw = Path(self.directory.name) / "shared-raw"
@@ -475,9 +605,10 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertEqual(sum(b"first\\n" in item for item in contents), 1)
         self.assertEqual(sum(b"second\\n" in item for item in contents), 1)
         self.assertEqual(
-            {first.safe_evidence()[0]["evidence_file"], second.safe_evidence()[0]["evidence_file"]},
-            {path.name for path in retained},
+            {first.safe_evidence()[0]["evidence_id"], second.safe_evidence()[0]["evidence_id"]},
+            {first.safe_evidence()[0]["evidence_id"], second.safe_evidence()[0]["evidence_id"]},
         )
+        self.assertNotEqual(first.safe_evidence()[0]["evidence_id"], second.safe_evidence()[0]["evidence_id"])
         self.assertTrue(all((path.stat().st_mode & 0o777) == 0o600 for path in retained))
 
     @unittest.skipUnless(os.name == "posix", "process-group assertion requires POSIX")
@@ -511,6 +642,192 @@ class HostedCLIAdapterTests(unittest.TestCase):
             time.sleep(0.05)
         else:
             self.fail(f"timed-out child process {child_pid} survived the process-group kill")
+
+    @unittest.skipUnless(os.name == "posix", "process-tree timing assertion requires POSIX")
+    def test_subprocess_runner_timeout_is_one_total_wall_clock_budget(self) -> None:
+        raw = Path(self.directory.name) / "total-bound-raw"
+        runner = SubprocessRunner(raw)
+        started = time.monotonic()
+        with self.assertRaisesRegex(HostedAdapterError, "COMMAND_TIMEOUT"):
+            runner.run(
+                (sys.executable, "-c", "import time; time.sleep(60)"),
+                timeout_seconds=0.4,
+            )
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.2)
+        evidence = runner.safe_evidence()
+        self.assertEqual(len(evidence), 1)
+        self.assertIn("timed_out", evidence[0])
+
+    @unittest.skipUnless(os.name == "posix", "process-tree reaping assertion requires POSIX")
+    def test_subprocess_runner_reaps_leader_when_cleanup_tail_is_tiny(self) -> None:
+        raw = Path(self.directory.name) / "tiny-reap-raw"
+        runner = SubprocessRunner(raw)
+        with warnings.catch_warnings(record=True) as observed:
+            warnings.simplefilter("always", ResourceWarning)
+            with self.assertRaisesRegex(HostedAdapterError, "COMMAND_TIMEOUT"):
+                runner.run(
+                    (sys.executable, "-c", "import time; time.sleep(60)"),
+                    timeout_seconds=0.2,
+                )
+            gc.collect()
+        self.assertFalse(
+            [warning for warning in observed if issubclass(warning.category, ResourceWarning)],
+            "timeout cleanup must reap the leader before returning",
+        )
+
+    @unittest.skipUnless(os.name == "posix", "process-group reaping assertion requires POSIX")
+    def test_subprocess_runner_reserves_reap_tail_after_tree_cleanup(self) -> None:
+        raw = Path(self.directory.name) / "reap-reserve-raw"
+        runner = SubprocessRunner(raw)
+        communicate_timeouts: list[float] = []
+        reap_timeouts: list[float] = []
+
+        class FakeMonitor:
+            identities = ()
+
+            def start(self) -> None:
+                return None
+
+            def stop(self, timeout: float) -> bool:
+                return True
+
+        class FakeProcess:
+            pid = 12345
+            returncode = None
+            stdout = None
+            stderr = None
+
+            def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+                communicate_timeouts.append(timeout)
+                raise subprocess.TimeoutExpired(("fake",), timeout, output=b"partial-out", stderr=b"partial-err")
+
+            def poll(self) -> None:
+                return None
+
+            def kill(self) -> None:
+                return None
+
+        process = FakeProcess()
+
+        def reap(_process: FakeProcess, timeout: float) -> tuple[bool, bytes, bytes, bytes]:
+            reap_timeouts.append(timeout)
+            return True, b"drained-out", b"drained-err", b""
+
+        def tree_cleanup(*_args, **_kwargs) -> bytes:
+            time.sleep(0.1)
+            return b"PROCESS_TREE_STATUS=gone\n"
+
+        with (
+            mock.patch("torturer_checks.hosted.cli.subprocess.Popen", return_value=process),
+            mock.patch("torturer_checks.hosted.cli._ProcessTreeMonitor", return_value=FakeMonitor()),
+            mock.patch("torturer_checks.hosted.cli._kill_process_tree", side_effect=tree_cleanup),
+            mock.patch("torturer_checks.hosted.cli._tree_status", return_value="gone"),
+            mock.patch("torturer_checks.hosted.cli._tracked_processes", return_value=()),
+            mock.patch("torturer_checks.hosted.cli._kill_process", return_value=b""),
+            mock.patch("torturer_checks.hosted.cli._bounded_reap_process", side_effect=reap),
+            self.assertRaisesRegex(HostedAdapterError, "COMMAND_TIMEOUT"),
+        ):
+            runner.run(("fake",), timeout_seconds=0.2)
+
+        self.assertEqual(len(communicate_timeouts), 2)
+        self.assertGreaterEqual(len(reap_timeouts), 1)
+        # A 0.2-second budget has a 0.1-second cleanup reserve and must leave
+        # the explicit 0.05-second reaping tail after the drain attempt.
+        self.assertLessEqual(communicate_timeouts[1], 0.08)
+        self.assertTrue(all(timeout <= 0.05 for timeout in reap_timeouts))
+        retained = next(raw.glob("command-001*.raw.log")).read_bytes()
+        self.assertIn(b"drained-out", retained)
+        self.assertIn(b"drained-err", retained)
+
+    @unittest.skipUnless(os.name == "posix", "detached process-tree assertion requires POSIX")
+    def test_subprocess_runner_kills_detached_resistant_descendant_and_retains_markers(self) -> None:
+        raw = Path(self.directory.name) / "detached-timeout-raw"
+        runner = SubprocessRunner(raw)
+        child_script = (
+            "import os,signal,time,sys; os.setsid(); signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print('detached descendant stdout', flush=True); "
+            "print('detached descendant stderr', file=sys.stderr, flush=True); time.sleep(60)"
+        )
+        parent_script = (
+            "import subprocess,sys,time; "
+            "child=subprocess.Popen([sys.executable, '-c', sys.argv[1]]); "
+            "print(child.pid, flush=True); time.sleep(60)"
+        )
+        with self.assertRaisesRegex(HostedAdapterError, "COMMAND_TIMEOUT"):
+            runner.run(
+                (sys.executable, "-c", parent_script, child_script),
+                timeout_seconds=0.6,
+            )
+
+        retained = next(raw.glob("command-001*.raw.log"))
+        content = retained.read_bytes()
+        self.assertIn(b"detached descendant stdout", content)
+        self.assertIn(b"detached descendant stderr", content)
+        self.assertIn(b"PROCESS_TREE_TRACKED=", content)
+        self.assertIn(b"PROCESS_TREE_STATUS=gone", content)
+        self.assertNotIn(b"EVIDENCE_INCOMPLETE=1", content)
+
+    @unittest.skipUnless(os.name == "posix", "process-group assertion requires POSIX")
+    def test_subprocess_runner_rejects_zero_exit_leader_with_detached_descendant(self) -> None:
+        raw = Path(self.directory.name) / "zero-exit-detached-raw"
+        runner = SubprocessRunner(raw)
+        child_script = (
+            "import os,signal,time; os.setsid(); signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "os.close(1); os.close(2); time.sleep(60)"
+        )
+        parent_script = (
+            "import os,subprocess,sys; child=subprocess.Popen([sys.executable, '-c', sys.argv[1]]); "
+            "print(child.pid, flush=True); import time; time.sleep(0.15); os._exit(0)"
+        )
+        with self.assertRaisesRegex(HostedAdapterError, "PROCESS_TREE_UNPROVEN"):
+            runner.run(
+                (sys.executable, "-c", parent_script, child_script),
+                timeout_seconds=2.0,
+            )
+        retained = next(raw.glob("command-001*.raw.log"))
+        content = retained.read_bytes()
+        self.assertIn(b"PROCESS_TREE_SURVIVOR_DETECTED=1", content)
+        self.assertIn(b"PROCESS_TREE_STATUS=gone", content)
+        self.assertIn(b"EVIDENCE_INCOMPLETE=1", content)
+        self.assertNotIn(b"ResourceWarning", content)
+
+    @unittest.skipUnless(os.name == "posix", "process-tree drain assertion requires POSIX")
+    def test_subprocess_runner_marks_evidence_incomplete_after_drain_timeout(self) -> None:
+        raw = Path(self.directory.name) / "drain-timeout-raw"
+        runner = SubprocessRunner(raw)
+        parent_script = (
+            "import pathlib,subprocess,sys,time; "
+            "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+            "print(child.pid, flush=True); time.sleep(60)"
+        )
+        try:
+            with mock.patch(
+                "torturer_checks.hosted.cli._kill_process_tree",
+                return_value=b"PROCESS_TREE_STATUS=gone\n",
+            ):
+                with self.assertRaisesRegex(HostedAdapterError, "COMMAND_TIMEOUT"):
+                    runner.run(
+                        (sys.executable, "-c", parent_script),
+                        timeout_seconds=0.6,
+                    )
+            retained = next(raw.glob("command-001*.raw.log"))
+            content = retained.read_bytes()
+            self.assertIn(b"OUTPUT_DRAIN_TIMEOUT=1", content)
+            self.assertIn(b"PROCESS_TREE_FINAL_STATUS=alive", content)
+            self.assertIn(b"EVIDENCE_INCOMPLETE=1", content)
+        finally:
+            try:
+                child_pid = int(
+                    next(raw.glob("command-001*.raw.log"))
+                    .read_text(encoding="utf-8")
+                    .split("stdout-begin\n", 1)[1]
+                    .split("\nstdout-end", 1)[0]
+                    .strip()
+                )
+                os.kill(child_pid, 9)
+            except (FileNotFoundError, IndexError, ValueError, ProcessLookupError):
+                pass
 
     def test_throughput_urls_reject_query_fragment_and_userinfo(self) -> None:
         for invalid in (

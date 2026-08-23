@@ -12,7 +12,13 @@ from torturer_contract.functional.capabilities import Capability
 from torturer_contract.functional.engine import CapabilityUnavailable, ScenarioExecutionError
 from torturer_contract.functional.scenarios import ScenarioStep
 
-from .cli import CommandRunner, HostedAdapterError, HostedCLIAdapter
+from .cli import (
+    CommandRunner,
+    HostedAdapterError,
+    HostedCLIAdapter,
+    _allocate_owner_only_path,
+    _ensure_owner_only_directory,
+)
 
 
 _PID = re.compile(r"^[1-9][0-9]{0,9}$")
@@ -29,12 +35,12 @@ if [ -n "$library_path" ]; then
     DOBBYVPN_CONTROL_SOCKET="$control_socket" \
     DOBBYVPN_CONTROL_PEER_UID="$peer_uid" \
     LD_LIBRARY_PATH="$library_path" \
-    "$binary" > "$log_path" 2>&1 < /dev/null &
+    "$binary" >> "$log_path" 2>&1 < /dev/null &
 else
   env \
     DOBBYVPN_CONTROL_SOCKET="$control_socket" \
     DOBBYVPN_CONTROL_PEER_UID="$peer_uid" \
-    "$binary" > "$log_path" 2>&1 < /dev/null &
+    "$binary" >> "$log_path" 2>&1 < /dev/null &
 fi
 printf '%s\n' "$!"
 """
@@ -69,11 +75,17 @@ class LinuxServiceProcessController:
         self.pid_file = pid_file
         self.runner = runner
         self.raw_directory = raw_directory
-        self.raw_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(self.raw_directory, 0o700)
+        _ensure_owner_only_directory(self.raw_directory)
         self._restart_number = 0
         self._write_pid(pid)
         self._verify_candidate_pid()
+
+    @staticmethod
+    def _remaining(deadline: float, failure: str) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ScenarioExecutionError(failure)
+        return remaining
 
     def _write_pid(self, pid: int) -> None:
         temporary = self.pid_file.with_name(f".{self.pid_file.name}.tmp")
@@ -93,11 +105,11 @@ class LinuxServiceProcessController:
         result = self._sudo(("kill", "-0", str(self.pid)), timeout, "SERVICE_PROBE_FAILED")
         return result.returncode == 0 and not result.timed_out
 
-    def _verify_candidate_pid(self) -> None:
+    def _verify_candidate_pid(self, timeout: float = 5.0) -> None:
         try:
             result = self.runner.run(
                 ("sudo", "-n", "readlink", "-f", f"/proc/{self.pid}/exe"),
-                timeout_seconds=5.0,
+                timeout_seconds=timeout,
             )
         except HostedAdapterError as error:
             raise HostedAdapterError("SERVICE_PID_PROBE_FAILED") from error
@@ -114,17 +126,17 @@ class LinuxServiceProcessController:
     def _wait_dead(self, timeout: float) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if not self._alive(max(0.2, deadline - time.monotonic())):
+            if not self._alive(self._remaining(deadline, "SERVICE_DID_NOT_EXIT")):
                 return
             time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
         raise ScenarioExecutionError("SERVICE_DID_NOT_EXIT")
 
-    def _socket_ready(self) -> bool:
+    def _socket_ready(self, timeout: float = 0.2) -> bool:
         if not self.socket.is_socket():
             return False
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            probe.settimeout(0.2)
+            probe.settimeout(timeout)
             probe.connect(str(self.socket))
             return True
         except OSError:
@@ -134,7 +146,11 @@ class LinuxServiceProcessController:
 
     def _start(self, timeout: float) -> None:
         self._restart_number += 1
-        log_path = self.raw_directory / f"service-restart-{self._restart_number:03d}.raw.log"
+        log_path = _allocate_owner_only_path(
+            self.raw_directory,
+            f"service-restart-{self._restart_number:03d}",
+            ".raw.log",
+        )
         deadline = time.monotonic() + timeout
         library_value = str(self.library_path) if self.library_path is not None else ""
         command = (
@@ -148,7 +164,10 @@ class LinuxServiceProcessController:
         )
         try:
             result = self.runner.run(
-                command, timeout_seconds=min(10.0, max(0.2, deadline - time.monotonic()))
+                command,
+                timeout_seconds=min(
+                    10.0, self._remaining(deadline, "SERVICE_RESTART_TIMEOUT")
+                ),
             )
         except HostedAdapterError as error:
             raise ScenarioExecutionError("SERVICE_RESTART_UNAVAILABLE") from error
@@ -159,23 +178,31 @@ class LinuxServiceProcessController:
             raise ScenarioExecutionError("SERVICE_RESTART_PID_INVALID")
         self.pid = int(value)
         self._write_pid(self.pid)
-        while time.monotonic() < deadline:
-            if not self._alive(max(0.2, deadline - time.monotonic())):
+        while True:
+            remaining = self._remaining(deadline, "SERVICE_RESTART_TIMEOUT")
+            if not self._alive(remaining):
                 raise ScenarioExecutionError("SERVICE_RESTART_EXITED")
-            if self._socket_ready():
-                self._verify_candidate_pid()
+            # Reserve half of the observed remainder for the socket probe and
+            # use the other half for the candidate-PID proof. This keeps both
+            # operations inside the same absolute restart deadline without a
+            # second unbounded wait or an extra clock race.
+            socket_timeout = min(0.2, remaining / 2.0)
+            if self._socket_ready(socket_timeout):
+                verify_timeout = remaining - socket_timeout
+                if verify_timeout <= 0:
+                    raise ScenarioExecutionError("SERVICE_RESTART_TIMEOUT")
+                self._verify_candidate_pid(verify_timeout)
                 return
-            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
-        raise ScenarioExecutionError("SERVICE_RESTART_NOT_READY")
+            time.sleep(min(0.5, remaining))
 
     def restart_after_loss(self, timeout: float) -> None:
         deadline = time.monotonic() + timeout
-        remaining = max(0.2, deadline - time.monotonic())
+        remaining = self._remaining(deadline, "PROCESS_LOSS_TIMEOUT")
         result = self._sudo(("kill", "-KILL", str(self.pid)), remaining, "SERVICE_KILL_FAILED")
         if result.returncode != 0:
             raise ScenarioExecutionError("SERVICE_KILL_FAILED")
-        self._wait_dead(max(0.2, deadline - time.monotonic()))
-        self._start(max(0.2, deadline - time.monotonic()))
+        self._wait_dead(self._remaining(deadline, "PROCESS_LOSS_TIMEOUT"))
+        self._start(self._remaining(deadline, "PROCESS_LOSS_TIMEOUT"))
 
 
 class LinuxHostedAdapter(HostedCLIAdapter):
@@ -248,12 +275,18 @@ class LinuxHostedAdapter(HostedCLIAdapter):
             time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
         finally:
             if down_succeeded:
-                up = self._privileged(("ip", "link", "set", "dev", self.network_interface, "up"), max(0.2, deadline - time.monotonic()), "NETWORK_UP_FAILED")
+                up = self._privileged(
+                    ("ip", "link", "set", "dev", self.network_interface, "up"),
+                    self._remaining(deadline, "NETWORK_UP_FAILED"),
+                    "NETWORK_UP_FAILED",
+                )
                 if up.returncode != 0:
                     raise ScenarioExecutionError("NETWORK_UP_FAILED")
-        if not self._connected(max(0.2, deadline - time.monotonic())):
+        if not self._connected(self._remaining(deadline, "NETWORK_TUNNEL_NOT_RESTORED")):
             raise ScenarioExecutionError("NETWORK_TUNNEL_NOT_RESTORED")
-        if not self._routing_identity_changed(max(0.2, deadline - time.monotonic())):
+        if not self._routing_identity_changed(
+            self._remaining(deadline, "NETWORK_ROUTING_NOT_RESTORED")
+        ):
             raise ScenarioExecutionError("NETWORK_ROUTING_NOT_RESTORED")
         return {"network_transition_verified": time.monotonic() <= deadline}
 

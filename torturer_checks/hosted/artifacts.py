@@ -10,15 +10,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import re
 import stat
+import threading
+import time
 from pathlib import PurePosixPath
 from typing import Iterable
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 import zipfile
+
+from torturer_checks.public_output import emit_evidence
 
 
 class ArtifactDownloadError(RuntimeError):
@@ -47,12 +52,27 @@ class _CredentialSafeRedirectHandler(HTTPRedirectHandler):
 
 
 _OPENER = build_opener(_CredentialSafeRedirectHandler())
+_DEFAULT_TRANSFER_TIMEOUT_SECONDS = 30.0
+_TRANSFER_CHUNK_BYTES = 64 * 1024
+_DEADLINE_CLEANUP_RESERVE_SECONDS = 0.01
 
 
-def _owner_dir(path: Path) -> None:
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise ArtifactDownloadError("ARTIFACT_TRANSFER_TIMEOUT")
+
+
+def _deadline_for(timeout_seconds: float) -> float:
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ArtifactDownloadError("ARTIFACT_TRANSFER_TIMEOUT")
+    return time.monotonic() + timeout_seconds
+
+
+def _owner_dir(path: Path, *, deadline: float | None = None) -> None:
     """Create/check a private directory without traversing symlinks."""
 
     path = Path(path)
+    _check_deadline(deadline)
     missing: list[Path] = []
     cursor = path
     while True:
@@ -70,6 +90,7 @@ def _owner_dir(path: Path) -> None:
             raise ArtifactDownloadError("owner-only directory is not a real directory")
         break
     for directory in reversed(missing):
+        _check_deadline(deadline)
         try:
             directory.mkdir(mode=0o700)
         except FileExistsError:
@@ -82,6 +103,7 @@ def _owner_dir(path: Path) -> None:
             raise ArtifactDownloadError("owner-only directory contains a symlink")
         os.chmod(directory, 0o700)
     try:
+        _check_deadline(deadline)
         info = path.lstat()
     except OSError as error:
         raise ArtifactDownloadError("owner-only directory is unavailable") from error
@@ -91,11 +113,42 @@ def _owner_dir(path: Path) -> None:
         raise ArtifactDownloadError("owner-only directory has unsafe permissions")
 
 
-def _owner_file(path: Path, data: bytes) -> None:
+def _fsync_with_deadline(descriptor: int, deadline: float | None) -> None:
+    """Flush through a duplicate descriptor without overrunning the deadline."""
+
+    if deadline is None:
+        os.fsync(descriptor)
+        return
+    _check_deadline(deadline)
+    duplicate = os.dup(descriptor)
+    result: list[BaseException] = []
+
+    def flush() -> None:
+        try:
+            os.fsync(duplicate)
+        except BaseException as error:  # preserve the provider/filesystem failure
+            result.append(error)
+        finally:
+            os.close(duplicate)
+
+    worker = threading.Thread(target=flush, name="artifact-fsync", daemon=True)
+    worker.start()
+    remaining = max(0.0, deadline - time.monotonic() - _DEADLINE_CLEANUP_RESERVE_SECONDS)
+    worker.join(remaining)
+    if worker.is_alive():
+        raise ArtifactDownloadError("ARTIFACT_TRANSFER_TIMEOUT")
+    if result:
+        raise result[0]
+    _check_deadline(deadline)
+
+
+def _owner_file(path: Path, data: bytes, *, deadline: float | None = None) -> None:
     """Create one owner-only file, refusing every existing destination."""
 
     path = Path(path)
-    _owner_dir(path.parent)
+    _check_deadline(deadline)
+    _owner_dir(path.parent, deadline=deadline)
+    _check_deadline(deadline)
     temporary = path.with_name(f".{path.name}.tmp")
     for candidate in (path, temporary):
         try:
@@ -114,10 +167,13 @@ def _owner_file(path: Path, data: bytes) -> None:
         raise ArtifactDownloadError("owner-only destination cannot be created") from error
     try:
         with os.fdopen(descriptor, "wb", closefd=True) as output:
-
-            output.write(data)
+            offset = 0
+            while offset < len(data):
+                _check_deadline(deadline)
+                offset += output.write(data[offset : offset + _TRANSFER_CHUNK_BYTES])
             output.flush()
-            os.fsync(output.fileno())
+            _fsync_with_deadline(output.fileno(), deadline)
+        _check_deadline(deadline)
         info = path.lstat()
         if stat.S_ISLNK(info.st_mode) or info.st_mode & 0o077:
             raise ArtifactDownloadError("owner-only file has unsafe permissions")
@@ -135,7 +191,116 @@ def _token() -> str:
     return token
 
 
-def _get(url: str) -> bytes:
+def _close_response(response: object, deadline: float | None = None) -> bool:
+    close = getattr(response, "close", None)
+    if not callable(close):
+        return True
+    if deadline is None:
+        close()
+        return True
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return False
+    result: list[BaseException] = []
+
+    def close_response() -> None:
+        try:
+            close()
+        except BaseException as error:  # preserve provider cleanup failure
+            result.append(error)
+
+    worker = threading.Thread(target=close_response, name="artifact-response-closer", daemon=True)
+    worker.start()
+    worker.join(remaining)
+    if worker.is_alive():
+        return False
+    if result:
+        raise result[0]
+    return True
+
+
+def _read_chunk_with_deadline(response: object, deadline: float) -> bytes:
+    """Read one response chunk without allowing a blocking read to overrun the deadline."""
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ArtifactDownloadError("ARTIFACT_TRANSFER_TIMEOUT")
+    result: list[object] = []
+
+    def read_chunk() -> None:
+        try:
+            result.append(response.read(_TRANSFER_CHUNK_BYTES))  # type: ignore[attr-defined]
+        except BaseException as error:  # retain the original provider failure
+            result.append(error)
+
+    reader = threading.Thread(target=read_chunk, name="artifact-response-reader", daemon=True)
+    reader.start()
+    reader.join(max(0.0, remaining - _DEADLINE_CLEANUP_RESERVE_SECONDS))
+    if reader.is_alive():
+        _close_response(response, deadline)
+        raise ArtifactDownloadError("ARTIFACT_TRANSFER_TIMEOUT")
+    if not result:
+        raise ArtifactDownloadError("ARTIFACT_TRANSFER_FAILED")
+    value = result[0]
+    if isinstance(value, BaseException):
+        if isinstance(value, TimeoutError):
+            raise ArtifactDownloadError("ARTIFACT_TRANSFER_TIMEOUT") from value
+        raise value
+    if not isinstance(value, bytes):
+        raise ArtifactDownloadError("ARTIFACT_TRANSFER_FAILED")
+    if time.monotonic() >= deadline:
+        _close_response(response, deadline)
+        raise ArtifactDownloadError("ARTIFACT_TRANSFER_TIMEOUT")
+    return value
+
+
+def _open_with_deadline(request: Request, deadline: float):
+    """Open the response without allowing a blocking provider call to overrun the deadline."""
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ArtifactDownloadError("ARTIFACT_TRANSFER_TIMEOUT")
+    result: list[object] = []
+    cancelled = threading.Event()
+
+    def open_response() -> None:
+        try:
+            response = _OPENER.open(request, timeout=min(30.0, remaining))
+            if cancelled.is_set() or time.monotonic() >= deadline:
+                _close_response(response, deadline)
+            else:
+                result.append(response)
+        except BaseException as error:  # retain the original provider failure
+            if not cancelled.is_set():
+                result.append(error)
+
+    opener = threading.Thread(target=open_response, name="artifact-response-opener", daemon=True)
+    opener.start()
+    opener.join(max(0.0, remaining - _DEADLINE_CLEANUP_RESERVE_SECONDS))
+    if opener.is_alive():
+        cancelled.set()
+        if result:
+            _close_response(result[0])
+        raise ArtifactDownloadError("ARTIFACT_TRANSFER_TIMEOUT")
+    if not result:
+        if time.monotonic() >= deadline:
+            raise ArtifactDownloadError("ARTIFACT_TRANSFER_TIMEOUT")
+        raise ArtifactDownloadError("ARTIFACT_TRANSFER_FAILED")
+    value = result[0]
+    if isinstance(value, BaseException):
+        raise value
+    return value
+
+
+def _get(
+    url: str,
+    *,
+    timeout_seconds: float = _DEFAULT_TRANSFER_TIMEOUT_SECONDS,
+    deadline: float | None = None,
+) -> bytes:
+    if deadline is None:
+        deadline = _deadline_for(timeout_seconds)
+    _check_deadline(deadline)
     request = Request(
         url,
         headers={
@@ -146,10 +311,42 @@ def _get(url: str) -> bytes:
         },
     )
     try:
-        with _OPENER.open(request, timeout=30) as response:
-            return response.read()
+        response = _open_with_deadline(request, deadline)
+    except ArtifactDownloadError:
+        raise
+    except TimeoutError as error:
+        raise ArtifactDownloadError("ARTIFACT_TRANSFER_TIMEOUT") from error
     except Exception as error:  # pragma: no cover - provider/network boundary
         raise ArtifactDownloadError("GitHub artifact request failed") from error
+    chunks: list[bytes] = []
+    pending: BaseException | None = None
+    value: bytes | None = None
+    try:
+        while True:
+            chunk = _read_chunk_with_deadline(response, deadline)
+            if not chunk:
+                value = b"".join(chunks)
+                break
+            chunks.append(chunk)
+    except BaseException as error:
+        pending = error
+    finally:
+        try:
+            if not _close_response(response, deadline) and pending is None:
+                pending = ArtifactDownloadError("ARTIFACT_TRANSFER_TIMEOUT")
+        except BaseException as error:
+            if pending is None:
+                pending = error
+    if pending is not None:
+        if isinstance(pending, ArtifactDownloadError):
+            raise pending
+        if isinstance(pending, TimeoutError):
+            raise ArtifactDownloadError("ARTIFACT_TRANSFER_TIMEOUT") from pending
+        if isinstance(pending, Exception):
+            raise ArtifactDownloadError("GitHub artifact request failed") from pending
+        raise pending
+    assert value is not None
+    return value
 
 
 def _repository(value: str) -> str:
@@ -195,11 +392,33 @@ def _safe_member_name(value: str) -> str:
     return value
 
 
-def _extract(archive: Path, output: Path, expected: set[str]) -> None:
-    _owner_dir(output)
+def _read_zip_member(bundle: zipfile.ZipFile, item: zipfile.ZipInfo, deadline: float | None) -> bytes:
+    chunks: list[bytes] = []
+    with bundle.open(item, "r") as source:
+        while True:
+            _check_deadline(deadline)
+            chunk = source.read(_TRANSFER_CHUNK_BYTES)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    _check_deadline(deadline)
+    return b"".join(chunks)
+
+
+def _extract(
+    archive: Path,
+    output: Path,
+    expected: set[str],
+    *,
+    deadline: float | None = None,
+) -> None:
+    _check_deadline(deadline)
+    _owner_dir(output, deadline=deadline)
     try:
         with zipfile.ZipFile(archive) as bundle:
+            _check_deadline(deadline)
             infos = bundle.infolist()
+            _check_deadline(deadline)
             names = {item.filename for item in infos}
             if len(names) != len(infos):
                 raise ArtifactDownloadError("artifact contains duplicate members")
@@ -209,6 +428,7 @@ def _extract(archive: Path, output: Path, expected: set[str]) -> None:
                 )
             safe_items: list[tuple[zipfile.ZipInfo, str]] = []
             for item in infos:
+                _check_deadline(deadline)
                 name = _safe_member_name(item.filename)
                 mode = (item.external_attr >> 16) & 0o170000
                 if item.is_dir() or mode not in (0, stat.S_IFREG):
@@ -216,7 +436,7 @@ def _extract(archive: Path, output: Path, expected: set[str]) -> None:
                 safe_items.append((item, name))
             for item, name in safe_items:
                 target = output / name
-                _owner_file(target, bundle.read(item))
+                _owner_file(target, _read_zip_member(bundle, item, deadline), deadline=deadline)
     except (OSError, zipfile.BadZipFile) as error:
         raise ArtifactDownloadError("artifact archive is unreadable") from error
 
@@ -230,6 +450,7 @@ def download_artifact(
     expected_files: Iterable[str],
     metadata_path: Path,
     archive_path: Path,
+    timeout_seconds: float = _DEFAULT_TRANSFER_TIMEOUT_SECONDS,
 ) -> dict[str, object]:
     """Fetch and extract one exact artifact, retaining complete raw bytes."""
 
@@ -239,23 +460,44 @@ def download_artifact(
     expected_values = tuple(expected_files)
     if not expected_values or len(set(expected_values)) != len(expected_values):
         raise ArtifactDownloadError("artifact allow-list is invalid")
+    deadline = _deadline_for(timeout_seconds)
     try:
         expected = {_safe_member_name(value) for value in expected_values}
     except ArtifactDownloadError as error:
         raise ArtifactDownloadError("artifact allow-list is invalid") from error
     listing_url = f"https://api.github.com/repos/{repository}/actions/artifacts?name={quote(artifact_name, safe='')}&per_page=100"
-    listing_bytes = _get(listing_url)
-    _owner_file(metadata_path, listing_bytes)
+    listing_bytes = _get(listing_url, deadline=deadline)
+    _owner_file(metadata_path, listing_bytes, deadline=deadline)
+    _check_deadline(deadline)
     try:
         listing = json.loads(listing_bytes)
+        _check_deadline(deadline)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ArtifactDownloadError("artifact listing is not JSON") from error
     if not isinstance(listing, dict):
         raise ArtifactDownloadError("artifact listing has an unsafe shape")
     selected = _select(listing, name=artifact_name, run_id=run_id)
-    archive_bytes = _get(str(selected["archive_download_url"]))
-    _owner_file(archive_path, archive_bytes)
-    _extract(archive_path, output_dir, expected)
+    _check_deadline(deadline)
+    archive_bytes = _get(str(selected["archive_download_url"]), deadline=deadline)
+    _owner_file(archive_path, archive_bytes, deadline=deadline)
+    _check_deadline(deadline)
+    extraction_result: list[BaseException] = []
+
+    def extract() -> None:
+        try:
+            _extract(archive_path, output_dir, expected, deadline=deadline)
+        except BaseException as error:
+            extraction_result.append(error)
+
+    worker = threading.Thread(target=extract, name="artifact-extractor", daemon=True)
+    worker.start()
+    remaining = max(0.0, deadline - time.monotonic() - _DEADLINE_CLEANUP_RESERVE_SECONDS)
+    worker.join(remaining)
+    if worker.is_alive():
+        raise ArtifactDownloadError("ARTIFACT_TRANSFER_TIMEOUT")
+    if extraction_result:
+        raise extraction_result[0]
+    _check_deadline(deadline)
     return {
         "name": artifact_name,
         "run_id": run_id,
@@ -272,6 +514,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--metadata", type=Path, required=True)
     parser.add_argument("--archive", type=Path, required=True)
+    parser.add_argument("--timeout-seconds", type=float, default=_DEFAULT_TRANSFER_TIMEOUT_SECONDS)
     parser.add_argument("--expect-file", action="append", required=True)
     args = parser.parse_args(argv)
     try:
@@ -283,8 +526,13 @@ def main(argv: list[str] | None = None) -> int:
             expected_files=args.expect_file,
             metadata_path=args.metadata,
             archive_path=args.archive,
+            timeout_seconds=args.timeout_seconds,
         )
-        print(json.dumps({"artifact": result["name"], "run_id": result["run_id"], "files": result["files"]}, sort_keys=True))
+        # The archive and API listing remain complete runner-local evidence.
+        # Do not echo artifact names, run ids, or member names into public
+        # Actions; expose only a fresh opaque id and archive byte metadata.
+        archive_bytes = args.archive.read_bytes()
+        emit_evidence("artifact-download", status="completed", payloads={"archive": archive_bytes})
         return 0
     except ArtifactDownloadError as error:
         print(f"artifact-download failed code={type(error).__name__}", file=os.sys.stderr)

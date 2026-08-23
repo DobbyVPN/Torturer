@@ -29,6 +29,7 @@ jobs:
     env:
       SOURCE_REPOSITORY: ${{ inputs.source_repository }}
       SOURCE_SHA: ${{ inputs.commit_sha }}
+      TORTURER_SHA: ${{ github.sha }}
 
     steps:
       - name: Validate exact public candidate identity
@@ -57,6 +58,14 @@ jobs:
           path: torturer
           persist-credentials: false
 
+      - name: Verify exact trusted Torturer helper checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C torturer rev-parse HEAD)" = "$TORTURER_SHA"
+          git -C torturer status --porcelain=v1 --untracked-files=all
+          test -z "$(git -C torturer status --porcelain=v1 --untracked-files=all)"
+
       - name: Set up JDK 17
         uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95
         with:
@@ -70,8 +79,34 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          timeout --foreground --signal=TERM --kill-after=10s 300s sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;36.0.0"
-          timeout --foreground --signal=TERM --kill-after=10s 30s sdkmanager --list_installed
+          umask 077
+          toolchain_dir="$RUNNER_TEMP/android-build-toolchain"
+          mkdir -p "$toolchain_dir"
+          emit_private_evidence() {
+            label="$1"
+            file="$2"
+            bytes="$(wc -c < "$file" | tr -d '[:space:]')"
+            digest="$(sha256sum "$file" | awk '{print $1}')"
+            evidence_id="$(printf '%s:%s' "$GITHUB_RUN_ID" "$label" | sha256sum | cut -c1-16)"
+            printf 'diagnostic_evidence label=%s id=%s bytes=%s sha256=%s\n' \
+              "$label" "$evidence_id" "$bytes" "$digest"
+          }
+          sdk_install_log="$toolchain_dir/sdkmanager-install.raw.log"
+          sdk_install_status=0
+          timeout --foreground --signal=TERM --kill-after=10s 300s sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;36.0.0" > "$sdk_install_log" 2>&1 || sdk_install_status=$?
+          emit_private_evidence android-build-sdkmanager-install "$sdk_install_log"
+          if [ "$sdk_install_status" -ne 0 ]; then
+            printf 'android_build_toolchain=failed code=SDKMANAGER_INSTALL status=%s\n' "$sdk_install_status" >&2
+            exit "$sdk_install_status"
+          fi
+          sdk_list_log="$toolchain_dir/sdkmanager-list.raw.log"
+          sdk_list_status=0
+          timeout --foreground --signal=TERM --kill-after=10s 30s sdkmanager --list_installed > "$sdk_list_log" 2>&1 || sdk_list_status=$?
+          emit_private_evidence android-build-sdkmanager-list "$sdk_list_log"
+          if [ "$sdk_list_status" -ne 0 ]; then
+            printf 'android_build_toolchain=failed code=SDKMANAGER_LIST status=%s\n' "$sdk_list_status" >&2
+            exit "$sdk_list_status"
+          fi
 
       - name: Verify checkout and build Android candidate
         shell: bash
@@ -159,21 +194,67 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
+          emit_private_evidence() {
+            label="$1"
+            file="$2"
+            if [ -f "$file" ]; then
+              bytes="$(wc -c < "$file" | tr -d '[:space:]')"
+              digest="$(sha256sum "$file" | awk '{print $1}')"
+              evidence_id="$(printf '%s:%s' "$GITHUB_RUN_ID" "$label" | sha256sum | cut -c1-16)"
+              printf 'diagnostic_evidence label=%s id=%s bytes=%s sha256=%s\n' \
+                "$label" "$evidence_id" "$bytes" "$digest"
+            else
+              printf 'diagnostic_evidence label=%s state=missing\n' "$label"
+            fi
+          }
           test -e /dev/kvm
-          timeout --foreground --signal=TERM --kill-after=10s 30s sudo chmod a+rw /dev/kvm
-          ls -l /dev/kvm
-          timeout --foreground --signal=TERM --kill-after=10s 300s sdkmanager --install "platform-tools" "emulator" "platforms;android-35" "build-tools;36.0.0" "system-images;android-35;google_apis;x86_64"
-          timeout --foreground --signal=TERM --kill-after=10s 30s sdkmanager --list_installed
+          kvm_chmod_log="$SERVICE_DIR/kvm-chmod.raw.log"
+          kvm_chmod_status=0
+          timeout --foreground --signal=TERM --kill-after=10s 30s sudo chmod a+rw /dev/kvm > "$kvm_chmod_log" 2>&1 || kvm_chmod_status=$?
+          emit_private_evidence android-kvm-chmod "$kvm_chmod_log"
+          if [ "$kvm_chmod_status" -ne 0 ]; then
+            printf 'android_kvm_setup=failed code=KVM_CHMOD status=%s\n' "$kvm_chmod_status" >&2
+            exit "$kvm_chmod_status"
+          fi
+          kvm_device_log="$SERVICE_DIR/kvm-device.raw.log"
+          kvm_device_status=0
+          ls -l /dev/kvm > "$kvm_device_log" 2>&1 || kvm_device_status=$?
+          emit_private_evidence android-kvm-device "$kvm_device_log"
+          if [ "$kvm_device_status" -ne 0 ]; then
+            printf 'android_kvm_device_probe=failed code=KVM_DEVICE status=%s\n' "$kvm_device_status" >&2
+            exit "$kvm_device_status"
+          fi
+          sdk_install_log="$SERVICE_DIR/sdkmanager-install.raw.log"
+          sdk_install_status=0
+          timeout --foreground --signal=TERM --kill-after=10s 300s sdkmanager --install "platform-tools" "emulator" "platforms;android-35" "build-tools;36.0.0" "system-images;android-35;google_apis;x86_64" > "$sdk_install_log" 2>&1 || sdk_install_status=$?
+          emit_private_evidence android-sdkmanager-install "$sdk_install_log"
+          if [ "$sdk_install_status" -ne 0 ]; then
+            printf 'android_sdk_setup=failed code=SDKMANAGER_INSTALL status=%s\n' "$sdk_install_status" >&2
+            exit "$sdk_install_status"
+          fi
+          sdk_list_log="$SERVICE_DIR/sdkmanager-list.raw.log"
+          sdk_list_status=0
+          timeout --foreground --signal=TERM --kill-after=10s 30s sdkmanager --list_installed > "$sdk_list_log" 2>&1 || sdk_list_status=$?
+          emit_private_evidence android-sdkmanager-list "$sdk_list_log"
+          if [ "$sdk_list_status" -ne 0 ]; then
+            printf 'android_sdk_setup=failed code=SDKMANAGER_LIST status=%s\n' "$sdk_list_status" >&2
+            exit "$sdk_list_status"
+          fi
           accel_check_log="$SERVICE_DIR/emulator-accel-check.raw.log"
-          if ! timeout --foreground --signal=TERM --kill-after=10s 60s "$ANDROID_SDK_ROOT/emulator/emulator" -accel-check | tee "$accel_check_log"; then
-            printf 'android_kvm_acceleration_check=failed\n' >&2
+          accel_status=0
+          timeout --foreground --signal=TERM --kill-after=10s 60s "$ANDROID_SDK_ROOT/emulator/emulator" -accel-check > "$accel_check_log" 2>&1 || accel_status=$?
+          if [ "$accel_status" -ne 0 ]; then
+            emit_private_evidence android-kvm-accel-check "$accel_check_log"
+            printf 'android_kvm_acceleration_check=failed status=%s\n' "$accel_status" >&2
             exit 1
           fi
           if ! grep -Eiq 'KVM .*usable|KVM.*installed and usable' "$accel_check_log"; then
+            emit_private_evidence android-kvm-accel-check "$accel_check_log"
             printf 'android_kvm_acceleration_check=not-usable\n' >&2
-            cat "$accel_check_log"
             exit 1
           fi
+          emit_private_evidence android-kvm-accel-check "$accel_check_log"
           printf 'android_kvm_acceleration_check=usable\n'
 
       - name: Establish hard thirty-minute workflow deadline
@@ -182,7 +263,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          timeout --foreground --signal=TERM --kill-after=10s 30s gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" | tee "$HANDOFF_DIR/origin-run.json"
+          "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" 30 origin-run "$HANDOFF_DIR/origin-run.json" \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           python3 - "$HANDOFF_DIR/origin-run.json" <<'PY'
           import datetime, json, os, sys
           from pathlib import Path
@@ -204,7 +286,7 @@ jobs:
           timeout --foreground --signal=TERM --kill-after=10s 60s openssl req -x509 -newkey rsa:3072 -nodes -days 1 \
             -subj "/CN=dobbyvpn-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             -keyout "$HANDOFF_DIR/recipient.key" -out "$HANDOFF_DIR/recipient.crt"
-          lease_run_id="$(python3 -c 'import hashlib,os; print(hashlib.sha256(":".join(os.environ[name] for name in ("GITHUB_RUN_ID","GITHUB_RUN_ATTEMPT","PLATFORM","TORTURER_SHA")).encode()).hexdigest()[:32])')"
+          lease_run_id="$(python3 -c 'import hashlib,os; print(hashlib.sha256(":".join(os.environ[name] for name in ("GITHUB_RUN_ID","GITHUB_RUN_ATTEMPT","PLATFORM","TORTURER_SHA","SOURCE_SHA")).encode()).hexdigest()[:32])')"
           request_name="render-request-${lease_run_id}-${PLATFORM}"
           python3 - "$HANDOFF_DIR/request.json" "$lease_run_id" "$request_name" <<'PY'
           import json, os, re, sys
@@ -212,7 +294,7 @@ jobs:
           path, run_id, name = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
           if not re.fullmatch(r"[0-9a-f]{32}", run_id) or name != f"render-request-{run_id}-android":
               raise SystemExit("lease request identity is invalid")
-          path.write_text(json.dumps({"schema": 1, "kind": "dobbyvpn.render-lease-request", "run_id": run_id, "platform": "android", "image_digest": os.environ["SERVER_IMAGE_DIGEST"]}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          path.write_text(json.dumps({"schema": 1, "kind": "dobbyvpn.render-lease-request", "run_id": run_id, "platform": "android", "source_sha": os.environ["SOURCE_SHA"], "image_digest": os.environ["SERVER_IMAGE_DIGEST"]}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
           path.chmod(0o600)
           with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as env:
               env.write(f"LEASE_RUN_ID={run_id}\nREQUEST_ARTIFACT_NAME={name}\n")
@@ -247,10 +329,31 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
+          emit_private_evidence() {
+            label="$1"
+            file="$2"
+            if [ -f "$file" ]; then
+              bytes="$(wc -c < "$file" | tr -d '[:space:]')"
+              digest="$(sha256sum "$file" | awk '{print $1}')"
+              evidence_id="$(printf '%s:%s' "$GITHUB_RUN_ID" "$label" | sha256sum | cut -c1-16)"
+              printf 'diagnostic_evidence label=%s id=%s bytes=%s sha256=%s\n' \
+                "$label" "$evidence_id" "$bytes" "$digest"
+            else
+              printf 'diagnostic_evidence label=%s state=missing\n' "$label"
+            fi
+          }
           avd_name=dobby-functional-api35
-          timeout --foreground --signal=TERM --kill-after=10s 120s avdmanager create avd --force --name "$avd_name" --package "system-images;android-35;google_apis;x86_64" --device pixel
+          avd_log="$SERVICE_DIR/avdmanager-create.raw.log"
+          avd_status=0
+          timeout --foreground --signal=TERM --kill-after=10s 120s avdmanager create avd --force --name "$avd_name" --package "system-images;android-35;google_apis;x86_64" --device pixel > "$avd_log" 2>&1 || avd_status=$?
+          emit_private_evidence android-avdmanager-create "$avd_log"
+          if [ "$avd_status" -ne 0 ]; then
+            printf 'android_avd_setup=failed code=AVDMANAGER_CREATE status=%s\n' "$avd_status" >&2
+            exit "$avd_status"
+          fi
           emulator_log="$SERVICE_DIR/emulator.raw.log"
-          setsid timeout --foreground --signal=TERM --kill-after=10s 1500s "$ANDROID_SDK_ROOT/emulator/emulator" -avd "$avd_name" -port 5554 -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -accel on -no-snapshot -wipe-data > >(tee "$emulator_log") 2>&1 &
+          setsid timeout --foreground --signal=TERM --kill-after=10s 1500s "$ANDROID_SDK_ROOT/emulator/emulator" -avd "$avd_name" -port 5554 -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -accel on -no-snapshot -wipe-data > "$emulator_log" 2>&1 &
           emulator_pid=$!
           printf '%s\n' "$emulator_pid" > "$HANDOFF_DIR/emulator.pid"
           printf 'EMULATOR_PID=%s\nADB_PATH=%s\nEMULATOR_LOG=%s\n' "$emulator_pid" "$ANDROID_SDK_ROOT/platform-tools/adb" "$emulator_log" >> "$GITHUB_ENV"
@@ -258,22 +361,33 @@ jobs:
           adb_bounded() {
             timeout --foreground --signal=TERM --kill-after=10s 120s "$adb" "$@"
           }
-          adb_bounded start-server
+          adb_start_log="$SERVICE_DIR/adb-start-server.raw.log"
+          adb_start_status=0
+          adb_bounded start-server > "$adb_start_log" 2>&1 || adb_start_status=$?
+          emit_private_evidence android-adb-start-server "$adb_start_log"
+          if [ "$adb_start_status" -ne 0 ]; then
+            printf 'android_adb_setup=failed code=START_SERVER status=%s\n' "$adb_start_status" >&2
+            exit "$adb_start_status"
+          fi
           device_ready=false
           for attempt in $(seq 1 90); do
             if ! kill -0 "$emulator_pid"; then
-              printf 'android emulator exited before device readiness\n' >&2
-              cat "$emulator_log"
+              emit_private_evidence android-emulator-exited "$emulator_log"
+              printf 'android_emulator_readiness=failed code=DEVICE_TIMEOUT\n' >&2
               exit 1
             fi
             devices_log="$SERVICE_DIR/adb-devices-${attempt}.raw.log"
-            if adb_bounded devices -l | tee "$devices_log"; then
+            devices_status=0
+            adb_bounded devices -l > "$devices_log" 2>&1 || devices_status=$?
+            if [ "$devices_status" -eq 0 ]; then
               if grep -Eq '^emulator-5554[[:space:]]+device' "$devices_log"; then
+                emit_private_evidence android-adb-devices-${attempt} "$devices_log"
                 device_ready=true
                 break
               fi
             else
-              printf 'android adb device probe failed attempt=%s\n' "$attempt" >&2
+              emit_private_evidence android-adb-devices-${attempt} "$devices_log"
+              printf 'android_adb_device_probe=failed attempt=%s status=%s\n' "$attempt" "$devices_status" >&2
             fi
             sleep 2
           done
@@ -281,41 +395,60 @@ jobs:
           booted=false
           for attempt in $(seq 1 90); do
             if ! kill -0 "$emulator_pid"; then
-              printf 'android emulator exited before boot readiness\n' >&2
-              cat "$emulator_log"
+              emit_private_evidence android-emulator-boot-exited "$emulator_log"
+              printf 'android_emulator_readiness=failed code=BOOT_TIMEOUT\n' >&2
               exit 1
             fi
             boot_state_log="$SERVICE_DIR/adb-boot-state-${attempt}.raw.log"
-            if ! adb_bounded shell getprop sys.boot_completed | tee "$boot_state_log"; then
-              printf 'android adb boot probe failed attempt=%s\n' "$attempt" >&2
+            boot_status=0
+            adb_bounded shell getprop sys.boot_completed > "$boot_state_log" 2>&1 || boot_status=$?
+            if [ "$boot_status" -ne 0 ]; then
+              emit_private_evidence android-adb-boot-${attempt} "$boot_state_log"
+              printf 'android_adb_boot_probe=failed attempt=%s status=%s\n' "$attempt" "$boot_status" >&2
               exit 1
             fi
+            emit_private_evidence android-adb-boot-${attempt} "$boot_state_log"
             boot_state="$(tr -d '\r' < "$boot_state_log")"
             printf 'android_boot_probe_attempt=%s state=%s\n' "$attempt" "$boot_state"
             if [ "$boot_state" = 1 ]; then booted=true; break; fi
             sleep 2
           done
           test "$booted" = true
-          adb_bounded devices -l
-          adb_bounded shell getprop ro.build.version.release
-          adb_bounded shell getprop ro.product.cpu.abi
-          adb_bounded install -r "$GITHUB_WORKSPACE/candidate/app-debug.apk"
-          adb_bounded install -r "$GITHUB_WORKSPACE/candidate/app-debug-androidTest.apk"
-          adb_bounded shell pm list packages -e com.dobby.vpn
-          adb_bounded shell dumpsys package com.dobby.vpn
-          adb_bounded shell am force-stop com.dobby.vpn
-          adb_bounded shell am force-stop com.dobby.vpn.test
+          adb_evidence() {
+            label="$1"
+            shift
+            output_log="$SERVICE_DIR/adb-${label}.raw.log"
+            output_status=0
+            adb_bounded "$@" > "$output_log" 2>&1 || output_status=$?
+            emit_private_evidence "android-${label}" "$output_log"
+            return "$output_status"
+          }
+          adb_evidence devices devices -l
+          adb_evidence os-version shell getprop ro.build.version.release
+          adb_evidence cpu shell getprop ro.product.cpu.abi
+          adb_evidence install-app install -r "$GITHUB_WORKSPACE/candidate/app-debug.apk"
+          adb_evidence install-test install -r "$GITHUB_WORKSPACE/candidate/app-debug-androidTest.apk"
+          adb_evidence packages shell pm list packages -e com.dobby.vpn
+          adb_evidence package-dump shell dumpsys package com.dobby.vpn
+          adb_evidence force-stop-app shell am force-stop com.dobby.vpn
+          adb_evidence force-stop-test shell am force-stop com.dobby.vpn.test
           app_pid_log="$SERVICE_DIR/android-app-pid.raw.log"
-          if adb_bounded shell pidof com.dobby.vpn | tee "$app_pid_log"; then
+          app_pid_status=0
+          adb_bounded shell pidof com.dobby.vpn > "$app_pid_log" 2>&1 || app_pid_status=$?
+          emit_private_evidence android-app-pid "$app_pid_log"
+          if [ "$app_pid_status" -eq 0 ]; then
             printf 'android_app_pid_probe=complete\n'
           else
-            printf 'android_app_pid_probe=failed\n' >&2
+            printf 'android_app_pid_probe=failed status=%s\n' "$app_pid_status" >&2
           fi
           test_pid_log="$SERVICE_DIR/android-test-pid.raw.log"
-          if adb_bounded shell pidof com.dobby.vpn.test | tee "$test_pid_log"; then
+          test_pid_status=0
+          adb_bounded shell pidof com.dobby.vpn.test > "$test_pid_log" 2>&1 || test_pid_status=$?
+          emit_private_evidence android-test-pid "$test_pid_log"
+          if [ "$test_pid_status" -eq 0 ]; then
             printf 'android_test_pid_probe=complete\n'
           else
-            printf 'android_test_pid_probe=failed\n' >&2
+            printf 'android_test_pid_probe=failed status=%s\n' "$test_pid_status" >&2
           fi
 
       - name: Upload public certificate and opaque request
@@ -345,7 +478,15 @@ jobs:
             fi
             attempt_dir="$HANDOFF_DIR/lease-response-attempt-$attempt"
             mkdir -p "$attempt_dir"
-            timeout --foreground --signal=TERM --kill-after=10s 30s gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${response_name}" | tee "$attempt_dir/poll.json"
+            api_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 181))
+            if [ "$api_remaining" -le 0 ]; then
+              printf 'lease response polling reached the cleanup reserve: remaining=%s\n' "$api_remaining" >&2
+              break
+            fi
+            api_timeout=30
+            if [ "$api_timeout" -gt "$api_remaining" ]; then api_timeout="$api_remaining"; fi
+            "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" "$api_timeout" artifact-poll "$attempt_dir/poll.json" \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${response_name}"
             if lease_workflow_run_id="$(python3 - "$attempt_dir/poll.json" "$response_name" <<'PY'
           import json, sys
           from pathlib import Path
@@ -357,7 +498,15 @@ jobs:
           print(run_id)
           PY
             )"; then
-              timeout --foreground --signal=TERM --kill-after=10s 30s gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${lease_workflow_run_id}" | tee "$attempt_dir/lease-workflow-run.json"
+              api_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 181))
+              if [ "$api_remaining" -le 0 ]; then
+                printf 'lease workflow lookup reached the cleanup reserve: remaining=%s\n' "$api_remaining" >&2
+                break
+              fi
+              api_timeout=30
+              if [ "$api_timeout" -gt "$api_remaining" ]; then api_timeout="$api_remaining"; fi
+              "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" "$api_timeout" lease-workflow-run "$attempt_dir/lease-workflow-run.json" \
+                "repos/${GITHUB_REPOSITORY}/actions/runs/${lease_workflow_run_id}"
               python3 - "$attempt_dir/lease-workflow-run.json" "$lease_workflow_run_id" "$expected_title" <<'PY'
           import json, os, sys
           from pathlib import Path
@@ -394,7 +543,7 @@ jobs:
           import json, os, re, sys
           from pathlib import Path
           value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          expected = {"schema": 1, "kind": "dobbyvpn.render-lease", "run_id": os.environ["LEASE_RUN_ID"], "platform": "android", "image_digest": os.environ["SERVER_IMAGE_DIGEST"], "state": "issued"}
+          expected = {"schema": 1, "kind": "dobbyvpn.render-lease", "run_id": os.environ["LEASE_RUN_ID"], "platform": "android", "source_sha": os.environ["SOURCE_SHA"], "image_digest": os.environ["SERVER_IMAGE_DIGEST"], "state": "issued"}
           for key, wanted in expected.items():
               if value.get(key) != wanted: raise SystemExit(f"lease field {key} is invalid")
           if not re.fullmatch(r"srv-[A-Za-z0-9][A-Za-z0-9_-]{1,99}", str(value.get("service_id"))): raise SystemExit("lease service id is invalid")
@@ -419,6 +568,7 @@ jobs:
           python3 -m torturer_checks.hosted.deadline --timeout-seconds "$remaining" --kill-grace-seconds 30 \
             python3 -m torturer_checks.hosted.run --platform android \
             --profile "$HANDOFF_DIR/profile.toml" --source-repository "$SOURCE_REPOSITORY" --source-sha "$SOURCE_SHA" \
+            --platform-version "35" \
             --candidate-manifest "$GITHUB_WORKSPACE/candidate/manifest.json" --server-image-digest "$SERVER_IMAGE_DIGEST" --output "$RESULT_PATH" \
             --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" --identity-url "https://api.ipify.org" \
             --latency-url "https://proof.ovh.net/files/1Mb.dat" \
@@ -430,19 +580,51 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
+          emit_private_evidence() {
+            label="$1"
+            file="$2"
+            if [ -f "$file" ]; then
+              bytes="$(wc -c < "$file" | tr -d '[:space:]')"
+              digest="$(sha256sum "$file" | awk '{print $1}')"
+              evidence_id="$(printf '%s:%s' "$GITHUB_RUN_ID" "$label" | sha256sum | cut -c1-16)"
+              printf 'diagnostic_evidence label=%s id=%s bytes=%s sha256=%s\n' \
+                "$label" "$evidence_id" "$bytes" "$digest"
+            else
+              printf 'diagnostic_evidence label=%s state=missing\n' "$label"
+            fi
+          }
           adb="${ADB_PATH:-${ANDROID_SDK_ROOT:-}/platform-tools/adb}"
+          # Keep the complete cleanup phase inside the client’s 120-second
+          # finalization reserve.  Six adb operations are each capped at
+          # 4s plus a 1s kill grace; host process-group proof is capped at
+          # 15s TERM observation + 5s TERM grace + 5s KILL grace, and the
+          # emulator log drain is capped at 5s.  The policy test proves this
+          # 60-second worst-case arithmetic, leaving time for artifact/key
+          # finalization without relying on the outer job kill.
+          adb_timeout_seconds=4
+          adb_kill_grace_seconds=1
           adb_bounded() {
-            timeout --foreground --signal=TERM --kill-after=10s 60s "$adb" "$@"
+            timeout --foreground --signal=TERM --kill-after="${adb_kill_grace_seconds}s" "${adb_timeout_seconds}s" "$adb" "$@"
+          }
+          adb_cleanup_evidence() {
+            label="$1"
+            shift
+            cleanup_log="$SERVICE_DIR/cleanup-${label}.raw.log"
+            cleanup_status=0
+            adb_bounded "$@" > "$cleanup_log" 2>&1 || cleanup_status=$?
+            emit_private_evidence "android-cleanup-${label}" "$cleanup_log"
+            return "$cleanup_status"
           }
           if [ -x "$adb" ]; then
-            if ! adb_bounded shell am force-stop com.dobby.vpn; then printf 'android_cleanup_force_stop_app=failed\n' >&2; fi
-            if ! adb_bounded shell am force-stop com.dobby.vpn.test; then printf 'android_cleanup_force_stop_test=failed\n' >&2; fi
-            if adb_bounded uninstall com.dobby.vpn.test; then printf 'android_test_package_removed=true\n'; else printf 'android_test_package_removal=not-installed-or-failed\n'; fi
-            if adb_bounded uninstall com.dobby.vpn; then printf 'android_package_removed=true\n'; else printf 'android_package_removal=not-installed-or-failed\n'; fi
-            if adb_bounded emu kill; then printf 'android_emulator_shutdown_requested=true\n'; else printf 'android_emulator_shutdown_request=failed-or-already-stopped\n'; fi
-            if ! adb_bounded devices -l; then printf 'android_cleanup_devices_probe=failed\n' >&2; fi
+            if ! adb_cleanup_evidence force-stop-app shell am force-stop com.dobby.vpn; then printf 'android_cleanup_force_stop_app=failed\n' >&2; fi
+            if ! adb_cleanup_evidence force-stop-test shell am force-stop com.dobby.vpn.test; then printf 'android_cleanup_force_stop_test=failed\n' >&2; fi
+            if adb_cleanup_evidence uninstall-test uninstall com.dobby.vpn.test; then printf 'android_test_package_removed=true\n'; else printf 'android_test_package_removal=not-installed-or-failed\n'; fi
+            if adb_cleanup_evidence uninstall-app uninstall com.dobby.vpn; then printf 'android_package_removed=true\n'; else printf 'android_package_removal=not-installed-or-failed\n'; fi
+            if adb_cleanup_evidence emulator-kill emu kill; then printf 'android_emulator_shutdown_requested=true\n'; else printf 'android_emulator_shutdown_request=failed-or-already-stopped\n'; fi
+            if ! adb_cleanup_evidence devices devices -l; then printf 'android_cleanup_devices_probe=failed\n' >&2; fi
           else
-            printf 'adb_missing_during_cleanup=%s\n' "$adb" >&2
+            printf 'adb_missing_during_cleanup=true\n' >&2
           fi
           emulator_pid="${EMULATOR_PID:-}"
           if [ -f "${HANDOFF_DIR:-}/emulator.pid" ]; then emulator_pid="$(cat "$HANDOFF_DIR/emulator.pid")"; fi
@@ -454,7 +636,7 @@ jobs:
             0|*[!0-9]*) printf 'invalid emulator pid=%s\n' "$emulator_pid" >&2; exit 1;;
             *)
               stopped=false
-              for attempt in $(seq 1 30); do
+              for attempt in $(seq 1 15); do
                 if ! process_group_alive; then stopped=true; break; fi
                 printf 'android_emulator_cleanup_attempt=%s pid=%s\n' "$attempt" "$emulator_pid"
                 sleep 1
@@ -462,7 +644,7 @@ jobs:
               if [ "$stopped" != true ]; then
                 printf 'android_emulator_term_group=%s\n' "$emulator_pid"
                 kill -TERM -- "-$emulator_pid"
-                for attempt in $(seq 1 10); do
+                for attempt in $(seq 1 5); do
                   if ! process_group_alive; then stopped=true; break; fi
                   sleep 1
                 done
@@ -470,14 +652,16 @@ jobs:
               if [ "$stopped" != true ]; then
                 printf 'android_emulator_kill_group=%s\n' "$emulator_pid"
                 kill -KILL -- "-$emulator_pid"
-                for attempt in $(seq 1 10); do
+                for attempt in $(seq 1 5); do
                   if ! process_group_alive; then stopped=true; printf 'android_emulator_post_kill_verified=true\n'; break; fi
                   printf 'android_emulator_post_kill_check=%s\n' "$attempt"
                   sleep 1
                 done
               fi
               test "$stopped" = true
-              if [ -f "${EMULATOR_LOG:-}" ]; then cat "$EMULATOR_LOG"; fi
+              if [ -f "${EMULATOR_LOG:-}" ]; then
+                emit_private_evidence android-emulator-log "$EMULATOR_LOG"
+              fi
               ;;
           esac
 
@@ -519,27 +703,37 @@ jobs:
   controller:
     name: Dispatch isolated Android Render lease controller
     runs-on: ubuntu-24.04
-    timeout-minutes: 16
+    timeout-minutes: 30
     permissions:
       contents: read
       actions: write
     env:
       PLATFORM: android
+      SOURCE_SHA: ${{ inputs.commit_sha }}
       TORTURER_SHA: ${{ github.sha }}
       SERVER_IMAGE_DIGEST: ${{ vars.RENDER_IMAGE_DIGEST }}
 
     steps:
+      - name: Check out exact trusted Torturer output helper
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: DobbyVPN/Torturer
+          ref: ${{ github.sha }}
+          path: torturer
+          persist-credentials: false
+
       - name: Validate controller inputs
         run: |
-          set -euo pipefail
+         set -euo pipefail
           [[ "$TORTURER_SHA" =~ ^[0-9a-f]{40}$ ]]
+         [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SERVER_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           printf 'controller_inputs=validated platform=%s\n' "$PLATFORM"
 
       - name: Derive one origin and Android lease correlation
         run: |
           set -euo pipefail
-          lease_run_id="$(printf '%s:%s:%s:%s' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PLATFORM" "$TORTURER_SHA" | sha256sum | cut -c1-32)"
+          lease_run_id="$(printf '%s:%s:%s:%s:%s' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PLATFORM" "$TORTURER_SHA" "$SOURCE_SHA" | sha256sum | cut -c1-32)"
           printf 'LEASE_RUN_ID=%s\nREQUEST_ARTIFACT_NAME=render-request-%s-%s\n' "$lease_run_id" "$lease_run_id" "$PLATFORM" >> "$GITHUB_ENV"
 
       - name: Wait for Android client request artifact
@@ -548,10 +742,27 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/controller"
+          "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" 30 controller-run "$RUNNER_TEMP/controller/controller-run.json" \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          python3 - "$RUNNER_TEMP/controller/controller-run.json" <<'PY'
+          import datetime, json, os, sys
+          from pathlib import Path
+          run = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if run.get("id") != int(os.environ["GITHUB_RUN_ID"]): raise SystemExit("controller run identity mismatch")
+          started = datetime.datetime.fromisoformat(run["run_started_at"].replace("Z", "+00:00"))
+          deadline = int(started.timestamp()) + 30 * 60
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as env: env.write(f"CONTROLLER_DEADLINE_EPOCH={deadline}\n")
+          print(f"controller_deadline_epoch={deadline}")
+          PY
           found=false
           for attempt in $(seq 1 180); do
+            remaining=$((CONTROLLER_DEADLINE_EPOCH - $(date +%s) - 120))
+            if [ "$remaining" -le 1 ]; then printf 'controller request wait reached finalization reserve: remaining=%s\n' "$remaining" >&2; break; fi
             response="$RUNNER_TEMP/controller/request-${attempt}.json"
-            timeout --foreground --signal=TERM --kill-after=10s 30s gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${REQUEST_ARTIFACT_NAME}" | tee "$response"
+            api_timeout=30
+            if [ "$api_timeout" -gt "$((remaining - 1))" ]; then api_timeout="$((remaining - 1))"; fi
+            "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" "$api_timeout" request-artifact-poll "$response" \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${REQUEST_ARTIFACT_NAME}"
             if python3 - "$response" "$GITHUB_RUN_ID" "$REQUEST_ARTIFACT_NAME" <<'PY'
           import json, sys
           from pathlib import Path
@@ -561,7 +772,11 @@ jobs:
           PY
             then found=true; break; fi
             printf 'request_artifact_attempt=%s status=pending\n' "$attempt"
-            sleep 5
+            sleep_seconds=5
+            remaining=$((CONTROLLER_DEADLINE_EPOCH - $(date +%s) - 120))
+            if [ "$remaining" -le 0 ]; then break; fi
+            if [ "$sleep_seconds" -gt "$remaining" ]; then sleep_seconds="$remaining"; fi
+            sleep "$sleep_seconds"
           done
           test "$found" = true
 
@@ -570,8 +785,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          timeout --foreground --signal=TERM --kill-after=10s 30s gh api --method POST "repos/${GITHUB_REPOSITORY}/actions/workflows/server-lease.yml/dispatches" \
+          remaining=$((CONTROLLER_DEADLINE_EPOCH - $(date +%s) - 1))
+          if [ "$remaining" -le 0 ]; then printf '%s\n' 'controller dispatch reached the hard workflow deadline' >&2; exit 1; fi
+          dispatch_timeout=30
+          if [ "$dispatch_timeout" -gt "$remaining" ]; then dispatch_timeout="$remaining"; fi
+          "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" "$dispatch_timeout" lease-dispatch "$RUNNER_TEMP/controller/lease-dispatch.json" \
+            --method POST "repos/${GITHUB_REPOSITORY}/actions/workflows/server-lease.yml/dispatches" \
             -f "ref=${GITHUB_REF_NAME}" -f "inputs[mode]=acquire" -f "inputs[origin_run_id]=${GITHUB_RUN_ID}" \
             -f "inputs[origin_run_attempt]=${GITHUB_RUN_ATTEMPT}" -f "inputs[origin_torturer_sha]=${TORTURER_SHA}" \
+            -f "inputs[origin_source_sha]=${SOURCE_SHA}" \
             -f "inputs[origin_workflow_path]=.github/workflows/functional-android.yml" -f "inputs[lease_run_id]=${LEASE_RUN_ID}" \
             -f "inputs[platform]=${PLATFORM}" -f "inputs[request_artifact_name]=${REQUEST_ARTIFACT_NAME}" -f "inputs[trusted_ref]=${GITHUB_REF_NAME}"

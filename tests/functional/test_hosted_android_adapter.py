@@ -6,7 +6,11 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from torturer_checks.hosted.android import AndroidHostedAdapter
+from torturer_checks.hosted.android import (
+    AndroidHostedAdapter,
+    _finalization_error,
+    _scenario_deadlines,
+)
 from torturer_checks.hosted.cli import CommandResult, HostedAdapterError
 from torturer_checks.hosted.factory import adapter_for_platform
 from torturer_contract.functional.engine import FunctionalEngine
@@ -47,11 +51,13 @@ def _observation(error_code: str | None = None) -> bytes:
 class FakeAndroidRunner:
     def __init__(self, raw_directory: Path) -> None:
         self.raw_directory = raw_directory
-        self.raw_directory.mkdir(parents=True)
+        self.raw_directory.mkdir(mode=0o700, parents=True)
         self.calls: list[tuple[str, ...]] = []
         self.timeouts: list[float] = []
         self.command_payload: dict[str, object] | None = None
         self.observation = _observation()
+        self.fail_diagnostics = False
+        self.fail_cleanup = False
 
     def run(self, command, *, timeout_seconds):
         argv = tuple(command)
@@ -61,6 +67,18 @@ class FakeAndroidRunner:
             self.command_payload = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
         if argv[1:2] == ("exec-out",):
             return CommandResult(argv, 0, self.observation, b"")
+        if argv[1:3] == ("shell", "pidof"):
+            return CommandResult(argv, 1, b"", b"adb pidof: no matching process\n")
+        if self.fail_diagnostics and (
+            argv[1:2] == ("logcat",) or argv[1:3] == ("shell", "dumpsys") or argv[1:3] == ("shell", "ps")
+        ):
+            return CommandResult(argv, 1, b"adb diagnostics stdout diagnostic\n", b"adb diagnostics stderr diagnostic\n")
+        if self.fail_cleanup and (
+            argv[1:3] == ("shell", "rm")
+            or argv[1:4] == ("shell", "am", "force-stop")
+            or (argv[1:4] == ("shell", "run-as", "com.dobby.vpn") and "rm" in argv)
+        ):
+            return CommandResult(argv, 1, b"adb cleanup stdout diagnostic\n", b"adb cleanup stderr diagnostic\n")
         return CommandResult(argv, 0, b"adb stdout diagnostic\n", b"adb stderr diagnostic\n")
 
 
@@ -121,6 +139,7 @@ class HostedAndroidAdapterTests(unittest.TestCase):
         self.assertTrue(
             all(timeout <= scenario.max_duration_seconds for timeout in self.runner.timeouts)
         )
+        self.assertTrue(all(timeout <= 5.0 for timeout in self.runner.timeouts[-7:]))
 
     def test_product_error_is_failed_and_cleanup_commands_are_still_attempted(self) -> None:
         self.runner.observation = _observation("DRIVER_ERROR")
@@ -136,6 +155,57 @@ class HostedAndroidAdapterTests(unittest.TestCase):
                 "am" in call and "force-stop" in call
                 for call in self.runner.calls
             )
+        )
+
+    def test_finalization_deadlines_are_reserved_inside_the_lane(self) -> None:
+        work, diagnostics, cleanup = _scenario_deadlines(100.0, 141.0)
+        self.assertLess(work, diagnostics)
+        self.assertLess(diagnostics, cleanup)
+        self.assertLessEqual(cleanup, 100.0 + 1_800.0)
+        self.assertAlmostEqual(cleanup - work, 35.25)
+
+    def test_command_evidence_uses_exclusive_names_when_raw_directory_is_reused(self) -> None:
+        scenario = get_scenario("functional.core-connection")
+        first, _profile_one, _output_one = self.adapter._write_command(scenario)
+        first_bytes = first.read_bytes()
+        second, _profile_two, _output_two = self.adapter._write_command(scenario)
+        self.assertNotEqual(first, second)
+        self.assertEqual(first.read_bytes(), first_bytes)
+        self.assertEqual(first.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(second.stat().st_mode & 0o777, 0o600)
+
+    def test_finalization_failure_remains_visible_after_product_failure(self) -> None:
+        self.runner.observation = _observation("DRIVER_ERROR")
+        self.runner.fail_cleanup = True
+        result = FunctionalEngine("e" * 64).run(
+            get_scenario("functional.core-connection"),
+            self.adapter,
+            _provenance(self.adapter),
+        )
+        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(result.reason_code, "ANDROID_CLEANUP_FAILED")
+        self.assertTrue(any(call[1] == "logcat" for call in self.runner.calls))
+
+    def test_diagnostic_failure_remains_visible_after_product_failure(self) -> None:
+        self.runner.observation = _observation("DRIVER_ERROR")
+        self.runner.fail_diagnostics = True
+        result = FunctionalEngine("e" * 64).run(
+            get_scenario("functional.core-connection"),
+            self.adapter,
+            _provenance(self.adapter),
+        )
+        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(result.reason_code, "ANDROID_DIAGNOSTICS_FAILED")
+
+    def test_finalization_error_codes_are_stable(self) -> None:
+        from torturer_contract.functional.engine import ScenarioExecutionError
+
+        self.assertEqual(
+            _finalization_error(
+                ScenarioExecutionError("ANDROID_DIAGNOSTICS_FAILED"),
+                ScenarioExecutionError("ANDROID_CLEANUP_FAILED"),
+            ).reason_code,
+            "ANDROID_FINALIZATION_FAILED",
         )
 
     def test_missing_seam_inputs_fail_closed_and_headless_contract_is_explicit(self) -> None:
@@ -246,6 +316,7 @@ class HostedAndroidAdapterTests(unittest.TestCase):
         parsed = build_parser().parse_args([
             "--platform", "android", "--profile", str(self.profile),
             "--source-repository", "DobbyVPN/DobbyVPN", "--source-sha", _SOURCE_SHA,
+            "--platform-version", "35",
             "--candidate-manifest", __file__, "--server-image-digest", "sha256:" + "b" * 64,
             "--output", str(Path(self.directory.name) / "result.json"),
             "--adb", "/synthetic/adb", "--identity-url", "https://identity.example.test/ip",
