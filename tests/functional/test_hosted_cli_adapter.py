@@ -34,6 +34,8 @@ class FakeRunner:
         self.connected = False
         self.external_calls = 0
         self.restore_identity = True
+        self.baseline_ip = b"198.51.100.10\n"
+        self.disconnected_ip = b"198.51.100.10\n"
 
     def run(self, command, *, timeout_seconds):
         argv = tuple(command)
@@ -54,8 +56,10 @@ class FakeRunner:
             return CommandResult(argv, 0, b'{"code":%d,"state":"%s"}\n' % (2 if self.connected else 0, state), b"")
         if operation == "external-ip":
             self.external_calls += 1
-            if self.external_calls == 1 or (not self.connected and self.restore_identity):
-                value = b"198.51.100.10\n"
+            if self.external_calls == 1:
+                value = self.baseline_ip
+            elif not self.connected and self.restore_identity:
+                value = self.disconnected_ip
             else:
                 value = b"203.0.113.10\n"
             return CommandResult(argv, 0, value, b"")
@@ -139,6 +143,16 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertEqual(result.outcome, "passed")
         self.assertTrue(result.cleanup["verified"])
 
+    def test_disconnect_accepts_a_rotated_non_tunnel_host_identity(self) -> None:
+        self.runner.disconnected_ip = b"198.51.100.11\n"
+        scenario = get_scenario("functional.disconnect-cleanup")
+        result = FunctionalEngine(scenario_set_digest="a" * 64).run(
+            scenario, self.adapter, _provenance(self.adapter)
+        )
+        self.assertEqual(result.outcome, "passed")
+        self.assertTrue(result.cleanup["verified"])
+        self.assertNotEqual(self.runner.baseline_ip, self.runner.disconnected_ip)
+
     def test_disconnect_fails_when_status_is_clean_but_identity_is_not_restored(self) -> None:
         self.runner.restore_identity = False
         scenario = get_scenario("functional.disconnect-cleanup")
@@ -187,7 +201,7 @@ class HostedCLIAdapterTests(unittest.TestCase):
         metrics = {"latency_ms": 1.0, "download_mbps": 2.0, "upload_mbps": 3.0}
         with (
             mock.patch.object(adapter, "_connected", return_value=True),
-            mock.patch.object(adapter, "_external_ip", return_value="203.0.113.10"),
+            mock.patch.object(adapter, "_routing_identity_changed", return_value=True),
             mock.patch.object(adapter, "_throughput", return_value=metrics) as throughput,
             mock.patch(
                 "torturer_checks.hosted.linux.time.monotonic",
@@ -334,14 +348,16 @@ class HostedCLIAdapterTests(unittest.TestCase):
         adapter = LinuxHostedAdapter(cli=self.cli, profile=self.profile, runner=self.runner)
         service = FakeService()
         adapter.service = service  # type: ignore[assignment]
+        adapter._baseline_ip = "198.51.100.10"
+        self.runner.external_calls = 1
         with mock.patch(
             "torturer_checks.hosted.linux.time.monotonic",
-            side_effect=[100.0, 101.0, 102.0, 103.0],
+            side_effect=[100.0, 101.0, 102.0, 103.0, 104.0],
         ):
             result = adapter._process_loss(10)
         self.assertEqual(result, {"process_loss_verified": True})
         self.assertEqual(service.timeouts, [9.0])
-        self.assertEqual(self.runner.timeouts, [8.0, 7.0])
+        self.assertEqual(self.runner.timeouts, [8.0, 7.0, 6.0])
 
     def test_linux_restart_launcher_tracks_exact_child_pid(self) -> None:
         root = Path(self.directory.name)

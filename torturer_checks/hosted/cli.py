@@ -176,6 +176,7 @@ class HostedCLIAdapter:
         self.upload_url = upload_url
         self.stability_samples = stability_samples
         self._baseline_ip: str | None = None
+        self._tunneled_ips: set[str] = set()
 
     @property
     def capabilities(self) -> frozenset[Capability]:
@@ -207,9 +208,9 @@ class HostedCLIAdapter:
             key = "second_tunnel_interface" if step.id == "second-tunnel" else "tunnel_interface"
             return {key: self._connected(timeout)}
         if operation == "observe_routing_identity":
-            current = self._external_ip(timeout)
+            changed = self._routing_identity_changed(timeout)
             key = "second_routing_identity_changed" if step.id == "second-routing" else "routing_identity_changed"
-            return {key: self._baseline_ip is not None and current != self._baseline_ip}
+            return {key: changed}
         if operation == "measure_stability":
             return {"stability_verified": self._stability(timeout)}
         if operation == "measure_throughput":
@@ -250,6 +251,7 @@ class HostedCLIAdapter:
                 raise HostedAdapterError("RESET_CLEANUP_UNVERIFIED")
         finally:
             self._baseline_ip = None
+            self._tunneled_ips.clear()
 
     def _command(self, arguments: Sequence[str], timeout: float, failure: str) -> CommandResult:
         command = (str(self.cli), *arguments)
@@ -269,7 +271,13 @@ class HostedCLIAdapter:
         return match is not None
 
     def _capture_baseline(self, timeout: float) -> None:
+        self._tunneled_ips.clear()
         self._baseline_ip = self._external_ip(timeout)
+
+    def _routing_identity_changed(self, timeout: float) -> bool:
+        current = self._external_ip(timeout)
+        self._tunneled_ips.add(current)
+        return self._baseline_ip is not None and current != self._baseline_ip
 
     def _connected(self, timeout: float) -> bool:
         result = self._command(("status", "--json"), timeout, "STATUS_FAILED")
@@ -410,9 +418,9 @@ class HostedCLIAdapter:
             raise ScenarioExecutionError("CLEANUP_STATUS_INVALID") from error
         if not isinstance(value, dict) or value.get("state") != "Disconnected":
             return False
-        if self._baseline_ip is None:
+        if self._baseline_ip is None or not self._tunneled_ips:
             return False
-        return self._external_ip(remaining()) == self._baseline_ip
+        return self._external_ip(remaining()) not in self._tunneled_ips
 
 
 __all__ = ["CommandResult", "HostedAdapterError", "HostedCLIAdapter", "SubprocessRunner"]
