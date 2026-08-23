@@ -15,6 +15,7 @@ from .cli import (
     HostedAdapterError,
     HostedCLIAdapter,
     HostedServiceProcessController,
+    _allocate_owner_only_path,
 )
 
 
@@ -25,7 +26,7 @@ control_socket=$3
 peer_uid=$4
 env DOBBYVPN_CONTROL_SOCKET="$control_socket" \
   DOBBYVPN_CONTROL_PEER_UID="$peer_uid" \
-  "$binary" >"$log_path" 2>&1 < /dev/null &
+  "$binary" >>"$log_path" 2>&1 < /dev/null &
 printf '%s\\n' "$!"
 """
 _MACOS_SOCKET_PROBE = """import socket
@@ -35,6 +36,48 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
     connection.settimeout(0.5)
     connection.connect(sys.argv[1])
 """
+_MACOS_PROCESS_CENSUS = ("sudo", "-n", "ps", "-axo", "pid=,ppid=,lstart=")
+
+
+def _parse_macos_process_census(stdout: str) -> dict[int, tuple[int, str]]:
+    """Parse the bounded ``ps`` census into PID, parent, and start identity."""
+
+    processes: dict[int, tuple[int, str]] = {}
+    for line in stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or not fields[0].isdigit() or not fields[1].isdigit():
+            continue
+        pid = int(fields[0])
+        parent = int(fields[1])
+        start = " ".join(fields[2:])
+        if pid > 0 and parent >= 0 and start:
+            processes[pid] = (parent, start)
+    return processes
+
+
+def _macos_process_tree(
+    processes: dict[int, tuple[int, str]], root_pid: int
+) -> tuple[tuple[int, str], ...]:
+    """Return the root and all descendants using one complete census."""
+
+    children: dict[int, list[int]] = {}
+    for pid, (parent, _start) in processes.items():
+        children.setdefault(parent, []).append(pid)
+    pending = [root_pid]
+    seen: set[int] = set()
+    tree: list[tuple[int, str]] = []
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        current = processes.get(pid)
+        if current is None:
+            continue
+        parent, start = current
+        tree.append((pid, start))
+        pending.extend(children.get(pid, ()))
+    return tuple(tree)
 
 
 def _default_control_socket() -> Path:
@@ -70,6 +113,7 @@ class MacOSServiceProcessController(HostedServiceProcessController):
             raw_directory=raw_directory,
         )
         self.control_socket = control_socket
+        self._tree_identities: tuple[tuple[int, str], ...] = ()
         self._write_pid(pid)
         try:
             self._verify_candidate_pid(5.0)
@@ -85,11 +129,45 @@ class MacOSServiceProcessController(HostedServiceProcessController):
         return result.returncode == 0
 
     def _terminate(self, timeout: float) -> None:
-        self._checked(
-            ("sudo", "-n", "kill", "-KILL", str(self.pid)),
+        deadline = time.monotonic() + timeout
+        snapshot = self._census(self._remaining(deadline, "SERVICE_TREE_PROBE_FAILED"))
+        identities = _macos_process_tree(snapshot, self.pid)
+        if not identities or identities[0][0] != self.pid:
+            raise ScenarioExecutionError("SERVICE_TREE_PROBE_FAILED")
+        self._tree_identities = identities
+        kill_failed = False
+        while time.monotonic() < deadline:
+            snapshot = self._census(self._remaining(deadline, "SERVICE_TREE_PROBE_FAILED"))
+            survivors = tuple(
+                identity
+                for identity in identities
+                if (current := snapshot.get(identity[0])) is not None
+                and current[1] == identity[1]
+            )
+            if not survivors:
+                return
+            for pid, _start in survivors:
+                result = self._probe(
+                    ("sudo", "-n", "kill", "-KILL", str(pid)),
+                    self._remaining(deadline, "SERVICE_KILL_FAILED"),
+                    "SERVICE_KILL_FAILED",
+                )
+                if result.returncode != 0:
+                    kill_failed = True
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        if kill_failed:
+            raise ScenarioExecutionError("SERVICE_KILL_FAILED")
+        raise ScenarioExecutionError("SERVICE_TREE_SURVIVED")
+
+    def _census(self, timeout: float) -> dict[int, tuple[int, str]]:
+        result = self._probe(
+            _MACOS_PROCESS_CENSUS,
             timeout,
-            "SERVICE_KILL_FAILED",
+            "SERVICE_TREE_PROBE_FAILED",
         )
+        if result.returncode != 0:
+            raise ScenarioExecutionError("SERVICE_TREE_PROBE_FAILED")
+        return _parse_macos_process_census(result.stdout_text)
 
     def _verify_candidate_pid(self, timeout: float) -> None:
         result = self._probe(
@@ -119,7 +197,11 @@ class MacOSServiceProcessController(HostedServiceProcessController):
 
     def _start(self, timeout: float) -> None:
         self._restart_number += 1
-        log_path = self.raw_directory / f"service-restart-{self._restart_number:03d}.raw.log"
+        log_path = _allocate_owner_only_path(
+            self.raw_directory,
+            f"service-restart-{self._restart_number:03d}",
+            ".raw.log",
+        )
         deadline = time.monotonic() + timeout
         result = self._probe(
             (

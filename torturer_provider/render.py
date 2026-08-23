@@ -29,6 +29,8 @@ _IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SECRET_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _READY_STATUSES = frozenset({"live"})
 _FAILED_STATUSES = frozenset({"build_failed", "update_failed", "canceled", "deactivated"})
+_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+_RETRYABLE_METHODS = frozenset({"GET", "DELETE"})
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _REGIONS = frozenset({"frankfurt", "oregon", "ohio", "singapore", "virginia"})
 
@@ -254,6 +256,9 @@ class RenderAPI:
         base_url: str = "https://api.render.com/v1",
         timeout_seconds: float = 20.0,
         transport: RenderTransport | None = None,
+        retry_attempts: int = 2,
+        retry_backoff_seconds: float = 0.5,
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         if not isinstance(token, str) or not token or any(character.isspace() for character in token):
             raise ValueError("Render API token must be a non-empty single value")
@@ -262,8 +267,15 @@ class RenderAPI:
             raise ValueError("Render API base URL must be HTTPS without credentials")
         if timeout_seconds <= 0:
             raise ValueError("Render API timeout must be positive")
+        if isinstance(retry_attempts, bool) or not 0 <= retry_attempts <= 3:
+            raise ValueError("Render API retry attempts must be between 0 and 3")
+        if isinstance(retry_backoff_seconds, bool) or retry_backoff_seconds < 0:
+            raise ValueError("Render API retry backoff must not be negative")
         self._token = token
         self._transport = transport or _URLTransport(base_url, timeout_seconds)
+        self._retry_attempts = retry_attempts
+        self._retry_backoff_seconds = retry_backoff_seconds
+        self._sleeper = sleeper
 
     def _request(
         self,
@@ -283,24 +295,36 @@ class RenderAPI:
             if any(not isinstance(value, (str, int)) or isinstance(value, bool) for value in query.values()):
                 raise ValueError("Render API query values must be strings or integers")
             request_path = f"{path}?{urlencode(query)}"
-        try:
-            response = self._transport.request(
-                method,
-                request_path,
-                payload,
-                {
-                    "Accept": "application/json",
-                    "Authorization": f"Bearer {self._token}",
-                    "Content-Type": "application/json",
-                },
-            )
-        except RenderAPIError:
-            raise
-        except Exception as error:
-            raise RenderAPIError("TRANSPORT_ERROR") from error
-        if response.status not in expected:
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self._token}",
+            "Content-Type": "application/json",
+        }
+        for attempt in range(self._retry_attempts + 1):
+            try:
+                response = self._transport.request(method, request_path, payload, headers)
+            except RenderAPIError as error:
+                if (
+                    method in _RETRYABLE_METHODS
+                    and attempt < self._retry_attempts
+                    and (error.status in _RETRYABLE_STATUSES or error.code == "TRANSPORT_ERROR")
+                ):
+                    self._sleeper(self._retry_backoff_seconds * (2**attempt))
+                    continue
+                raise
+            except Exception as error:
+                wrapped = RenderAPIError("TRANSPORT_ERROR")
+                if method in _RETRYABLE_METHODS and attempt < self._retry_attempts:
+                    self._sleeper(self._retry_backoff_seconds * (2**attempt))
+                    continue
+                raise wrapped from error
+            if response.status in expected:
+                return response.payload
+            if method in _RETRYABLE_METHODS and response.status in _RETRYABLE_STATUSES and attempt < self._retry_attempts:
+                self._sleeper(self._retry_backoff_seconds * (2**attempt))
+                continue
             raise RenderAPIError("UNEXPECTED_STATUS", response.status)
-        return response.payload
+        raise AssertionError("Render API retry loop did not return or raise")
 
     @staticmethod
     def _object(payload: object, code: str = "INVALID_RESPONSE") -> Mapping[str, Any]:
@@ -417,13 +441,26 @@ class DisposableRenderController:
     def acquire(self, spec: RenderServiceSpec, *, timeout_seconds: float = 600.0, poll_seconds: float = 5.0) -> RenderServiceReady:
         if timeout_seconds <= 0 or poll_seconds <= 0:
             raise ValueError("Render readiness bounds must be positive")
-        handle = self.api.create_service(spec)
+        try:
+            handle = self.api.create_service(spec)
+        except BaseException:
+            try:
+                # Render may accept a create request and lose its response.  A
+                # fresh exact-name list/delete/absence proof is the only safe
+                # recovery when no service ID was returned.  Create is never
+                # retried because a second POST could create a duplicate.
+                RenderReaper(self.api).reap_exact(spec.owner_id, spec.name)
+            except BaseException as cleanup_error:
+                raise RenderAPIError("CREATE_CLEANUP_FAILED") from cleanup_error
+            raise
         try:
             return self._wait_until_ready(handle, timeout_seconds, poll_seconds)
-        except Exception:
+        except BaseException:
             try:
                 self.api.delete_service(handle.service_id)
-            except Exception as cleanup_error:
+                if self.api.exists(handle.service_id):
+                    raise RenderAPIError("DELETE_NOT_VERIFIED")
+            except BaseException as cleanup_error:
                 raise RenderAPIError("CREATE_CLEANUP_FAILED") from cleanup_error
             raise
 
@@ -478,6 +515,60 @@ class RenderReaper:
             if self.api.exists(service_id):
                 raise RenderAPIError("REAPER_DELETE_NOT_VERIFIED")
 
+    def reap_exact(self, owner_id: str, service_name: str) -> tuple[str, ...]:
+        """Delete and freshly verify one owner/name identity after lost create."""
+
+        _require(owner_id, _OWNER_ID, "owner_id")
+        _require(service_name, _SERVICE_NAME, "service_name")
+        deleted: list[str] = []
+        for record in self.api.list_services(owner_id):
+            if record.owner_id == owner_id and record.name == service_name:
+                self.reap((record.service_id,))
+                deleted.append(record.service_id)
+        remaining = tuple(
+            record.service_id
+            for record in self.api.list_services(owner_id)
+            if record.owner_id == owner_id and record.name == service_name
+        )
+        if remaining:
+            raise RenderAPIError("REAPER_DELETE_NOT_VERIFIED")
+        return tuple(deleted)
+
+    @staticmethod
+    def _tagged_record(
+        record: RenderServiceRecord,
+        owner_id: str,
+        name_prefix: str,
+        active_service_ids: set[str],
+    ) -> bool:
+        if record.owner_id != owner_id or record.service_id in active_service_ids:
+            return False
+        if not record.name.startswith(name_prefix):
+            return False
+        suffix = record.name[len(name_prefix):]
+        return bool(re.fullmatch(r"[a-z][a-z0-9-]{0,13}", suffix))
+
+    def assert_tagged_absent(
+        self,
+        owner_id: str,
+        name_prefix: str,
+        *,
+        active_service_ids: tuple[str, ...] = (),
+    ) -> None:
+        _require(owner_id, _OWNER_ID, "owner_id")
+        prefix = _service_prefix(name_prefix)
+        active = {
+            _require(service_id, _SERVICE_ID, "active_service_id")
+            for service_id in active_service_ids
+        }
+        remaining = tuple(
+            record
+            for record in self.api.list_services(owner_id)
+            if self._tagged_record(record, owner_id, prefix, active)
+        )
+        if remaining:
+            raise RenderAPIError("REAPER_DELETE_NOT_VERIFIED")
+
     def reap_tagged(
         self,
         owner_id: str,
@@ -504,16 +595,23 @@ class RenderReaper:
             raise ValueError("reaper clock returned an invalid value")
         deleted: list[str] = []
         for record in self.api.list_services(owner_id):
-            if record.owner_id != owner_id or record.service_id in active or not record.name.startswith(prefix):
+            if not self._tagged_record(record, owner_id, prefix, active):
                 continue
             try:
                 age = now - _timestamp(record.created_at)
-            except ValueError:
-                continue
+            except ValueError as error:
+                raise RenderAPIError("INVALID_SERVICE_TIMESTAMP") from error
             if age < older_than_seconds:
                 continue
             self.reap((record.service_id,))
             deleted.append(record.service_id)
+        remaining_ids = {
+            record.service_id
+            for record in self.api.list_services(owner_id)
+            if record.service_id in deleted
+        }
+        if remaining_ids:
+            raise RenderAPIError("REAPER_DELETE_NOT_VERIFIED")
         return tuple(deleted)
 
 

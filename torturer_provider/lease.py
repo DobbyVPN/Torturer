@@ -295,12 +295,12 @@ class RenderLease:
             self.ready = self._controller._wait_until_ready(self.handle, timeout_seconds, poll_seconds)
             self._transition(LeaseState.HEALTHY)
             return self.ready
-        except Exception as error:
+        except BaseException:
             try:
                 self._cleanup_after_failure()
-            except Exception as cleanup_error:
+            except BaseException as cleanup_error:
                 raise LeaseCleanupError("lease creation cleanup was not verified") from cleanup_error
-            raise error
+            raise
 
     def mark_issued(self) -> None:
         if self.state is not LeaseState.HEALTHY:
@@ -321,7 +321,11 @@ class RenderLease:
                 # request. The run-scoped random namespace is the only safe
                 # fallback selector when no exact service ID exists.
                 self.reap_orphans(older_than_seconds=0)
-            except Exception as error:
+                RenderReaper(self.api).assert_tagged_absent(
+                    self.spec.owner_id,
+                    self.descriptor.service_prefix,
+                )
+            except BaseException as error:
                 self._append("unverified-no-service-id")
                 raise LeaseCleanupError("namespace cleanup was not verified") from error
             self._transition(LeaseState.ABSENT, "verified-namespace")

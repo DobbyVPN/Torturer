@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
 import re
-import shutil
+import secrets
 import stat
 import sys
 
@@ -25,6 +26,54 @@ _ARCHITECTURES = {
 
 class CandidateClosureError(RuntimeError):
     """The candidate closure is incomplete, unsafe, or has stale provenance."""
+
+
+def expected_architecture(platform: str) -> str:
+    """Return the immutable architecture expected by one hosted lane."""
+    try:
+        return _ARCHITECTURES[platform]
+    except KeyError as error:
+        raise CandidateClosureError("candidate platform is unsupported") from error
+
+
+def closure_sha256(manifest: dict[str, object]) -> str:
+    """Hash the validated multi-file candidate identity, not ``manifest.json``.
+
+    ``verify`` must run before this function.  The digest is deliberately
+    independent of JSON object insertion order, while binding the validated
+    header and every ordered member name, byte digest, size, and executable
+    policy.  The raw manifest-file digest is a separate provenance value.
+    """
+    expected = {"schema", "kind", "platform", "architecture", "source_sha", "files"}
+    if set(manifest) != expected or not isinstance(manifest.get("files"), dict):
+        raise CandidateClosureError("candidate manifest is not a validated closure")
+    files = manifest["files"]
+    members: list[dict[str, object]] = []
+    for name in sorted(files):
+        record = files[name]
+        if not isinstance(name, str) or not isinstance(record, dict):
+            raise CandidateClosureError("candidate closure member identity is invalid")
+        if set(record) != {"sha256", "size", "executable"}:
+            raise CandidateClosureError("candidate closure member record is invalid")
+        members.append(
+            {
+                "name": name,
+                "sha256": record["sha256"],
+                "size": record["size"],
+                "executable": record["executable"],
+            }
+        )
+    canonical = {
+        "digest_version": 1,
+        "schema": manifest["schema"],
+        "kind": manifest["kind"],
+        "platform": manifest["platform"],
+        "architecture": manifest["architecture"],
+        "source_sha": manifest["source_sha"],
+        "members": members,
+    }
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -142,9 +191,170 @@ def _regular(path: Path, description: str) -> os.stat_result:
     return details
 
 
-def _digest(path: Path) -> str:
-    with path.open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
+def _descriptor_identity(details: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    """Return the identity and mutation-sensitive metadata of an open file."""
+
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_mode,
+        getattr(details, "st_uid", -1),
+        details.st_size,
+        getattr(details, "st_mtime_ns", int(details.st_mtime * 1_000_000_000)),
+        getattr(details, "st_ctime_ns", int(details.st_ctime * 1_000_000_000)),
+    )
+
+
+def _validate_descriptor(details: os.stat_result, description: str) -> None:
+    """Validate the object represented by an already-open descriptor."""
+
+    if not stat.S_ISREG(details.st_mode):
+        raise CandidateClosureError(f"{description} is not a regular file")
+    if details.st_size <= 0:
+        raise CandidateClosureError(f"{description} is empty")
+    if os.name != "nt":
+        if hasattr(os, "geteuid") and details.st_uid != os.geteuid():
+            raise CandidateClosureError(f"{description} is not owned by the current user")
+        if details.st_mode & 0o022:
+            raise CandidateClosureError(f"{description} has unsafe permissions")
+
+
+def _open_pinned(path: Path, description: str) -> tuple[int, os.stat_result]:
+    """Open a candidate file and bind the checks to that exact descriptor."""
+
+    path = Path(path)
+    _reject_symlink_components(path.parent, description)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise CandidateClosureError(f"{description} is not a regular file") from error
+        raise CandidateClosureError(f"{description} is unavailable") from error
+    try:
+        details = os.fstat(descriptor)
+        _validate_descriptor(details, description)
+        try:
+            path_details = path.lstat()
+        except OSError as error:
+            raise CandidateClosureError(f"{description} disappeared while opening") from error
+        if _descriptor_identity(path_details) != _descriptor_identity(details):
+            raise CandidateClosureError(f"{description} changed while being opened")
+        return descriptor, details
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _iter_descriptor_bytes(descriptor: int):
+    while True:
+        try:
+            chunk = os.read(descriptor, 1024 * 1024)
+        except InterruptedError:
+            continue
+        if not chunk:
+            return
+        yield chunk
+
+
+def _ensure_descriptor_stable(
+    descriptor: int,
+    path: Path,
+    before: os.stat_result,
+    description: str,
+) -> os.stat_result:
+    """Prove both the descriptor and its pathname stayed the same after I/O."""
+
+    try:
+        after = os.fstat(descriptor)
+        _validate_descriptor(after, description)
+        path_details = path.lstat()
+    except OSError as error:
+        raise CandidateClosureError(f"{description} became unavailable during I/O") from error
+    if _descriptor_identity(after) != _descriptor_identity(before):
+        raise CandidateClosureError(f"{description} changed while being read or copied")
+    if _descriptor_identity(path_details) != _descriptor_identity(before):
+        raise CandidateClosureError(f"{description} was replaced while being read or copied")
+    return after
+
+
+def _digest_descriptor(
+    descriptor: int,
+    path: Path,
+    before: os.stat_result,
+    description: str,
+) -> tuple[str, int]:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    size = 0
+    for chunk in _iter_descriptor_bytes(descriptor):
+        digest.update(chunk)
+        size += len(chunk)
+    _ensure_descriptor_stable(descriptor, path, before, description)
+    return digest.hexdigest(), size
+
+
+def _read_descriptor(
+    descriptor: int,
+    path: Path,
+    before: os.stat_result,
+    description: str,
+) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    data = b"".join(_iter_descriptor_bytes(descriptor))
+    _ensure_descriptor_stable(descriptor, path, before, description)
+    return data
+
+
+def _copy_descriptor(
+    descriptor: int,
+    source: Path,
+    before: os.stat_result,
+    destination: Path,
+    description: str,
+) -> None:
+    _reject_symlink_components(destination.parent, "candidate output")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        target = os.open(destination, flags, 0o600)
+    except OSError as error:
+        raise CandidateClosureError(f"candidate output {destination.name} could not be created") from error
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        for chunk in _iter_descriptor_bytes(descriptor):
+            offset = 0
+            while offset < len(chunk):
+                offset += os.write(target, chunk[offset:])
+        os.fsync(target)
+    except OSError as error:
+        raise CandidateClosureError(f"candidate {description} could not be copied") from error
+    finally:
+        os.close(target)
+    _ensure_descriptor_stable(descriptor, source, before, description)
+
+
+def _write_manifest(path: Path, manifest: dict[str, object]) -> None:
+    payload = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise CandidateClosureError("candidate manifest could not be created") from error
+    try:
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset:])
+        os.fchmod(descriptor, 0o600) if hasattr(os, "fchmod") else os.chmod(path, 0o600)
+        os.fsync(descriptor)
+        details = os.fstat(descriptor)
+        _validate_descriptor(details, "candidate manifest")
+        path_details = path.lstat()
+        if _descriptor_identity(path_details) != _descriptor_identity(details):
+            raise CandidateClosureError("candidate manifest changed while being written")
+    except OSError as error:
+        raise CandidateClosureError("candidate manifest could not be written") from error
+    finally:
+        os.close(descriptor)
 
 
 def stage(
@@ -161,17 +371,30 @@ def stage(
     files: dict[str, dict[str, object]] = {}
     for item in _FILES[platform]:
         source = source_root / item.source
-        details = _regular(source, f"candidate source {item.name}")
-        if item.executable and os.name != "nt" and not details.st_mode & stat.S_IXUSR:
-            raise CandidateClosureError(f"candidate source {item.name} is not executable")
-        destination = output_root / item.name
-        shutil.copyfile(source, destination)
-        destination.chmod(0o700 if item.executable else 0o600)
-        files[item.name] = {
-            "sha256": _digest(destination),
-            "size": destination.stat().st_size,
-            "executable": item.executable,
-        }
+        descriptor, details = _open_pinned(source, f"candidate source {item.name}")
+        try:
+            if item.executable and os.name != "nt" and not details.st_mode & stat.S_IXUSR:
+                raise CandidateClosureError(f"candidate source {item.name} is not executable")
+            destination = output_root / item.name
+            _copy_descriptor(descriptor, source, details, destination, f"source {item.name}")
+        finally:
+            os.close(descriptor)
+        destination_descriptor, destination_details = _open_pinned(
+            destination, f"candidate output {item.name}"
+        )
+        try:
+            mode = 0o700 if item.executable else 0o600
+            if hasattr(os, "fchmod"):
+                os.fchmod(destination_descriptor, mode)
+                destination_details = os.fstat(destination_descriptor)
+            else:
+                destination.chmod(mode)
+            digest, size = _digest_descriptor(
+                destination_descriptor, destination, destination_details, f"candidate output {item.name}"
+            )
+        finally:
+            os.close(destination_descriptor)
+        files[item.name] = {"sha256": digest, "size": size, "executable": item.executable}
     manifest: dict[str, object] = {
         "schema": 1,
         "kind": "dobbyvpn.hosted-candidate-closure",
@@ -181,12 +404,13 @@ def stage(
         "files": files,
     }
     manifest_path = output_root / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
-        encoding="utf-8",
+    _write_manifest(manifest_path, manifest)
+    total_bytes = sum(int(record["size"]) for record in files.values())
+    print(
+        "candidate_closure status=staged "
+        f"id={secrets.token_hex(16)} bytes={total_bytes} "
+        f"sha256={closure_sha256(manifest)}"
     )
-    manifest_path.chmod(0o600)
-    print(json.dumps(manifest, sort_keys=True))
     return manifest
 
 
@@ -200,11 +424,15 @@ def verify(
     _validate_identity(platform, architecture, source_sha)
     root = _directory(root, "candidate artifact root")
     manifest_path = root / "manifest.json"
-    _regular(manifest_path, "candidate manifest")
+    manifest_descriptor, manifest_details = _open_pinned(manifest_path, "candidate manifest")
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(
+            _read_descriptor(manifest_descriptor, manifest_path, manifest_details, "candidate manifest")
+        )
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise CandidateClosureError("candidate manifest is unreadable") from error
+    finally:
+        os.close(manifest_descriptor)
     expected_header = {
         "schema": 1,
         "kind": "dobbyvpn.hosted-candidate-closure",
@@ -228,25 +456,40 @@ def verify(
         raise CandidateClosureError("candidate artifact member allow-list mismatch")
     for name, item in expected_specs.items():
         path = root / name
-        details = _regular(path, f"candidate artifact {name}")
+        descriptor, details = _open_pinned(path, f"candidate artifact {name}")
         record = files.get(name)
-        if not isinstance(record, dict) or set(record) != {"sha256", "size", "executable"}:
-            raise CandidateClosureError(f"candidate manifest file record is invalid: {name}")
-        digest = record["sha256"]
-        size = record["size"]
-        executable = record["executable"]
-        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-            raise CandidateClosureError(f"candidate manifest digest is invalid: {name}")
-        if type(size) is not int or size <= 0:
-            raise CandidateClosureError(f"candidate manifest size is invalid: {name}")
-        if type(executable) is not bool:
-            raise CandidateClosureError(f"candidate manifest executable flag is invalid: {name}")
-        if digest != _digest(path) or size != details.st_size:
-            raise CandidateClosureError(f"candidate artifact digest or size mismatch: {name}")
-        if executable is not item.executable:
-            raise CandidateClosureError(f"candidate executable policy mismatch: {name}")
-        path.chmod(0o700 if item.executable else 0o600)
-        print(f"{digest}  {name}")
+        try:
+            if not isinstance(record, dict) or set(record) != {"sha256", "size", "executable"}:
+                raise CandidateClosureError(f"candidate manifest file record is invalid: {name}")
+            digest = record["sha256"]
+            size = record["size"]
+            executable = record["executable"]
+            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise CandidateClosureError(f"candidate manifest digest is invalid: {name}")
+            if type(size) is not int or size <= 0:
+                raise CandidateClosureError(f"candidate manifest size is invalid: {name}")
+            if type(executable) is not bool:
+                raise CandidateClosureError(f"candidate manifest executable flag is invalid: {name}")
+            actual_digest, actual_size = _digest_descriptor(
+                descriptor, path, details, f"candidate artifact {name}"
+            )
+            if digest != actual_digest or size != actual_size:
+                raise CandidateClosureError(f"candidate artifact digest or size mismatch: {name}")
+            if executable is not item.executable:
+                raise CandidateClosureError(f"candidate executable policy mismatch: {name}")
+            mode = 0o700 if item.executable else 0o600
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, mode)
+            else:
+                path.chmod(mode)
+        finally:
+            os.close(descriptor)
+    total_bytes = sum(int(record["size"]) for record in files.values())
+    print(
+        "candidate_closure status=verified "
+        f"id={secrets.token_hex(16)} bytes={total_bytes} "
+        f"sha256={closure_sha256(manifest)}"
+    )
     return manifest
 
 
@@ -283,7 +526,10 @@ def main(argv: list[str] | None = None) -> int:
                 source_sha=args.source_sha,
             )
     except (CandidateClosureError, OSError, ValueError) as error:
-        print(f"hosted candidate closure failed: {error}", file=sys.stderr)
+        print(
+            f"candidate_closure status=failed code={type(error).__name__}",
+            file=sys.stderr,
+        )
         return 1
     return 0
 

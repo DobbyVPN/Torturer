@@ -17,11 +17,13 @@ from .assertions import (
 from .capabilities import Capability
 from .engine import (
     CapabilityUnavailable,
+    EvidenceProvider,
     FunctionalEngine,
     ScenarioAdapter,
     ScenarioExecutionError,
 )
 from .results import (
+    EvidenceReference,
     ResultValidationError,
     RunProvenance,
     ScenarioResult,
@@ -41,6 +43,8 @@ __all__ = [
     "AndroidProfileObservation",
     "CapabilityUnavailable",
     "Capability",
+    "EvidenceReference",
+    "EvidenceProvider",
     "FunctionalEngine",
     "ResultValidationError",
     "RunProvenance",

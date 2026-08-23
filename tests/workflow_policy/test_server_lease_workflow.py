@@ -24,22 +24,33 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
     def test_is_manual_only_and_has_a_bounded_lease_job(self) -> None:
         self.assertRegex(self.text, r"(?m)^on:\n  workflow_dispatch:")
         self.assertNotRegex(self.text, r"(?m)^  (?:push|pull_request|pull_request_target|schedule):")
-        self.assertRegex(self.text, r"(?m)^    timeout-minutes: 40$")
+        self.assertRegex(self.text, r"(?m)^    timeout-minutes: 30$")
+        self.assertNotRegex(self.text, r"(?m)^\s+timeout-minutes:\s*(?:3[1-9]|[4-9][0-9]|[1-9][0-9]{2,})$")
+        self.assertIn("LEASE_DEADLINE_EPOCH", self.text)
+        self.assertIn("reserve = 120", self.text)
+        self.assertIn("cleanup_command_seconds = 44", self.text)
+        self.assertIn("cleanup_kill_grace_seconds = 1", self.text)
+        self.assertIn("plaintext_cleanup_seconds = 4", self.text)
+        self.assertIn("plaintext_kill_grace_seconds = 1", self.text)
+        self.assertIn("evidence_upload_seconds = 60", self.text)
+        self.assertIn("finalization_overhead_seconds = 10", self.text)
+        self.assertIn("if sum(finalization_components) > reserve", self.text)
+        self.assertIn("30 * 60", self.text)
         self.assertRegex(self.text, r"(?m)^    environment: render-functional$")
         self.assertIn("run-name: Trusted Render lease ${{ inputs.lease_run_id }} ${{ inputs.platform }}", self.text)
 
     def test_lease_directory_is_owner_only_before_provider_files_are_created(self) -> None:
+        establish = self.text.index("- name: Establish runner-local paths and hard thirty-minute deadline")
         validate = self.text.index("- name: Validate trusted lease boundary")
-        checkout = self.text.index("- name: Check out exact trusted Torturer revision")
-        block = self.text[validate:checkout]
+        block = self.text[establish:validate]
         self.assertIn("umask 077", block)
-        self.assertIn('mkdir -p "$LEASE_DIR"', block)
-        self.assertIn('chmod 700 "$LEASE_DIR"', block)
+        self.assertIn('mkdir -p "$lease_dir"', block)
+        self.assertIn('chmod 700 "$lease_dir"', block)
 
     def test_runner_local_lease_path_is_initialized_from_runner_environment(self) -> None:
         self.assertNotIn("${{ runner.temp }}", self.text)
-        self.assertRegex(self.text, r"(?m)^      - name: Establish runner-local paths$")
-        self.assertIn("printf 'LEASE_DIR=%s\\n' \"$RUNNER_TEMP/dobbyvpn-render-lease\" >> \"$GITHUB_ENV\"", self.text)
+        self.assertRegex(self.text, r"(?m)^      - name: Establish runner-local paths and hard thirty-minute deadline$")
+        self.assertIn('printf \'LEASE_DIR=%s\\n\' "$lease_dir" >> "$GITHUB_ENV"', self.text)
 
     def test_permissions_and_external_actions_are_immutable(self) -> None:
         self.assertRegex(self.text, r"(?m)^permissions:\n  contents: read\n  actions: write$")
@@ -68,6 +79,7 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
 
     def test_origin_and_request_artifacts_are_bound_to_the_same_run(self) -> None:
         self.assertIn("origin_torturer_sha:", self.text)
+        self.assertIn("origin_source_sha:", self.text)
         self.assertIn("origin_run_attempt:", self.text)
         self.assertIn("ORIGIN_RUN_ATTEMPT: ${{ inputs.origin_run_attempt }}", self.text)
         self.assertIn("trusted-render-lease-${{ inputs.origin_run_id }}-${{ inputs.platform }}", self.text)
@@ -76,6 +88,8 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         self.assertNotIn("actions/runs/${ORIGIN_RUN_ID}/artifacts", self.text)
         self.assertIn("one Render lease already exists for this origin/platform", self.text)
         self.assertIn("ORIGIN_TORTURER_SHA: ${{ inputs.origin_torturer_sha }}", self.text)
+        self.assertIn("ORIGIN_SOURCE_SHA: ${{ inputs.origin_source_sha }}", self.text)
+        self.assertIn("origin_source_sha is invalid", self.text)
         self.assertIn("origin_workflow_path:", self.text)
         self.assertIn("ORIGIN_WORKFLOW_PATH: ${{ inputs.origin_workflow_path }}", self.text)
         self.assertIn("origin workflow path is not allow-listed", self.text)
@@ -95,8 +109,10 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("--expect-file request.json", self.text)
         self.assertIn("--expect-file recipient.crt", self.text)
         self.assertNotIn("unzip -o", self.text)
-        self.assertIn("--timeout-seconds 300", self.text)
+        self.assertIn("--timeout-seconds \"$readiness_timeout\"", self.text)
+        self.assertIn("torturer_checks.hosted.deadline", self.text)
         self.assertIn('"platform": os.environ["PLATFORM"]', self.text)
+        self.assertIn('"source_sha": os.environ["ORIGIN_SOURCE_SHA"]', self.text)
         self.assertIn('render-lease-${{ inputs.lease_run_id }}-${{ inputs.platform }}', self.text)
         self.assertIn('render-lease-journal-${{ inputs.lease_run_id }}-${{ inputs.platform }}', self.text)
 
@@ -109,6 +125,79 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         self.assertNotIn("profile.toml", block)
         self.assertIn("openssl cms -encrypt -binary -aes-256-gcm", self.text)
         self.assertIn('rm -f "$LEASE_DIR/profile.toml"', self.text)
+
+    def test_every_cms_encrypt_or_decrypt_invocation_is_bounded(self) -> None:
+        workflows = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+        found: list[tuple[str, int]] = []
+        for workflow in workflows:
+            lines = workflow.read_text(encoding="utf-8").splitlines()
+            for index, line in enumerate(lines):
+                if not re.search(r"openssl\s+cms\s+-(?:encrypt|decrypt)\b", line):
+                    continue
+                found.append((workflow.name, index + 1))
+                preceding = lines[max(0, index - 4):index]
+                direct_timeout = bool(
+                    re.search(
+                        r"^\s*timeout\s+.*(?:[0-9]+|\$\{[^}]+\})s[\"']?\s+openssl\s+cms\b",
+                        line,
+                    )
+                )
+                deadline_wrapper = any(
+                    "torturer_checks.hosted.deadline" in candidate
+                    for candidate in preceding
+                )
+                with self.subTest(workflow=workflow.name, line=index + 1):
+                    self.assertTrue(
+                        direct_timeout or deadline_wrapper,
+                        "CMS invocation must be directly timeout-wrapped or use the "
+                        "shared process-tree deadline wrapper",
+                    )
+        self.assertGreaterEqual(len(found), 5)
+
+    def test_server_encryption_uses_absolute_deadline_and_preserves_streams(self) -> None:
+        encrypt = self.text.index("- name: Encrypt and publish the profile handoff")
+        upload = self.text.index("- name: Upload encrypted profile and safe lease record", encrypt)
+        block = self.text[encrypt:upload]
+        self.assertIn("LEASE_DEADLINE_EPOCH - $(date +%s) - LEASE_CLEANUP_RESERVE_SECONDS", block)
+        self.assertIn('if [ "$remaining" -le 2 ]', block)
+        self.assertIn('encryption_timeout=$((remaining - 1))', block)
+        self.assertIn('if [ "$encryption_timeout" -gt 60 ]; then encryption_timeout=60; fi', block)
+        self.assertIn("torturer_checks.hosted.deadline", block)
+        self.assertIn('--timeout-seconds "$encryption_timeout" --kill-grace-seconds 1', block)
+        self.assertIn("openssl cms -encrypt -binary -aes-256-gcm", block)
+        # The deadline wrapper inherits both streams and proves/reaps the full
+        # process tree; no redirection may discard OpenSSL diagnostics.
+        self.assertNotRegex(block, r"2>\s*/dev/null|>\s*/dev/null|--quiet(?:\s|$)")
+
+    def test_server_cms_budget_is_inside_the_single_aggregate_deadline(self) -> None:
+        """The CMS child and its bounded reaping tail cannot cross the job deadline."""
+
+        establish = self.text.index("- name: Establish runner-local paths and hard thirty-minute deadline")
+        boundary = self.text.index("- name: Validate trusted lease boundary", establish)
+        deadline_setup = self.text[establish:boundary]
+        self.assertIn("deadline = int(started.timestamp()) + 30 * 60", deadline_setup)
+        self.assertIn("reserve = 120", deadline_setup)
+        self.assertIn("if sum(finalization_components) > reserve", deadline_setup)
+        self.assertIn("LEASE_DEADLINE_EPOCH={deadline}", deadline_setup)
+
+        encrypt = self.text.index("- name: Encrypt and publish the profile handoff")
+        upload = self.text.index("- name: Upload encrypted profile and safe lease record", encrypt)
+        block = self.text[encrypt:upload]
+        self.assertRegex(
+            block,
+            r"remaining=\$\(\(LEASE_DEADLINE_EPOCH - \$\(date \+%s\) - "
+            r"LEASE_CLEANUP_RESERVE_SECONDS\)\)",
+        )
+        self.assertIn("encryption_timeout=$((remaining - 1))", block)
+        self.assertIn('if [ "$encryption_timeout" -gt 60 ]; then encryption_timeout=60; fi', block)
+        self.assertIn('--timeout-seconds "$encryption_timeout" --kill-grace-seconds 1', block)
+        # There must be one shared absolute-deadline wrapper, not a second
+        # nominal `timeout` whose grace could escape the aggregate deadline.
+        self.assertEqual(block.count("torturer_checks.hosted.deadline"), 1)
+        self.assertNotRegex(block, r"(?m)^\s+timeout\s+.*openssl cms")
+        # Worst-case CMS work (60s), wrapper grace (1s), and the one-second
+        # arithmetic safety margin all remain inside the 120s reserve.
+        self.assertLessEqual(60 + 1 + 1, 120)
 
     def test_cleanup_is_unconditional_and_independently_verified(self) -> None:
         cleanup = self.text.index("- name: Delete the exact Render service and verify absence")
@@ -125,7 +214,42 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         self.assertIn('cleanup_args+=(--lease "$LEASE_DIR/lease.json")', cleanup_step)
         self.assertIn("if api.exists(service_id)", (ROOT / "torturer_provider" / "lease_cli.py").read_text(encoding="utf-8"))
         self.assertIn("for attempt in $(seq 1 180)", self.text)
+        self.assertIn("completion marker wait reached the cleanup reserve", self.text)
+        self.assertIn('private-gh-api.sh', self.text)
+        self.assertIn('sleep_seconds=10', self.text)
+        self.assertIn('cleanup_command_limit="$LEASE_CLEANUP_COMMAND_SECONDS"', self.text)
+        self.assertIn('"$LEASE_PLAINTEXT_CLEANUP_SECONDS"', self.text)
+        self.assertIn('timeout --foreground --signal=TERM --kill-after="${LEASE_PLAINTEXT_KILL_GRACE_SECONDS}s" "${command_timeout}s"', self.text)
         self.assertIn("completion marker deadline expired", self.text)
+
+    def test_finalization_sub_budgets_fit_inside_the_reserve(self) -> None:
+        reserve = int(re.search(r"(?m)^          reserve = (\d+)$", self.text).group(1))
+        names = (
+            "cleanup_command_seconds",
+            "cleanup_kill_grace_seconds",
+            "plaintext_cleanup_seconds",
+            "plaintext_kill_grace_seconds",
+            "evidence_upload_seconds",
+            "finalization_overhead_seconds",
+        )
+        values = {
+            name: int(re.search(rf"(?m)^          {name} = (\d+)$", self.text).group(1))
+            for name in names
+        }
+        self.assertEqual(values, {
+            "cleanup_command_seconds": 44,
+            "cleanup_kill_grace_seconds": 1,
+            "plaintext_cleanup_seconds": 4,
+            "plaintext_kill_grace_seconds": 1,
+            "evidence_upload_seconds": 60,
+            "finalization_overhead_seconds": 10,
+        })
+        self.assertLessEqual(sum(values.values()), reserve)
+        self.assertEqual(sum(values.values()), 120)
+        self.assertRegex(
+            self.text,
+            r"(?ms)- name: Upload safe lease journal.*?timeout-minutes: 1",
+        )
 
     def test_render_token_is_confined_to_provider_steps(self) -> None:
         self.assertEqual(self.text.count("RENDER_API_TOKEN: ${{ secrets.RENDER_API_TOKEN }}"), 2)
@@ -133,6 +257,15 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
 
     def test_diagnostic_suppression_is_not_added(self) -> None:
         self.assertNotRegex(self.text, r">\s*/dev/null|2>\s*/dev/null|--quiet(?:\s|$)")
+
+    def test_every_active_workflow_job_is_bounded_to_thirty_minutes(self) -> None:
+        workflows = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+        self.assertTrue(workflows)
+        for workflow in workflows:
+            values = re.findall(r"(?m)^\s+timeout-minutes:\s*([0-9]+)\s*$", workflow.read_text(encoding="utf-8"))
+            self.assertTrue(values, workflow.name)
+            for value in values:
+                self.assertLessEqual(int(value), 30, workflow.name)
 
 
 if __name__ == "__main__":

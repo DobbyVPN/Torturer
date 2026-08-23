@@ -1,21 +1,31 @@
 from __future__ import annotations
+import hashlib
 import os
+import time
 
 from pathlib import Path
 import tempfile
 import unittest
 
 from unittest import mock
-from torturer_checks.hosted.cli import CommandResult, HostedAdapterError
+from torturer_checks.hosted.cli import CommandResult, HostedAdapterError, _evidence_metadata
 from torturer_checks.hosted.factory import adapter_for_platform
-from torturer_checks.hosted.macos import MacOSHostedAdapter, _default_control_socket
+from torturer_checks.hosted.macos import (
+    MacOSHostedAdapter,
+    _default_control_socket,
+    _macos_process_tree,
+    _parse_macos_process_census,
+)
 from torturer_checks.hosted.windows import (
     WindowsHostedAdapter,
     _WINDOWS_PORT_READY_SCRIPT,
     _WINDOWS_PROCESS_ALIVE_SCRIPT,
+    _WINDOWS_PROCESS_TREE_SNAPSHOT_SCRIPT,
+    _WINDOWS_PROCESS_TREE_VERIFY_SCRIPT,
+    _parse_windows_tree_identities,
 )
 from torturer_contract.functional.capabilities import Capability
-from torturer_contract.functional.engine import FunctionalEngine
+from torturer_contract.functional.engine import FunctionalEngine, ScenarioExecutionError
 from torturer_contract.functional.scenarios import get_scenario
 
 
@@ -29,8 +39,21 @@ class HostedDesktopProcessRunner:
         self.timeouts: list[float] = []
         self.raw_directory: Path | None = None
         self.service_alive = True
+        self.tree_survivor = False
+        self.tree_identity_mismatch = False
+        self.external_evidence: list[dict[str, object]] = []
         self.connected = False
         self.external_calls = 0
+
+    def retain_external_evidence(self, path: Path, *, evidence_kind: str) -> None:
+        evidence_bytes, evidence_sha256 = _evidence_metadata(path)
+        self.external_evidence.append({
+            "evidence_id": "e" + "0" * 31,
+            "evidence_file": path.name,
+            "evidence_kind": evidence_kind,
+            "evidence_bytes": evidence_bytes,
+            "evidence_sha256": evidence_sha256,
+        })
 
     def run(self, command, *, timeout_seconds):
         argv = tuple(command)
@@ -55,11 +78,49 @@ class HostedDesktopProcessRunner:
         if argv[0] == "python3":
             return CommandResult(argv, 0 if self.service_alive else 1, b"", b"")
         if argv[0] == "ps":
+            if argv[1:3] == ("-axo", "pid=,ppid=,lstart="):
+                if not self.service_alive:
+                    return CommandResult(argv, 0, b"", b"")
+                return CommandResult(
+                    argv,
+                    0,
+                    b"123 1 Mon Aug 23 10:00:00 2026\n"
+                    b"456 123 Mon Aug 23 10:00:01 2026\n",
+                    b"",
+                )
             return CommandResult(argv, 0, (str(self.binary.resolve()) + "\n").encode(), b"")
         if argv[0] == "powershell.exe":
             script = argv[argv.index("-Command") + 1]
+            if "tree_pid=" in script:
+                return CommandResult(
+                    argv,
+                    0,
+                    b"tree_pid=123\ntree_identity=123|100\n"
+                    b"tree_pid=456\ntree_identity=456|200\n",
+                    b"",
+                )
+            if "survivor_pid=" in script:
+                if self.tree_identity_mismatch:
+                    return CommandResult(
+                        argv,
+                        0,
+                        b"identity_mismatch_pid=123\n"
+                        b"identity_expected=123|100\n"
+                        b"identity_observed=123|200\n",
+                        b"",
+                    )
+                return CommandResult(
+                    argv,
+                    1 if self.tree_survivor else 0,
+                    b"survivor_pid=789\n" if self.tree_survivor else b"",
+                    b"tree diagnostic\n" if self.tree_survivor else b"",
+                )
             if "Start-Process" in script:
                 self.service_alive = True
+                Path(argv[7]).write_bytes(b"windows service stdout\n")
+                Path(argv[8]).write_bytes(b"windows service stderr\n")
+                Path(argv[7]).chmod(0o600)
+                Path(argv[8]).chmod(0o600)
                 return CommandResult(argv, 0, b"456\n", b"")
             if "Get-CimInstance" in script:
                 return CommandResult(
@@ -167,10 +228,31 @@ class HostedDesktopAdapterTests(unittest.TestCase):
                 privileged = [call[2:] for call in runner.calls if call[:2] == ("sudo", "-n")]
                 self.assertTrue(any(call[:2] == ("kill", "-KILL") for call in privileged))
                 self.assertTrue(any(call[:1] == ("ps",) for call in privileged))
+                self.assertTrue(any(call[:2] == ("ps", "-axo") for call in privileged))
+                self.assertGreaterEqual(
+                    sum(call[:2] == ("kill", "-KILL") for call in privileged),
+                    2,
+                )
                 self.assertTrue(any(call[:2] == ("sh", "-c") for call in privileged))
                 self.assertTrue(any(call[:2] == ("python3", "-c") for call in runner.calls))
                 launch = next(call for call in privileged if call[:2] == ("sh", "-c"))
                 self.assertEqual(launch[-2], str(Path(self.directory.name) / "control.sock"))
+
+    def test_macos_census_tracks_parent_tree_and_start_identity(self) -> None:
+        census = _parse_macos_process_census(
+            "bad row\n"
+            "123 1 Mon Aug 23 10:00:00 2026\n"
+            "456 123 Mon Aug 23 10:00:01 2026\n"
+            "789 456 Mon Aug 23 10:00:02 2026\n"
+        )
+        self.assertEqual(
+            _macos_process_tree(census, 123),
+            (
+                (123, "Mon Aug 23 10:00:00 2026"),
+                (456, "Mon Aug 23 10:00:01 2026"),
+                (789, "Mon Aug 23 10:00:02 2026"),
+            ),
+        )
 
     def test_windows_process_probes_preserve_diagnostics(self) -> None:
         self.assertNotIn("Out-Null", _WINDOWS_PROCESS_ALIVE_SCRIPT)
@@ -178,6 +260,103 @@ class HostedDesktopAdapterTests(unittest.TestCase):
         self.assertNotIn("-InformationLevel Quiet", _WINDOWS_PORT_READY_SCRIPT)
         self.assertIn("Write-Output $ready", _WINDOWS_PORT_READY_SCRIPT)
         self.assertIn("$ready.TcpTestSucceeded", _WINDOWS_PORT_READY_SCRIPT)
+        self.assertIn("tree_pid=", _WINDOWS_PROCESS_TREE_SNAPSHOT_SCRIPT)
+        self.assertIn("CreationDate", _WINDOWS_PROCESS_TREE_SNAPSHOT_SCRIPT)
+        self.assertIn("tree_identity=", _WINDOWS_PROCESS_TREE_SNAPSHOT_SCRIPT)
+        self.assertIn("survivor_pid=", _WINDOWS_PROCESS_TREE_VERIFY_SCRIPT)
+        self.assertIn("identity_mismatch_pid=", _WINDOWS_PROCESS_TREE_VERIFY_SCRIPT)
+        self.assertNotIn("$pid =", _WINDOWS_PROCESS_TREE_SNAPSHOT_SCRIPT)
+
+    def test_windows_tree_identity_rejects_malformed_and_accepts_creation_time(self) -> None:
+        self.assertEqual(
+            _parse_windows_tree_identities(
+                "tree_pid=123\n"
+                "tree_identity=123|100\n"
+                "tree_identity=bad|200\n"
+                "tree_identity=456|0\n"
+            ),
+            ("123|100",),
+        )
+
+    def test_windows_service_process_reuse_is_not_a_survivor(self) -> None:
+        runner = HostedDesktopProcessRunner(platform="windows", binary=self.cli)
+        runner.raw_directory = Path(self.directory.name) / "windows-reused-pid-raw"
+        runner.tree_identity_mismatch = True
+        adapter = self._adapter("windows", runner)
+        adapter.service._terminate(5.0)
+        self.assertTrue(adapter.service._tree_proof_for_evidence)
+        verify_call = next(
+            call
+            for call in runner.calls
+            if call[0] == "powershell.exe" and "identity_mismatch_pid=" in call[5]
+        )
+        self.assertIn("123|100", verify_call)
+
+    def test_windows_service_restart_evidence_is_exclusive_and_owner_only(self) -> None:
+        runner = HostedDesktopProcessRunner(platform="windows", binary=self.cli)
+        raw = Path(self.directory.name) / "windows-exclusive-raw"
+        raw.mkdir(mode=0o700)
+        sentinel_stdout = raw / "service-restart-001.stdout.raw.log"
+        sentinel_stderr = raw / "service-restart-001.stderr.raw.log"
+        sentinel_stdout.write_bytes(b"old stdout evidence\n")
+        sentinel_stderr.write_bytes(b"old stderr evidence\n")
+        sentinel_stdout.chmod(0o600)
+        sentinel_stderr.chmod(0o600)
+        runner.raw_directory = raw
+        adapter = self._adapter("windows", runner)
+        adapter.service._start(10.0)
+        launch = next(
+            call for call in runner.calls
+            if call[0] == "powershell.exe" and "Start-Process" in call[5]
+        )
+        stdout_path = Path(launch[7])
+        stderr_path = Path(launch[8])
+        self.assertNotEqual(stdout_path, sentinel_stdout)
+        self.assertNotEqual(stderr_path, sentinel_stderr)
+        self.assertEqual(sentinel_stdout.read_bytes(), b"old stdout evidence\n")
+        self.assertEqual(sentinel_stderr.read_bytes(), b"old stderr evidence\n")
+        self.assertEqual(stdout_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(stderr_path.stat().st_mode & 0o777, 0o600)
+        adapter.service._terminate(5.0)
+        adapter.service.finalize_evidence()
+        self.assertEqual(len(runner.external_evidence), 2)
+        for record, path in zip(runner.external_evidence, (stdout_path, stderr_path)):
+            data = path.read_bytes()
+            self.assertEqual(record["evidence_bytes"], len(data))
+            self.assertEqual(record["evidence_sha256"], hashlib.sha256(data).hexdigest())
+
+    def test_windows_restart_deadline_covers_predecessor_evidence_finalization(self) -> None:
+        runner = HostedDesktopProcessRunner(platform="windows", binary=self.cli)
+        runner.raw_directory = Path(self.directory.name) / "windows-deadline-raw"
+        adapter = self._adapter("windows", runner)
+        service = adapter.service
+        self.assertIsNotNone(service)
+        assert service is not None
+        service._service_evidence_paths = (
+            runner.raw_directory / "old.stdout.raw.log",
+            runner.raw_directory / "old.stderr.raw.log",
+        )
+        service._tree_proof_for_evidence = True
+        observed_deadlines: list[float | None] = []
+
+        def finalize(deadline: float | None = None) -> None:
+            observed_deadlines.append(deadline)
+            self.assertIsNotNone(deadline)
+            assert deadline is not None
+            self.assertGreater(deadline, time.monotonic())
+            service._service_evidence_paths = None
+
+        with mock.patch.object(service, "_finalize_service_evidence", side_effect=finalize):
+            service._start(5.0)
+        self.assertEqual(len(observed_deadlines), 1)
+
+    def test_windows_service_process_loss_rejects_surviving_descendant(self) -> None:
+        runner = HostedDesktopProcessRunner(platform="windows", binary=self.cli)
+        runner.raw_directory = Path(self.directory.name) / "windows-survivor-raw"
+        adapter = self._adapter("windows", runner)
+        runner.tree_survivor = True
+        with self.assertRaisesRegex(ScenarioExecutionError, "SERVICE_TREE_SURVIVED"):
+            adapter.service._terminate(5.0)
 
     def test_factory_wires_each_desktop_process_seam_without_changing_linux(self) -> None:
         for platform in ("windows", "macos"):

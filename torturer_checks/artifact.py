@@ -10,12 +10,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import plistlib
 import re
 import stat
 import struct
 import subprocess
+import tempfile
 from typing import Iterable
 import zipfile
 
@@ -47,6 +49,24 @@ CREDENTIAL_SCAN_OVERLAP_BYTES = 128
 
 class ArtifactContractError(ValueError):
     """An artifact or its recorded identity does not meet the public contract."""
+
+
+def _retain_source_probe_output(stdout: object, stderr: object) -> None:
+    """Keep complete Git probe streams in a fresh owner-only local bundle."""
+
+    directory = Path(tempfile.mkdtemp(prefix="torturer-artifact-source-probe-"))
+    directory.chmod(0o700)
+    for name, payload in (("stdout.raw.log", stdout), ("stderr.raw.log", stderr)):
+        data = payload.encode("utf-8", errors="replace") if isinstance(payload, str) else bytes(payload or b"")
+        path = directory / name
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb", closefd=True) as output:
+                output.write(data)
+                output.flush()
+                os.fsync(output.fileno())
+        except Exception:
+            raise
 
 
 @dataclass(frozen=True)
@@ -156,12 +176,14 @@ def source_identity_from_checkout(
             ["git", "-C", str(directory), "rev-parse", "--verify", "HEAD^{commit}"],
             check=False,
             stdout=subprocess.PIPE,
-            stderr=None,
+            stderr=subprocess.PIPE,
             text=True,
             timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
+        _retain_source_probe_output(getattr(error, "stdout", b""), getattr(error, "stderr", b""))
         raise ArtifactContractError("could not resolve checked-out source commit") from error
+    _retain_source_probe_output(result.stdout, result.stderr)
     resolved = result.stdout.strip()
     if result.returncode != 0 or not _COMMIT_RE.fullmatch(resolved):
         raise ArtifactContractError("could not resolve checked-out source commit")
@@ -179,12 +201,14 @@ def source_identity_from_checkout(
             ],
             check=False,
             stdout=subprocess.PIPE,
-            stderr=None,
+            stderr=subprocess.PIPE,
             text=True,
             timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
+        _retain_source_probe_output(getattr(error, "stdout", b""), getattr(error, "stderr", b""))
         raise ArtifactContractError("could not verify checked-out source state") from error
+    _retain_source_probe_output(status.stdout, status.stderr)
     if status.returncode != 0:
         raise ArtifactContractError("could not verify checked-out source state")
     if status.stdout.strip():

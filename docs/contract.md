@@ -239,9 +239,9 @@ commit.
 ## Trusted hosted adapter boundary
 
 The hosted functional entry point is `python3 -m
-torturer_checks.hosted.run`. It requires an exact candidate artifact digest, an
-owner-only profile file, an immutable server-image digest, and a full source
-SHA. It invokes the product's existing `dobby-cli` operations (`check-config`,
+torturer_checks.hosted.run`. It requires an exact allow-listed candidate
+manifest, an observed target platform version, an owner-only profile file, an
+immutable server-image digest, and a full source SHA. It invokes the product's existing `dobby-cli` operations (`check-config`,
 `connect-profile`, `status --json`, `external-ip`, `disconnect`) as argument
 vectors. The adapter's canonical `reconnect` operation composes the existing
 connect-profile/status commands after the scenario-owned disconnect within one
@@ -257,6 +257,25 @@ runner's owner-only temporary evidence directory. The emitted result contains
 only canonical scenario outcomes, stable failure codes, provenance, and safe
 metrics; it never contains the profile, URL, key, or observed public identity.
 The adapter advertises only capabilities it can actually observe.
+
+The hosted runner currently emits functional result schema 2. Its
+`artifact_sha256` is a deterministic SHA-256 over the ordered identities of
+every validated member in the candidate closure; it is not the SHA-256 of
+`manifest.json`. The raw manifest-file digest is emitted separately as
+`artifact_manifest_sha256`, alongside the stable `artifact_kind`, target
+`platform_version`, and candidate `architecture`. A missing or mismatched
+manifest, platform version, architecture, or closure member fails before
+candidate execution. The v2 result validator also rejects equal artifact and
+manifest digests, so a manifest-file hash cannot be reused as the artifact
+identity. Schema 1 remains a pinned historical contract and is
+validated with its original behavior; it is not silently upgraded or filled
+with `unknown` metadata.
+
+Evidence references are finalized by the canonical engine only after the
+adapter command and its owner-only evidence sink have completed and flushed.
+The bounded reset after each scenario is part of that finalization, so reset
+diagnostics and reset failures remain attached to the scenario result rather
+than being produced after its evidence references are frozen.
 
 `python3 -m torturer_provider.lease_cli acquire` and `cleanup` are trusted
 provider operations, not public candidate steps. The request contains only an
@@ -288,7 +307,18 @@ scenario catalog, partitions it by the adapter's proved capabilities, and
 records every unsupported scenario explicitly. It rejects a selected set whose
 declared scenario maxima plus one bounded reset per scenario exceed the active
 functional budget. A final cleanup reserve remains outside the functional
-subprocess.
+subprocess but inside the same 30-minute deadline. This rule also applies to
+the trusted `server-lease.yml` provider controller: its Render acquisition,
+completion-marker wait, diagnostic output, encrypted handoff, deletion, exact
+absence proof, and safe journal publication all share one 30-minute job bound.
+The controller reserves 120 seconds for finalization and refuses to start or
+continue work once that reserve is reached; it has no longer provider-job
+exception or separate 40-minute allowance. The reserve is partitioned into a
+44-second provider cleanup budget, its 1-second termination grace, a 4-second
+plaintext removal budget, its 1-second termination grace, a 60-second safe
+journal upload budget, and 10 seconds of bounded finalization overhead. Their
+sum is exactly 120 seconds and is enforced by workflow policy tests; the outer
+job timeout is not the cleanup mechanism.
 
 Linux, Windows, and macOS start the exact source-built product service and drive
 the public CLI. Their workflows provide the exact service PID, binary, control

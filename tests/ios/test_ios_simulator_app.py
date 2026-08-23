@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import plistlib
 import struct
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 
 from torturer_checks.ios_simulator_app import (
     CommandResult,
+    CLEANUP_RESERVE_SECONDS,
     IOSSimulatorAppContract,
     IOSSimulatorAppContractError,
     PUBLIC_IOS_SIMULATOR_APP_CONTRACT,
+    MAX_RUN_SECONDS,
+    RunBudget,
+    SubprocessCommandRunner,
     public_ios_simulator_app_contract,
     run_ios_simulator_app_contract,
     select_available_iphone,
@@ -46,8 +53,15 @@ class FakeRunner:
         self.contract = contract
         self.commands: list[list[str]] = []
 
-    def run(self, command: list[str] | tuple[str, ...], *, cwd: Path | None = None) -> CommandResult:
+    def run(
+        self,
+        command: list[str] | tuple[str, ...],
+        *,
+        cwd: Path | None = None,
+        timeout_seconds: float | None = None,
+    ) -> CommandResult:
         del cwd
+        del timeout_seconds
         command = list(command)
         self.commands.append(command)
         if self.fail is not None and tuple(command[:len(self.fail)]) == self.fail:
@@ -238,6 +252,75 @@ class IOSSimulatorAppContractTest(unittest.TestCase):
         self.assertIn("install Simulator app failed with exit code 9", str(raised.exception))
         self.assertNotIn("candidate output", str(raised.exception))
         self.assertFalse(any(command[:2] == ["xcodebuild", "test"] for command in runner.commands))
+        self.assertTrue(any(command[:3] == ["xcrun", "simctl", "shutdown"] for command in runner.commands))
+
+    @unittest.skipUnless(
+        os.name == "posix" and Path("/proc").is_dir(),
+        "detached-descendant regression requires a POSIX /proc process table",
+    )
+    def test_subprocess_runner_timeout_kills_detached_resistant_descendant(self) -> None:
+        raw_directory = self.root / "timeout-raw"
+        runner = SubprocessCommandRunner(raw_directory)
+        pid_file = self.root / "ios-descendant.pid"
+        command = (
+            sys.executable,
+            "-c",
+            (
+                "import os, signal, time; "
+                "pid = os.fork(); "
+                "os.setsid() if pid == 0 else None; "
+                    f"marker = open({str(pid_file)!r}, 'w', encoding='ascii'); "
+                    "marker.write(str(os.getpid()) if pid == 0 else str(pid)); marker.close(); "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN) if pid == 0 else None; "
+                "time.sleep(60)"
+            ),
+        )
+        with self.assertRaisesRegex(IOSSimulatorAppContractError, "timed out"):
+            runner.run(command, timeout_seconds=0.2)
+        descendant_pid = int(pid_file.read_text(encoding="ascii"))
+        for _ in range(40):
+            try:
+                os.kill(descendant_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail(f"detached iOS command descendant {descendant_pid} survived cleanup")
+
+    def test_run_budget_keeps_the_documented_cleanup_reserve(self) -> None:
+        self.assertEqual(MAX_RUN_SECONDS, 1800)
+        self.assertEqual(CLEANUP_RESERVE_SECONDS, 120)
+        clock = iter((0.0, 0.0, 7.0, 8.1))
+        budget = RunBudget(max_seconds=10, cleanup_reserve_seconds=2, clock=lambda: next(clock))
+        self.assertEqual(budget.operation_timeout(), 8.0)
+        self.assertEqual(budget.operation_timeout(), 1.0)
+        with self.assertRaisesRegex(IOSSimulatorAppContractError, "functional budget"):
+            budget.operation_timeout()
+
+    def test_policy_binds_every_host_command_and_unconditional_shutdown(self) -> None:
+        source = (Path(__file__).resolve().parents[2] / "torturer_checks" / "ios_simulator_app.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("timeout_seconds", source)
+        self.assertIn("start_new_session=True", source)
+        self.assertIn('["xcrun", "simctl", "shutdown", simulator.udid]', source)
+        self.assertIn("finally:", source)
+
+    def test_subprocess_runner_retains_complete_raw_output_without_public_echo(self) -> None:
+        raw_directory = self.root / "raw"
+        runner = SubprocessCommandRunner(raw_directory)
+        result = runner.run((
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(b'out\\x00\\xff'); sys.stderr.buffer.write(b'err\\xfe')",
+        ))
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "out\x00\ufffd" + "err\ufffd")
+        raw_path = next(raw_directory.glob("command-*.raw.log"))
+        self.assertEqual(raw_path.read_bytes(), b"out\x00\xfferr\xfe")
+        self.assertEqual(raw_directory.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(raw_path.stat().st_mode & 0o777, 0o600)
 
     def test_retries_transient_terminate_not_running_result_after_launch(self) -> None:
         runner = FakeRunner(
@@ -279,7 +362,7 @@ class IOSSimulatorAppContractTest(unittest.TestCase):
             command for command in runner.commands
             if command[:3] == ["xcrun", "simctl", "terminate"]
         ]
-        self.assertEqual(len(terminate_commands), 2)
+        self.assertEqual(len(terminate_commands), 3)
 
 
 if __name__ == "__main__":

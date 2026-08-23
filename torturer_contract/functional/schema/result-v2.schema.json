@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dobbyvpn.example/torturer/functional/result-v2.schema.json",
+  "title": "DobbyVPN canonical functional scenario result v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "scenario_id", "scenario_version", "scenario_set_digest", "provenance", "outcome", "assertions", "cleanup", "metrics", "duration_ms", "monotonic_start_ns", "monotonic_end_ns", "phase_durations_ms", "evidence_refs"],
+  "properties": {
+    "schema": {"const": 2},
+    "scenario_id": {"$ref": "#/$defs/identifier"},
+    "scenario_version": {"const": 1},
+    "scenario_set_digest": {"$ref": "#/$defs/digest"},
+    "provenance": {"$ref": "#/$defs/provenance"},
+    "outcome": {"enum": ["passed", "failed", "unavailable"]},
+    "reason_code": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$"},
+    "assertions": {"type": "array", "items": {"$ref": "#/$defs/assertion"}},
+    "cleanup": {"$ref": "#/$defs/cleanup"},
+    "metrics": {"$ref": "#/$defs/metrics"},
+    "duration_ms": {"$ref": "#/$defs/duration"},
+    "monotonic_start_ns": {"$ref": "#/$defs/monotonic"},
+    "monotonic_end_ns": {"$ref": "#/$defs/monotonic"},
+    "phase_durations_ms": {"$ref": "#/$defs/phase_durations"},
+    "evidence_refs": {"type": "array", "items": {"$ref": "#/$defs/evidence_ref"}}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"outcome": {"enum": ["failed", "unavailable"]}}, "required": ["outcome"]},
+      "then": {"required": ["reason_code"]}
+    },
+    {
+      "if": {"properties": {"outcome": {"const": "passed"}}, "required": ["outcome"]},
+      "then": {
+        "not": {"required": ["reason_code"]},
+        "properties": {"assertions": {"items": {"properties": {"passed": {"const": true}}}}}
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {"const": "passed"},
+          "cleanup": {"properties": {"required": {"const": true}}}
+        },
+        "required": ["outcome", "cleanup"]
+      },
+      "then": {"properties": {"cleanup": {"properties": {"verified": {"const": true}}}}}
+    }
+  ],
+  "$defs": {
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$", "not": {"const": "0000000000000000000000000000000000000000000000000000000000000000"}},
+    "image_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "identifier": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{2,95}$"},
+    "version": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{1,95}$"},
+    "duration": {"type": "integer", "minimum": 0},
+    "monotonic": {"type": "integer", "minimum": 0},
+    "assertion": {
+      "type": "object", "additionalProperties": false, "required": ["id", "passed"],
+      "properties": {"id": {"$ref": "#/$defs/identifier"}, "passed": {"type": "boolean"}}
+    },
+    "cleanup": {
+      "type": "object", "additionalProperties": false, "required": ["required", "verified"],
+      "properties": {"required": {"type": "boolean"}, "verified": {"type": "boolean"}}
+    },
+    "metrics": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "latency_ms": {"type": "number", "exclusiveMinimum": 0},
+        "download_mbps": {"type": "number", "exclusiveMinimum": 0},
+        "upload_mbps": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "phase_durations": {
+      "type": "object", "minProperties": 1,
+      "patternProperties": {"^[a-z][a-z0-9._-]{2,95}$": {"$ref": "#/$defs/duration"}},
+      "additionalProperties": false
+    },
+    "evidence_ref": {
+      "type": "object", "additionalProperties": false, "required": ["id", "bytes", "sha256"],
+      "properties": {"id": {"$ref": "#/$defs/identifier"}, "bytes": {"type": "integer", "minimum": 0}, "sha256": {"$ref": "#/$defs/digest"}}
+    },
+    "provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_repository", "source_sha", "torturer_sha", "artifact_sha256", "artifact_manifest_sha256", "artifact_kind", "platform", "platform_version", "architecture", "adapter_id", "adapter_version", "capabilities"],
+      "properties": {
+        "source_repository": {"type": "string", "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9_.-]{1,100}$"},
+        "source_sha": {"$ref": "#/$defs/sha"}, "torturer_sha": {"$ref": "#/$defs/sha"}, "harness_sha": {"$ref": "#/$defs/sha"},
+        "artifact_sha256": {"$ref": "#/$defs/digest"}, "artifact_manifest_sha256": {"$ref": "#/$defs/digest"}, "artifact_kind": {"$ref": "#/$defs/identifier"},
+        "server_image_digest": {"$ref": "#/$defs/image_digest"}, "provider_kind": {"enum": ["render", "private"]}, "provider_generation": {"$ref": "#/$defs/identifier"},
+        "platform": {"$ref": "#/$defs/identifier"}, "platform_version": {"$ref": "#/$defs/version"}, "architecture": {"$ref": "#/$defs/version"},
+        "adapter_id": {"$ref": "#/$defs/identifier"}, "adapter_version": {"$ref": "#/$defs/version"},
+        "capabilities": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/identifier"}}
+      },
+      "oneOf": [
+        {"required": ["server_image_digest"], "properties": {"provider_kind": {"const": "render"}}},
+        {"required": ["provider_kind"], "properties": {"provider_kind": {"const": "private"}}}
+      ]
+    }
+  }
+}

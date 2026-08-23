@@ -29,10 +29,16 @@ never supplies, reads, prints, or persists that token.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
+import json
+import hashlib
 import os
 from pathlib import Path
 import platform as host_platform_module
+import re
+import secrets
+import signal
 import socket
 import stat
 import subprocess
@@ -41,7 +47,14 @@ import tempfile
 import time
 from typing import Callable, Sequence
 
-from torturer_checks.source_checkout import SourceCheckoutError, verify_source_checkout
+from torturer_checks.source_checkout import (
+    SourceCheckoutError,
+    _finalize_process,
+    _pid_alive,
+    _proc_descendants,
+    verify_source_checkout,
+)
+from torturer_checks.public_output import emit_evidence
 
 
 BUILD_SCRIPT_RELATIVE_PATH = Path(".github/scripts/desktop_build.py")
@@ -56,6 +69,16 @@ MALFORMED_CONFIG_NAME = "malformed-public-fixture.toml"
 # This is intentionally neither valid TOML nor a profile container.
 MALFORMED_CONFIG = "[\nthis cannot be parsed as TOML\n"
 
+# Hosted desktop runs must finish before the workflow's 30-minute contract.
+# Keep a fixed reserve for diagnostics and process-tree cleanup; no individual
+# command may consume that reserve.
+MAX_RUN_SECONDS = 30 * 60
+CLEANUP_RESERVE_SECONDS = 120
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
+COMMAND_TERMINATION_GRACE_SECONDS = 15
+COMMAND_CLEANUP_RESERVE_FRACTION = 0.25
+MIN_COMMAND_CLEANUP_RESERVE_SECONDS = 0.01
+
 
 class SliceFailure(RuntimeError):
     """One required public-contract assertion did not hold."""
@@ -67,11 +90,27 @@ class CommandResult:
     returncode: int
     stdout: str
     stderr: str
+    stdout_bytes: bytes = b""
+    stderr_bytes: bytes = b""
+    evidence_directory: Path | None = None
+    stdout_path: Path | None = None
+    stderr_path: Path | None = None
+    cleanup_path: Path | None = None
+    process_tree_proven: bool = True
+    survivor_pids: tuple[int, ...] = ()
+    cleanup_diagnostics: tuple[str, ...] = ()
+    elapsed_seconds: float = 0.0
+    cleanup_reserve_seconds: float = 0.0
+    deadline_exceeded: bool = False
 
     def describe(self) -> str:
         return (
-            f"command: {' '.join(self.command)}\nexit code: {self.returncode}\n"
-            f"stdout:\n{self.stdout}\nstderr:\n{self.stderr}"
+            f"command_result exit_code={self.returncode} "
+            f"stdout_bytes={len(self.stdout_bytes)} "
+            f"stdout_sha256={hashlib.sha256(self.stdout_bytes).hexdigest()} "
+            f"stderr_bytes={len(self.stderr_bytes)} "
+            f"stderr_sha256={hashlib.sha256(self.stderr_bytes).hexdigest()} "
+            f"process_tree_proven={self.process_tree_proven}"
         )
 
 
@@ -81,6 +120,75 @@ class RuntimePaths:
     fixture: Path
     socket_path: Path | None
     token_path: Path | None
+
+
+@dataclass(frozen=True)
+class ProcessTreeResult:
+    """Bounded cleanup proof for one launched process tree."""
+
+    process_tree_proven: bool
+    survivor_pids: tuple[int, ...] = ()
+    diagnostics: tuple[str, ...] = ()
+
+
+class RunBudget:
+    """Track one hosted desktop run's hard deadline and cleanup reserve."""
+
+    def __init__(
+        self,
+        *,
+        max_seconds: float = MAX_RUN_SECONDS,
+        cleanup_reserve_seconds: float = CLEANUP_RESERVE_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if max_seconds <= 0 or cleanup_reserve_seconds < 0 or cleanup_reserve_seconds >= max_seconds:
+            raise ValueError("cleanup reserve must be non-negative and smaller than the run deadline")
+        self.max_seconds = float(max_seconds)
+        self.cleanup_reserve_seconds = float(cleanup_reserve_seconds)
+        self.clock = clock
+        self.started_at = clock()
+
+    @property
+    def deadline(self) -> float:
+        return self.started_at + self.max_seconds
+
+    def operation_timeout(self, requested: float | None = None) -> float:
+        """Return a timeout that cannot consume the diagnostic/cleanup reserve."""
+
+        remaining = self.deadline - self.clock() - self.cleanup_reserve_seconds
+        if remaining <= 0:
+            raise SliceFailure("hosted desktop run exhausted its functional budget before cleanup reserve")
+        if requested is None:
+            return remaining
+        if requested <= 0:
+            raise SliceFailure("hosted desktop operation timeout must be positive")
+        return min(float(requested), remaining)
+
+    def cleanup_timeout(self) -> float:
+        """Return the remaining bounded cleanup window."""
+
+        return max(0.0, min(self.cleanup_reserve_seconds, self.deadline - self.clock()))
+
+    def assert_within_deadline(self) -> None:
+        if self.clock() > self.deadline:
+            raise SliceFailure("hosted desktop run exceeded its strict 1800-second deadline")
+
+
+def _command_cleanup_reserve(timeout_seconds: float) -> float:
+    """Reserve part of one command's total bound for cleanup and evidence."""
+
+    return min(
+        COMMAND_TERMINATION_GRACE_SECONDS,
+        max(
+            MIN_COMMAND_CLEANUP_RESERVE_SECONDS,
+            timeout_seconds * COMMAND_CLEANUP_RESERVE_FRACTION,
+        ),
+    )
+
+
+def _remaining_until(deadline: float, *, cap: float | None = None) -> float:
+    remaining = max(0.0, deadline - time.monotonic())
+    return remaining if cap is None else min(remaining, max(0.0, cap))
 
 
 def candidate_path(value: str) -> Path:
@@ -198,43 +306,610 @@ def service_command(service: Path, target_platform: str, port: int | None) -> li
 
 
 def emit_command_diagnostics(result: CommandResult) -> None:
-    """Expose every captured child stream while retaining it for assertions.
+    """Publish only metadata after the complete streams are retained."""
 
-    The slices need the captured text for machine-readable checks, but a
-    successful command must not become diagnostically silent in hosted CI.
-    Labels go to stderr; child stdout and stderr are written unchanged to their
-    corresponding parent streams.
+    emit_evidence(
+        "desktop-command",
+        status=("failed" if result.returncode != 0 else "completed"),
+        payloads={"stdout": result.stdout_bytes, "stderr": result.stderr_bytes},
+    )
+
+
+def _safe_evidence_stem(label: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("._")
+    return stem or "command"
+
+
+def _validate_evidence_directory(directory: Path, *, allow_missing_final: bool = False) -> None:
+    if not directory.is_absolute():
+        raise SliceFailure(f"desktop evidence directory must be absolute: {directory}")
+    current = Path(directory.anchor)
+    for part in directory.parts[1:]:
+        current /= part
+        try:
+            details = os.lstat(current)
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(details.st_mode):
+            raise SliceFailure(f"desktop evidence path contains a symlink: {current}")
+        if not stat.S_ISDIR(details.st_mode):
+            raise SliceFailure(f"desktop evidence path is not a directory: {current}")
+        if current != directory and (details.st_mode & stat.S_IWOTH) and not (details.st_mode & stat.S_ISVTX):
+            raise SliceFailure(f"desktop evidence ancestor is world-writable: {current}")
+    try:
+        details = os.lstat(directory)
+    except FileNotFoundError as error:
+        if allow_missing_final:
+            return
+        raise SliceFailure(f"desktop evidence directory was not created: {directory}") from error
+    if stat.S_ISLNK(details.st_mode):
+        raise SliceFailure(f"desktop evidence directory must not be a symlink: {directory}")
+    if not stat.S_ISDIR(details.st_mode):
+        raise SliceFailure(f"desktop evidence path is not a directory: {directory}")
+    if hasattr(os, "geteuid") and details.st_uid != os.geteuid():
+        raise SliceFailure(f"desktop evidence directory is not owner-controlled: {directory}")
+    if details.st_mode & 0o077:
+        raise SliceFailure(f"desktop evidence directory must be mode 0700: {directory}")
+
+
+def _prepare_evidence_directory(configured: Path | str | None) -> Path:
+    if configured:
+        directory = Path(configured).expanduser()
+    else:
+        directory = Path(tempfile.mkdtemp(prefix="torturer-desktop-evidence-"))
+    _validate_evidence_directory(directory, allow_missing_final=True)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _validate_evidence_directory(directory)
+    return directory
+
+
+def _retain_exclusive_bytes(directory: Path, filename: str, payload: bytes) -> Path:
+    path = directory / filename
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError as error:
+        raise SliceFailure(f"refusing to overwrite existing desktop evidence: {path}") from error
+    except OSError as error:
+        raise SliceFailure(f"could not create owner-only desktop evidence: {path}") from error
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        path.chmod(0o600)
+    except Exception as error:
+        # Preserve partial original bytes for diagnosis; never unlink them.
+        raise SliceFailure(f"desktop evidence write incomplete; partial file preserved: {path}") from error
+    return path
+
+
+def _retain_command_streams(
+    evidence_directory: Path,
+    label: str,
+    stdout: bytes,
+    stderr: bytes,
+) -> dict[str, Path]:
+    """Retain original command streams and cleanup metadata exclusively."""
+
+    _validate_evidence_directory(evidence_directory)
+    stem = _safe_evidence_stem(label)
+    paths: dict[str, Path] = {}
+    for suffix, payload in (("stdout", stdout), ("stderr", stderr)):
+        paths[suffix] = _retain_exclusive_bytes(
+            evidence_directory,
+            f"{stem}.{suffix}.raw.log",
+            payload,
+        )
+    return paths
+
+
+def _retain_cleanup_record(
+    evidence_directory: Path,
+    label: str,
+    result: ProcessTreeResult,
+    *,
+    elapsed_seconds: float = 0.0,
+    cleanup_reserve_seconds: float = 0.0,
+    deadline_exceeded: bool = False,
+) -> Path:
+    metadata = {
+        "schema": "torturer.desktop.command-cleanup.v1",
+        "process_tree_proven": result.process_tree_proven,
+        "survivor_pids": list(result.survivor_pids),
+        "diagnostics": list(result.diagnostics),
+        "elapsed_seconds": elapsed_seconds,
+        "cleanup_reserve_seconds": cleanup_reserve_seconds,
+        "deadline_exceeded": deadline_exceeded,
+    }
+    return _retain_exclusive_bytes(
+        evidence_directory,
+        f"{_safe_evidence_stem(label)}.cleanup.raw.json",
+        (json.dumps(metadata, sort_keys=True, indent=2) + "\n").encode("utf-8"),
+    )
+
+
+def _emit_and_retain_service_log(path: Path, evidence_directory: Path | None) -> None:
+    """Retain the complete service log before publishing safe metadata."""
+
+    if not path.is_file():
+        return
+    if evidence_directory is None:
+        raise SliceFailure("desktop service diagnostics require an owner-only evidence directory")
+    _validate_evidence_directory(evidence_directory)
+    payload = path.read_bytes()
+    _retain_exclusive_bytes(evidence_directory, "service.combined.raw.log", payload)
+    emit_evidence("desktop-service", status="retained", payloads={"service": payload})
+
+
+def _process_group_alive(process: subprocess.Popen[bytes]) -> bool:
+    """Return whether the launched process group still has a member."""
+
+    if os.name == "nt":
+        return process.poll() is None
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # A permission error means we cannot prove the cleanup succeeded.
+        return True
+    return True
+
+
+def _wait_for_process_tree(
+    process: subprocess.Popen[bytes],
+    timeout_seconds: float,
+    tracked: set[int] | None = None,
+) -> bool:
+    """Wait for both the leader and its process group, proving disappearance."""
+
+    if os.name == "nt" and not getattr(process, "_torturer_tree_census_observed", False):
+        # CREATE_NEW_PROCESS_GROUP is not a Windows descendant boundary.  A
+        # missing Toolhelp census is unprovable, so callers must fail closed.
+        return False
+    tracked = tracked if tracked is not None else set()
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        tracked.update(
+            _proc_descendants(process.pid, process=process, deadline=deadline)
+        )
+        if os.name == "nt" and not getattr(process, "_torturer_tree_census_observed", False):
+            return False
+        leader_gone = process.poll() is not None
+        if leader_gone and not _process_group_alive(process) and not any(
+            _pid_alive(pid) for pid in tracked if pid != process.pid
+        ):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            process.wait(timeout=min(0.05, remaining))
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _retain_taskkill_diagnostics(
+    evidence_directory: Path | None,
+    description: str,
+    stdout: bytes,
+    stderr: bytes,
+    *,
+    status: str,
+) -> bool:
+    """Retain both taskkill streams before exposing only safe metadata."""
+
+    if evidence_directory is None:
+        return False
+    _validate_evidence_directory(evidence_directory)
+    suffix = secrets.token_hex(16)
+    stem = _safe_evidence_stem(description)
+    _retain_exclusive_bytes(evidence_directory, f"{stem}-taskkill-{suffix}.stdout.raw.log", stdout)
+    _retain_exclusive_bytes(evidence_directory, f"{stem}-taskkill-{suffix}.stderr.raw.log", stderr)
+    emit_evidence("desktop-taskkill", status=status, payloads={"stdout": stdout, "stderr": stderr})
+    return True
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen[bytes],
+    *,
+    grace_seconds: float,
+    description: str,
+    force_immediately: bool = False,
+    evidence_directory: Path | None = None,
+) -> ProcessTreeResult:
+    """Terminate a command and prove its process group did not survive."""
+
+    # Lightweight fakes in the helper tests model only the public Popen
+    # lifecycle methods. Preserve that seam while real processes always use
+    # the process-group path below.
+    cleanup_deadline = time.monotonic() + max(0.0, grace_seconds)
+    process_id = getattr(process, "pid", None)
+    if process_id is None:
+        diagnostics: list[str] = []
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=_remaining_until(cleanup_deadline))
+            except subprocess.TimeoutExpired:
+                diagnostics.append(f"{description} graceful-stop-expired")
+                process.kill()
+                try:
+                    process.wait(timeout=_remaining_until(cleanup_deadline))
+                except subprocess.TimeoutExpired:
+                    diagnostics.append(f"{description} forced-stop-expired")
+        if process.poll() is None:
+            return ProcessTreeResult(False, (), tuple(diagnostics + [f"{description} process survived termination"]))
+        return ProcessTreeResult(True, (), tuple(diagnostics))
+
+    tracked = set(getattr(process, "_torturer_tracked", set()))
+    tracked.update(
+        _proc_descendants(process_id, process=process, deadline=cleanup_deadline)
+    )
+    diagnostics = []
+    was_running = process.poll() is None
+    if force_immediately:
+        if os.name == "nt":
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        else:
+            if was_running:
+                try:
+                    os.killpg(process_id, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            for pid in tracked:
+                if pid != process_id:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+        if _wait_for_process_tree(process, _remaining_until(cleanup_deadline), tracked):
+            return ProcessTreeResult(True, (), tuple(diagnostics))
+        return ProcessTreeResult(
+            False,
+            tuple(sorted(pid for pid in tracked if _pid_alive(pid))),
+            f"{description} process group survived forced termination",
+        )
+    if was_running:
+        if os.name == "nt":
+            try:
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+            except (OSError, ValueError) as error:
+                diagnostics.append(f"{description} graceful-stop-error={type(error).__name__}")
+                print(
+                    f"[torturer-process] {description} graceful-stop-error={type(error).__name__}",
+                    file=sys.stderr,
+                )
+        else:
+            try:
+                os.killpg(process_id, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            for pid in tracked:
+                if pid != process_id:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+
+    tree_gone = _wait_for_process_tree(process, _remaining_until(cleanup_deadline), tracked)
+    if tree_gone and os.name != "nt":
+        return ProcessTreeResult(True, (), tuple(diagnostics))
+
+    if not tree_gone and os.name != "nt":
+        diagnostics.append(f"{description} graceful-stop-expired")
+        print(f"[torturer-process] {description} graceful-stop-expired", file=sys.stderr)
+    if os.name == "nt":
+        try:
+            # taskkill's /T is the Windows descendant equivalent of a POSIX
+            # process-group signal. Capture both streams so the hosted log is
+            # never the sole copy of cleanup diagnostics.
+            remaining = _remaining_until(cleanup_deadline)
+            if remaining > 0:
+                taskkill = subprocess.run(
+                    ["taskkill.exe", "/PID", str(process_id), "/T", "/F"],
+                    check=False,
+                    timeout=remaining,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                retained = _retain_taskkill_diagnostics(
+                    evidence_directory,
+                    description,
+                    taskkill.stdout or b"",
+                    taskkill.stderr or b"",
+                    status=("completed" if taskkill.returncode == 0 else "failed"),
+                )
+                if not retained:
+                    diagnostics.append(f"{description} taskkill diagnostics were not retained")
+            else:
+                process.kill()
+        except subprocess.TimeoutExpired as error:
+            retained = _retain_taskkill_diagnostics(
+                evidence_directory,
+                description,
+                getattr(error, "stdout", None) or b"",
+                getattr(error, "stderr", None) or b"",
+                status="timed-out",
+            )
+            diagnostics.append(f"{description} taskkill-expired")
+            if not retained:
+                diagnostics.append(f"{description} taskkill diagnostics were not retained")
+            print(f"[torturer-process] {description} taskkill-expired", file=sys.stderr)
+        except OSError as error:
+            diagnostics.append(f"{description} taskkill-error={type(error).__name__}")
+            print(
+                f"[torturer-process] {description} taskkill-error={type(error).__name__}",
+                file=sys.stderr,
+            )
+        if process.poll() is None:
+            process.kill()
+    else:
+        if process.poll() is None:
+            try:
+                os.killpg(process_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        for pid in tracked:
+            if pid != process_id:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    if _wait_for_process_tree(process, _remaining_until(cleanup_deadline), tracked):
+        return ProcessTreeResult(True, (), tuple(diagnostics))
+    survivors = {pid for pid in tracked if _pid_alive(pid)}
+    if _process_group_alive(process):
+        survivors.add(process_id)
+    diagnostics.append(f"{description} process group survived forced termination")
+    return ProcessTreeResult(False, tuple(sorted(survivors)), tuple(diagnostics))
+
+
+def _timeout_bytes(error: subprocess.TimeoutExpired, name: str) -> bytes:
+    payload = getattr(error, name, None) or b""
+    return payload if isinstance(payload, bytes) else str(payload).encode("utf-8", errors="replace")
+
+
+def _communicate_with_tracking(
+    process: subprocess.Popen[bytes],
+    timeout_seconds: float,
+    tracked: set[int],
+) -> tuple[bytes, bytes]:
+    """Communicate in bounded slices so short-lived descendants are observed."""
+
+    deadline = time.monotonic() + timeout_seconds
+    stdout = b""
+    stderr = b""
+    while True:
+        tracked.update(
+            _proc_descendants(process.pid, process=process, deadline=deadline)
+        )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timeout = subprocess.TimeoutExpired(process.args, timeout_seconds)
+            timeout.output = stdout
+            timeout.stderr = stderr
+            raise timeout
+        try:
+            stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+            tracked.update(
+                _proc_descendants(process.pid, process=process, deadline=deadline)
+            )
+            return stdout, stderr
+        except subprocess.TimeoutExpired as error:
+            stdout = _timeout_bytes(error, "output") or stdout
+            stderr = _timeout_bytes(error, "stderr") or stderr
+
+
+def run_command(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    evidence_directory: Path | None = None,
+    evidence_label: str = "command",
+) -> CommandResult:
+    """Execute an argument vector inside one total wall-clock bound.
+
+    ``timeout_seconds`` covers child observation, process-tree proof,
+    termination, pipe draining, and evidence retention.  A small reserve is
+    withheld from normal observation so cleanup cannot be pushed beyond the
+    caller's deadline.
     """
 
-    rendered = " ".join(result.command)
-    print(
-        f"[torturer-command] argv={rendered} returncode={result.returncode} stdout-begin",
-        file=sys.stderr,
-    )
-    if result.stdout:
-        sys.stdout.write(result.stdout)
-        sys.stdout.flush()
-    print("[torturer-command] stdout-end stderr-begin", file=sys.stderr)
-    if result.stderr:
-        sys.stderr.write(result.stderr)
-        sys.stderr.flush()
-    print("[torturer-command] stderr-end", file=sys.stderr)
-
-
-def run_command(command: Sequence[str], *, cwd: Path, env: dict[str, str]) -> CommandResult:
-    """Execute an argument vector without invoking a shell."""
-
-    completed = subprocess.run(
+    if timeout_seconds <= 0:
+        raise SliceFailure("command timeout must be positive")
+    started_at = time.monotonic()
+    deadline = started_at + timeout_seconds
+    cleanup_reserve = _command_cleanup_reserve(timeout_seconds)
+    evidence_root = _prepare_evidence_directory(evidence_directory)
+    process = subprocess.Popen(
         list(command),
         cwd=cwd,
         env=env,
-        text=True,
+        stdin=None,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        check=False,
+        start_new_session=os.name != "nt",
+        creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
     )
-    result = CommandResult(tuple(command), completed.returncode, completed.stdout, completed.stderr)
+    tracked = {process.pid}
+    process._torturer_tracked = tracked  # type: ignore[attr-defined]
+    timed_out = False
+    cleanup_result = ProcessTreeResult(True)
+    cleanup_diagnostics: list[str] = []
+    process_tree_proven = True
+    survivor_pids: tuple[int, ...] = ()
+    evidence_error: SliceFailure | None = None
+    stdout = b""
+    stderr = b""
+    try:
+        observation_timeout = max(
+            0.0,
+            deadline - time.monotonic() - cleanup_reserve,
+        )
+        stdout, stderr = _communicate_with_tracking(process, observation_timeout, tracked)
+        normal_tree_timeout = min(
+            COMMAND_TERMINATION_GRACE_SECONDS,
+            1.0,
+            max(0.0, deadline - time.monotonic() - cleanup_reserve),
+        )
+        process_tree_proven = _wait_for_process_tree(process, normal_tree_timeout, tracked)
+        if not process_tree_proven:
+            cleanup_diagnostics.append("normal completion left an unproven or surviving process tree")
+            cleanup_result = _terminate_process_tree(
+                process,
+                grace_seconds=_remaining_until(deadline),
+                description="command",
+                force_immediately=True,
+                evidence_directory=evidence_root,
+            )
+            cleanup_diagnostics.extend(cleanup_result.diagnostics)
+            process_tree_proven = cleanup_result.process_tree_proven
+            survivor_pids = cleanup_result.survivor_pids
+            try:
+                stdout, stderr = process.communicate(timeout=_remaining_until(deadline))
+            except subprocess.TimeoutExpired as error:
+                stdout = _timeout_bytes(error, "output") or stdout
+                stderr = _timeout_bytes(error, "stderr") or stderr
+                cleanup_diagnostics.append("command diagnostics did not drain after normal-completion cleanup")
+            final_proof = _wait_for_process_tree(process, _remaining_until(deadline), tracked)
+            process_tree_proven = process_tree_proven and final_proof
+            if not final_proof:
+                survivor_pids = tuple(sorted({pid for pid in tracked if _pid_alive(pid)}))
+                cleanup_diagnostics.append(
+                    "command process tree could not be proven gone after normal-completion cleanup"
+                )
+    except subprocess.TimeoutExpired as first_timeout:
+        timed_out = True
+        stdout = _timeout_bytes(first_timeout, "output")
+        stderr = _timeout_bytes(first_timeout, "stderr")
+        print(
+            f"[torturer-command] timeout after {timeout_seconds:g}s; terminating process tree",
+            file=sys.stderr,
+        )
+        tracked.update(
+            _proc_descendants(process.pid, process=process, deadline=deadline)
+        )
+        cleanup_result = _terminate_process_tree(
+            process,
+            grace_seconds=_remaining_until(deadline),
+            description="command",
+            force_immediately=True,
+            evidence_directory=evidence_root,
+        )
+        cleanup_diagnostics.extend(cleanup_result.diagnostics)
+        process_tree_proven = cleanup_result.process_tree_proven
+        survivor_pids = cleanup_result.survivor_pids
+        if cleanup_result.diagnostics:
+            print(
+                f"[torturer-command] cleanup-diagnostics={'; '.join(cleanup_result.diagnostics)}",
+                file=sys.stderr,
+            )
+        try:
+            drain_timeout = _remaining_until(deadline)
+            stdout, stderr = process.communicate(timeout=drain_timeout)
+        except subprocess.TimeoutExpired as error:
+            stdout = _timeout_bytes(error, "output") or stdout
+            stderr = _timeout_bytes(error, "stderr") or stderr
+            cleanup_diagnostics.append("command diagnostics did not drain after forced termination")
+        final_proof = _wait_for_process_tree(process, _remaining_until(deadline), tracked)
+        process_tree_proven = process_tree_proven and final_proof
+        if not final_proof:
+            final_cleanup = _terminate_process_tree(
+                process,
+                grace_seconds=_remaining_until(deadline),
+                description="command-final",
+                force_immediately=True,
+                evidence_directory=evidence_root,
+            )
+            cleanup_diagnostics.extend(final_cleanup.diagnostics)
+            process_tree_proven = process_tree_proven and final_cleanup.process_tree_proven
+            survivor_pids = final_cleanup.survivor_pids
+            try:
+                stdout, stderr = process.communicate(timeout=_remaining_until(deadline))
+            except subprocess.TimeoutExpired as error:
+                stdout = _timeout_bytes(error, "output") or stdout
+                stderr = _timeout_bytes(error, "stderr") or stderr
+                cleanup_diagnostics.append("command diagnostics did not drain after final cleanup")
+            final_proof = _wait_for_process_tree(process, _remaining_until(deadline), tracked)
+            process_tree_proven = process_tree_proven and final_proof
+            if not final_proof:
+                survivor_pids = tuple(sorted({pid for pid in tracked if _pid_alive(pid)}))
+                cleanup_diagnostics.append("command process tree survived final cleanup")
+    finally:
+        finalization_errors = _finalize_process(
+            process,
+            deadline=deadline,
+            description="command",
+        )
+        if finalization_errors:
+            process_tree_proven = False
+            cleanup_diagnostics.extend(finalization_errors)
+    elapsed_seconds = time.monotonic() - started_at
+    deadline_exceeded = elapsed_seconds > timeout_seconds
+    if deadline_exceeded:
+        cleanup_diagnostics.append(
+            f"command total bound exceeded ({elapsed_seconds:.3f}s > {timeout_seconds:.3f}s)"
+        )
+    result = CommandResult(
+        tuple(command),
+        process.returncode if process.returncode is not None else -1,
+        stdout.decode("utf-8", errors="replace"),
+        stderr.decode("utf-8", errors="replace"),
+        stdout,
+        stderr,
+        evidence_directory=evidence_root,
+        process_tree_proven=process_tree_proven,
+        survivor_pids=survivor_pids,
+        cleanup_diagnostics=tuple(cleanup_diagnostics),
+        elapsed_seconds=elapsed_seconds,
+        cleanup_reserve_seconds=cleanup_reserve,
+        deadline_exceeded=deadline_exceeded,
+    )
+    try:
+        paths = _retain_command_streams(evidence_root, evidence_label, stdout, stderr)
+        cleanup_path = _retain_cleanup_record(
+            evidence_root,
+            evidence_label,
+            ProcessTreeResult(process_tree_proven, survivor_pids, tuple(cleanup_diagnostics)),
+            elapsed_seconds=elapsed_seconds,
+            cleanup_reserve_seconds=cleanup_reserve,
+            deadline_exceeded=deadline_exceeded,
+        )
+        result = replace(
+            result,
+            stdout_path=paths["stdout"],
+            stderr_path=paths["stderr"],
+            cleanup_path=cleanup_path,
+        )
+    except SliceFailure as error:
+        evidence_error = error
+    post_elapsed_seconds = time.monotonic() - started_at
+    if post_elapsed_seconds > timeout_seconds and not deadline_exceeded:
+        cleanup_diagnostics.append(
+            f"command total bound exceeded during evidence retention "
+            f"({post_elapsed_seconds:.3f}s > {timeout_seconds:.3f}s)"
+        )
+        result = replace(
+            result,
+            elapsed_seconds=post_elapsed_seconds,
+            deadline_exceeded=True,
+            cleanup_diagnostics=tuple(cleanup_diagnostics),
+        )
     emit_command_diagnostics(result)
+    if evidence_error is not None:
+        raise SliceFailure(f"{evidence_error}\n{result.describe()}") from evidence_error
+    if not process_tree_proven or (cleanup_diagnostics and not timed_out):
+        raise SliceFailure(f"{'; '.join(cleanup_diagnostics)}\n{result.describe()}")
+    if timed_out:
+        raise SliceFailure(f"command timed out after {timeout_seconds:g}s\n{result.describe()}")
     return result
 
 
@@ -258,7 +933,7 @@ def reserve_loopback_port() -> int:
 
 def wait_for_tcp(
     port: int,
-    process: subprocess.Popen[str],
+    process: subprocess.Popen[bytes],
     timeout_seconds: float,
     *,
     connector: Callable[[tuple[str, int], float], object] = socket.create_connection,
@@ -283,7 +958,7 @@ def wait_for_tcp(
 
 def wait_for_unix_socket(
     path: Path,
-    process: subprocess.Popen[str],
+    process: subprocess.Popen[bytes],
     timeout_seconds: float,
     *,
     clock: Callable[[], float] = time.monotonic,
@@ -359,18 +1034,26 @@ def assert_windows_token_path(runtime: RuntimePaths) -> None:
         raise SliceFailure("Windows service did not create a regular PROGRAMDATA/DobbyVPN control token")
 
 
-def stop_service(process: subprocess.Popen[str], socket_path: Path | None) -> None:
-    """Stop the unprivileged service and remove only our private Unix socket."""
+def stop_service(
+    process: subprocess.Popen[bytes],
+    socket_path: Path | None,
+    *,
+    timeout_seconds: float = 15.0,
+    evidence_directory: Path | None = None,
+) -> None:
+    """Stop the service tree, prove it is gone, and remove only our socket."""
 
-    if process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
-    if process.poll() is None:
-        raise SliceFailure("service process survived termination")
+    cleanup = _terminate_process_tree(
+        process,
+        grace_seconds=max(0.0, timeout_seconds),
+        description="service",
+        evidence_directory=evidence_directory,
+    )
+    if not cleanup.process_tree_proven or cleanup.diagnostics:
+        raise SliceFailure(
+            "service process tree cleanup could not be proven: "
+            + "; ".join(cleanup.diagnostics)
+        )
     if socket_path is None:
         return
     if socket_path.exists() or socket_path.is_socket():
@@ -382,29 +1065,59 @@ def stop_service(process: subprocess.Popen[str], socket_path: Path | None) -> No
         raise SliceFailure(f"control socket remained after cleanup: {socket_path}")
 
 
-def assert_cli_contract(root: Path, target_platform: str, environment: dict[str, str], fixture: Path) -> None:
+def assert_cli_contract(
+    root: Path,
+    target_platform: str,
+    environment: dict[str, str],
+    fixture: Path,
+    *,
+    budget: RunBudget,
+    evidence_directory: Path | None,
+) -> None:
     """Exercise only non-connecting product CLI operations against the service."""
 
     gradle_dir = root / "kmp_module"
-    help_result = run_command(cli_command(root, target_platform, "--help"), cwd=gradle_dir, env=environment)
+    help_result = run_command(
+        cli_command(root, target_platform, "--help"),
+        cwd=gradle_dir,
+        env=environment,
+        timeout_seconds=budget.operation_timeout(),
+        evidence_directory=evidence_directory,
+        evidence_label="cli-help",
+    )
     require_success(help_result, "CLI help")
     if "check-config" not in help_result.stdout or "disconnect" not in help_result.stdout:
         raise SliceFailure(f"CLI help did not expose the documented command surface\n{help_result.describe()}")
 
     status_result = run_command(
-        cli_command(root, target_platform, "status", "--json"), cwd=gradle_dir, env=environment
+        cli_command(root, target_platform, "status", "--json"),
+        cwd=gradle_dir,
+        env=environment,
+        timeout_seconds=budget.operation_timeout(),
+        evidence_directory=evidence_directory,
+        evidence_label="cli-status",
     )
     require_success(status_result, "CLI status")
     if '"state": "Disconnected"' not in status_result.stdout:
         raise SliceFailure(f"CLI did not report the initial disconnected state\n{status_result.describe()}")
 
     malformed_result = run_command(
-        cli_command(root, target_platform, "check-config", str(fixture)), cwd=gradle_dir, env=environment
+        cli_command(root, target_platform, "check-config", str(fixture)),
+        cwd=gradle_dir,
+        env=environment,
+        timeout_seconds=budget.operation_timeout(),
+        evidence_directory=evidence_directory,
+        evidence_label="cli-check-config",
     )
     require_nonzero(malformed_result, "CLI malformed local configuration rejection")
 
     disconnect_result = run_command(
-        cli_command(root, target_platform, "disconnect"), cwd=gradle_dir, env=environment
+        cli_command(root, target_platform, "disconnect"),
+        cwd=gradle_dir,
+        env=environment,
+        timeout_seconds=budget.operation_timeout(),
+        evidence_directory=evidence_directory,
+        evidence_label="cli-disconnect",
     )
     require_success(disconnect_result, "CLI disconnect after malformed input")
 
@@ -420,71 +1133,102 @@ def run_slice(
 ) -> None:
     """Build, launch, verify, and clean up one matching desktop candidate."""
 
+    budget = RunBudget()
     validate_target(target_platform, architecture)
     root = candidate_path(str(candidate))
     try:
         verify_source_checkout(root, expected_commit)
     except SourceCheckoutError as error:
         raise SliceFailure(str(error)) from error
-    build_environment = os.environ.copy()
-    require_success(
-        run_command(
-            service_build_command(root, target_platform, architecture, skip_dependencies=skip_dependencies),
-            cwd=root,
-            env=build_environment,
-        ),
-        f"public {target_platform} {architecture} service build",
-    )
-    require_success(
-        run_command(
-            app_build_command(root, target_platform, skip_dependencies=skip_dependencies),
-            cwd=root,
-            env=build_environment,
-        ),
-        f"public {target_platform} JVM application build",
-    )
-
-    service = root / SERVICE_RELATIVE_PATHS[target_platform]
-    if not service.is_file() or (target_platform == "macos" and not os.access(service, os.X_OK)):
-        raise SliceFailure(f"public build did not produce an executable {target_platform} service: {service}")
-
-    with tempfile.TemporaryDirectory(prefix=f"torturer-{target_platform}-") as temporary:
-        runtime_root = Path(temporary)
-        runtime_root.chmod(0o700)
-        runtime = build_runtime_paths(runtime_root, target_platform)
-        runtime.fixture.write_text(MALFORMED_CONFIG, encoding="utf-8")
-        runtime.fixture.chmod(0o600)
-        port = reserve_loopback_port() if target_platform == "windows" else None
-        environment = service_environment(target_platform, runtime, port)
-        service_log_path = runtime.root / "service.log"
-        with service_log_path.open("w", encoding="utf-8") as service_log:
-            process = subprocess.Popen(
-                service_command(service, target_platform, port),
+    configured_evidence = os.environ.get("TORTURER_EVIDENCE_DIR")
+    runtime_root: Path | None = None
+    with nullcontext(_prepare_evidence_directory(configured_evidence)) as evidence_root:
+        build_environment = os.environ.copy()
+        require_success(
+            run_command(
+                service_build_command(root, target_platform, architecture, skip_dependencies=skip_dependencies),
                 cwd=root,
-                env=environment,
-                text=True,
-                stdout=service_log,
-                stderr=subprocess.STDOUT,
-            )
-            try:
-                if target_platform == "macos":
-                    if runtime.socket_path is None:  # Defensive narrowing for type checkers.
-                        raise SliceFailure("macOS runtime has no control socket path")
-                    wait_for_unix_socket(runtime.socket_path, process, timeout_seconds)
-                else:
-                    if port is None:
-                        raise SliceFailure("Windows runtime has no loopback TCP port")
-                    wait_for_tcp(port, process, timeout_seconds)
-                    assert_windows_token_path(runtime)
-                assert_cli_contract(root, target_platform, environment, runtime.fixture)
-            except SliceFailure as error:
-                service_log.flush()
-                logs = service_log_path.read_text(encoding="utf-8", errors="replace")
-                raise SliceFailure(f"{error}\nservice log:\n{logs}") from error
-            finally:
-                stop_service(process, runtime.socket_path)
-    if runtime_root.exists():
+                env=build_environment,
+                timeout_seconds=budget.operation_timeout(),
+                evidence_directory=evidence_root,
+                evidence_label="service-build",
+            ),
+            f"public {target_platform} {architecture} service build",
+        )
+        require_success(
+            run_command(
+                app_build_command(root, target_platform, skip_dependencies=skip_dependencies),
+                cwd=root,
+                env=build_environment,
+                timeout_seconds=budget.operation_timeout(),
+                evidence_directory=evidence_root,
+                evidence_label="app-build",
+            ),
+            f"public {target_platform} JVM application build",
+        )
+
+        service = root / SERVICE_RELATIVE_PATHS[target_platform]
+        if not service.is_file() or (target_platform == "macos" and not os.access(service, os.X_OK)):
+            raise SliceFailure(f"public build did not produce an executable {target_platform} service: {service}")
+
+        with tempfile.TemporaryDirectory(prefix=f"torturer-{target_platform}-") as temporary:
+            runtime_root = Path(temporary)
+            runtime_root.chmod(0o700)
+            runtime = build_runtime_paths(runtime_root, target_platform)
+            runtime.fixture.write_text(MALFORMED_CONFIG, encoding="utf-8")
+            runtime.fixture.chmod(0o600)
+            port = reserve_loopback_port() if target_platform == "windows" else None
+            environment = service_environment(target_platform, runtime, port)
+            service_log_path = runtime.root / "service.combined.log"
+            with service_log_path.open("wb", buffering=0) as service_log:
+                process = subprocess.Popen(
+                    service_command(service, target_platform, port),
+                    cwd=root,
+                    env=environment,
+                    stdin=None,
+                    stdout=service_log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=os.name != "nt",
+                    creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
+                )
+                process._torturer_tracked = {process.pid}  # type: ignore[attr-defined]
+                try:
+                    if target_platform == "macos":
+                        if runtime.socket_path is None:  # Defensive narrowing for type checkers.
+                            raise SliceFailure("macOS runtime has no control socket path")
+                        wait_for_unix_socket(runtime.socket_path, process, budget.operation_timeout(timeout_seconds))
+                    else:
+                        if port is None:
+                            raise SliceFailure("Windows runtime has no loopback TCP port")
+                        wait_for_tcp(port, process, budget.operation_timeout(timeout_seconds))
+                        assert_windows_token_path(runtime)
+                    assert_cli_contract(
+                        root,
+                        target_platform,
+                        environment,
+                        runtime.fixture,
+                        budget=budget,
+                        evidence_directory=evidence_root,
+                    )
+                except SliceFailure as error:
+                    service_log.flush()
+                    raise SliceFailure(
+                        f"{error}; complete service diagnostics retained privately"
+                    ) from error
+                finally:
+                    try:
+                        stop_service(
+                            process,
+                            runtime.socket_path,
+                            timeout_seconds=budget.cleanup_timeout(),
+                            evidence_directory=evidence_root,
+                        )
+                    finally:
+                        service_log.flush()
+                        _emit_and_retain_service_log(service_log_path, evidence_root)
+    if runtime_root is not None and runtime_root.exists():
         raise SliceFailure(f"private {target_platform} runtime resources remained after cleanup: {runtime_root}")
+    budget.assert_within_deadline()
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -517,7 +1261,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout_seconds=args.timeout,
         )
     except SliceFailure as error:
-        print(f"Torturer desktop slice failed: {error}", file=sys.stderr)
+        print(f"desktop_slice status=failed code={type(error).__name__}", file=sys.stderr)
         return 1
     print(
         "Torturer desktop slice passed: source builds, safe CLI lifecycle, "

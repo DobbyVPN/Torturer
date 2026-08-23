@@ -78,7 +78,14 @@ class LeaseCLIContractTests(unittest.TestCase):
             with tempfile.TemporaryDirectory(prefix="lease-cli-acquire-") as directory:
                 root = Path(directory)
                 digest = "sha256:" + "c" * 64
-                request = {"schema": 1, "kind": "dobbyvpn.render-lease-request", "run_id": "d" * 32, "platform": "linux", "image_digest": digest}
+                request = {
+                    "schema": 1,
+                    "kind": "dobbyvpn.render-lease-request",
+                    "run_id": "d" * 32,
+                    "platform": "linux",
+                    "source_sha": "e" * 40,
+                    "image_digest": digest,
+                }
                 request_path = root / "request.json"
                 request_path.write_text(json.dumps(request), encoding="utf-8")
                 os.chmod(request_path, 0o600)
@@ -116,6 +123,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                     "kind": "dobbyvpn.render-lease",
                     "run_id": "a" * 32,
                     "platform": "linux",
+                    "source_sha": "c" * 40,
                     "service_id": "srv-test123",
                     "image_digest": "sha256:" + "b" * 64,
                     "provider_generation": "dep-test123",
@@ -150,6 +158,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                 "kind": "dobbyvpn.render-lease",
                 "run_id": "b" * 32,
                 "platform": "macos",
+                "source_sha": "d" * 40,
                 "service_id": "srv-testing123",
                 "image_digest": "sha256:" + "c" * 64,
                 "provider_generation": "dep-testing123",
@@ -183,6 +192,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                     "kind": "dobbyvpn.render-lease",
                     "run_id": "7" * 32,
                     "platform": "android",
+                    "source_sha": "8" * 40,
                     "service_id": "srv-testingcleanup123",
                     "image_digest": "sha256:" + "8" * 64,
                     "provider_generation": "dep-testingcleanup123",
@@ -228,6 +238,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                 "kind": "dobbyvpn.render-lease",
                 "run_id": "9" * 32,
                 "platform": "windows",
+                "source_sha": "b" * 40,
                 "service_id": "srv-current123",
                 "image_digest": "sha256:" + "a" * 64,
                 "provider_generation": "dep-current123",
@@ -268,6 +279,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                     "kind": "dobbyvpn.render-lease-request",
                     "run_id": "e" * 32,
                     "platform": "windows",
+                    "source_sha": "a" * 40,
                     "image_digest": "sha256:" + "f" * 64,
                 }
                 request_path = root / "request.json"

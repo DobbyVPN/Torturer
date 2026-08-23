@@ -96,12 +96,43 @@ class FunctionalAndroidWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("adb_bounded()", client)
         self.assertNotIn("wait-for-device", client)
         self.assertIn("setsid timeout", client)
-        self.assertIn("tee \"$emulator_log\"", client)
-        self.assertIn("tee \"$accel_check_log\"", client)
+        self.assertIn('> "$emulator_log" 2>&1', client)
+        self.assertIn('> "$accel_check_log" 2>&1', client)
+        self.assertIn('> "$sdk_install_log" 2>&1', client)
+        self.assertIn('> "$sdk_list_log" 2>&1', client)
+        self.assertIn('> "$avd_log" 2>&1', client)
+        self.assertIn('> "$adb_start_log" 2>&1', client)
+        self.assertIn('> "$kvm_chmod_log" 2>&1', client)
+        self.assertIn('> "$kvm_device_log" 2>&1', client)
+        build = self.text[self.text.index("- name: Install exact Android build toolchain"):self.text.index("- name: Verify checkout and build Android candidate")]
+        self.assertIn('> "$sdk_install_log" 2>&1', build)
+        self.assertIn('> "$sdk_list_log" 2>&1', build)
+        self.assertIn('emit_private_evidence', build)
+        self.assertIn("umask 077", build)
+        self.assertIn("emit_private_evidence", client)
+        self.assertGreaterEqual(client.count("umask 077"), 3)
+        self.assertNotIn('cat "$emulator_log"', client)
         self.assertIn("android_emulator_post_kill_verified=true", client)
         self.assertIn("android_cleanup_force_stop_app=failed", client)
         self.assertIn('kill -TERM -- "-$emulator_pid"', client)
         self.assertIn('kill -KILL -- "-$emulator_pid"', client)
+        self.assertNotIn('adb_missing_during_cleanup=%s', client)
+
+    def test_android_cleanup_worst_case_fits_the_finalization_reserve(self) -> None:
+        client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
+        cleanup = client[client.index("- name: Stop Android emulator"):]
+        self.assertIn("adb_timeout_seconds=4", cleanup)
+        self.assertIn("adb_kill_grace_seconds=1", cleanup)
+        self.assertIn('"${adb_timeout_seconds}s"', cleanup)
+        self.assertIn('"${adb_kill_grace_seconds}s"', cleanup)
+        self.assertIn("for attempt in $(seq 1 15)", cleanup)
+        self.assertEqual(cleanup.count("for attempt in $(seq 1 5)"), 2)
+        self.assertIn('emit_private_evidence android-emulator-log "$EMULATOR_LOG"', cleanup)
+        self.assertNotIn('cat "$EMULATOR_LOG"', cleanup)
+        # Six adb calls + host process-group proof + bounded log drain.
+        worst_case = 6 * (4 + 1) + 15 + 5 + 5 + 5
+        self.assertEqual(worst_case, 60)
+        self.assertLessEqual(worst_case, 120)
 
     def test_every_runner_side_external_wait_has_a_bound(self) -> None:
         workflow = self.text
@@ -109,7 +140,7 @@ class FunctionalAndroidWorkflowPolicyTest(unittest.TestCase):
             "timeout --foreground --signal=TERM --kill-after=10s 30s sudo chmod",
             "timeout --foreground --signal=TERM --kill-after=10s 300s sdkmanager",
             "timeout --foreground --signal=TERM --kill-after=10s 480s ./kmp_module/gradlew",
-            "timeout --foreground --signal=TERM --kill-after=10s 30s gh api",
+            ".github/scripts/private-gh-api.sh",
             "timeout --foreground --signal=TERM --kill-after=10s 60s openssl req",
             "timeout --foreground --signal=TERM --kill-after=10s 120s avdmanager",
             "setsid timeout --foreground --signal=TERM --kill-after=10s 1500s",

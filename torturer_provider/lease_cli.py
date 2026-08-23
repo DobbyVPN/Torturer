@@ -70,6 +70,7 @@ def _safe_lease_payload(
         "kind": "dobbyvpn.render-lease",
         "run_id": request.run_id,
         "platform": request.platform,
+        "source_sha": request.source_sha,
         "service_id": service_id,
         "image_digest": request.image_digest,
         "provider_generation": generation,
@@ -181,11 +182,11 @@ def _lease_record(path: Path) -> tuple[dict[str, object], RenderLeaseRequest, st
         raise ValueError("lease record has an unsafe shape")
     base_keys = {
         "schema", "kind", "run_id", "platform", "service_id",
-        "image_digest", "provider_generation", "state",
+        "source_sha", "image_digest", "provider_generation", "state",
     }
     if set(value) not in (base_keys, base_keys | {"cleanup"}):
         raise ValueError("lease record has an unsafe shape")
-    request = RenderLeaseRequest(value["run_id"], value["platform"], value["image_digest"])
+    request = RenderLeaseRequest(value["run_id"], value["platform"], value["source_sha"], value["image_digest"])
     if value["kind"] != "dobbyvpn.render-lease" or value["schema"] != 1:
         raise ValueError("lease record identity is invalid")
     service_id = value["service_id"]

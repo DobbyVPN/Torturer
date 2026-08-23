@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 from typing import Mapping
 
+from .handoff import HandoffContractError, require_source_sha
+
 
 _RUN_ID = re.compile(r"^[a-f0-9]{32}$")
 _IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -24,6 +26,7 @@ class RenderLeaseRequest:
 
     run_id: str
     platform: str
+    source_sha: str
     image_digest: str
 
     def __post_init__(self) -> None:
@@ -31,18 +34,23 @@ class RenderLeaseRequest:
             raise LeaseRequestError("run_id is invalid")
         if self.platform not in _PLATFORM:
             raise LeaseRequestError("platform is invalid")
+        try:
+            require_source_sha(self.source_sha)
+        except HandoffContractError as error:
+            raise LeaseRequestError("source_sha is invalid") from error
         if not isinstance(self.image_digest, str) or _IMAGE_DIGEST.fullmatch(self.image_digest) is None:
             raise LeaseRequestError("image_digest is invalid")
 
     @classmethod
     def parse(cls, value: Mapping[str, object]) -> "RenderLeaseRequest":
-        if not isinstance(value, Mapping) or set(value) != {"schema", "kind", "run_id", "platform", "image_digest"}:
+        if not isinstance(value, Mapping) or set(value) != {"schema", "kind", "run_id", "platform", "source_sha", "image_digest"}:
             raise LeaseRequestError("request has an unexpected shape")
         if value.get("schema") != 1 or value.get("kind") != "dobbyvpn.render-lease-request":
             raise LeaseRequestError("request identity is invalid")
         return cls(
             run_id=value.get("run_id", ""),
             platform=value.get("platform", ""),
+            source_sha=value.get("source_sha", ""),
             image_digest=value.get("image_digest", ""),
         )
 
@@ -64,5 +72,6 @@ class RenderLeaseRequest:
             "kind": "dobbyvpn.render-lease-request",
             "run_id": self.run_id,
             "platform": self.platform,
+            "source_sha": self.source_sha,
             "image_digest": self.image_digest,
         }

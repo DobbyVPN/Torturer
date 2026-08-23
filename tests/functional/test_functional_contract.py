@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import json
 from pathlib import Path
+import time
 import unittest
 
 from torturer_contract.functional import (
+    AssertionOutcome,
     Capability,
+    EvidenceReference,
     FunctionalEngine,
     ResultValidationError,
+    ScenarioResult,
     evaluate_assertion,
     get_scenario,
     scenario_catalog,
@@ -68,6 +73,10 @@ def provenance() -> RunProvenance:
         adapter_id="fake-linux",
         adapter_version="v1",
         capabilities=frozenset(capability.value for capability in Capability),
+        platform_version="24.04",
+        architecture="amd64",
+        artifact_kind="package",
+        artifact_manifest_sha256="d" * 64,
     )
 
 
@@ -154,6 +163,276 @@ class FunctionalContractTests(unittest.TestCase):
         self.assertTrue(result.cleanup["verified"])
         self.assertEqual(result.to_dict()["schema"], 1)
 
+    def test_result_contains_identity_timing_and_evidence_metadata(self):
+        reference = EvidenceReference(id="command-001", bytes=17, sha256="f" * 64)
+        provider_calls = []
+
+        def evidence_provider():
+            provider_calls.append(True)
+            return (reference,)
+
+        result = FunctionalEngine("e" * 64, schema_version=2).run(
+            get_scenario("functional.configure"),
+            FakeAdapter(),
+            provenance(),
+            evidence_provider=evidence_provider,
+        )
+        payload = result.to_dict()
+        self.assertEqual(provider_calls, [True])
+        self.assertEqual(payload["schema"], 2)
+        self.assertEqual(payload["provenance"]["platform_version"], "24.04")
+        self.assertEqual(payload["provenance"]["architecture"], "amd64")
+        self.assertEqual(payload["provenance"]["artifact_kind"], "package")
+        self.assertEqual(payload["provenance"]["artifact_sha256"], "c" * 64)
+        self.assertEqual(payload["provenance"]["artifact_manifest_sha256"], "d" * 64)
+        self.assertLessEqual(payload["monotonic_start_ns"], payload["monotonic_end_ns"])
+        self.assertIn("execution", payload["phase_durations_ms"])
+        self.assertEqual(payload["evidence_refs"], [{"id": "command-001", "bytes": 17, "sha256": "f" * 64}])
+        validate_result_payload(payload)
+
+    def test_result_validator_rejects_missing_contract_metadata(self):
+        reference = EvidenceReference(id="command-001", bytes=17, sha256="f" * 64)
+        payload = FunctionalEngine("e" * 64, schema_version=2).run(
+            get_scenario("functional.configure"),
+            FakeAdapter(),
+            provenance(),
+            evidence_provider=lambda: (reference,),
+        ).to_dict()
+        for key in ("monotonic_start_ns", "monotonic_end_ns", "phase_durations_ms", "evidence_refs"):
+            invalid = copy.deepcopy(payload)
+            invalid.pop(key)
+            with self.subTest(key=key), self.assertRaises(ResultValidationError):
+                validate_result_payload(invalid)
+
+    def test_v1_contract_remains_unchanged_and_does_not_accept_v2_fields(self):
+        payload = FunctionalEngine("e" * 64).run(
+            get_scenario("functional.configure"), FakeAdapter(), provenance()
+        ).to_dict()
+        self.assertEqual(payload["schema"], 1)
+        self.assertTrue(all(isinstance(item, str) for item in payload["evidence_refs"]))
+        validate_result_payload(payload)
+        payload["monotonic_start_ns"] = 1
+        with self.assertRaises(ResultValidationError):
+            validate_result_payload(payload)
+
+    def test_v1_golden_payload_preserves_shape_and_default_omissions(self):
+        result = ScenarioResult(
+            scenario_id="functional.configure",
+            scenario_version=1,
+            scenario_set_digest="e" * 64,
+            provenance=RunProvenance(
+                source_repository="DobbyVPN/DobbyVPN",
+                source_sha="a" * 40,
+                torturer_sha="b" * 40,
+                artifact_sha256="c" * 64,
+                server_image_digest="sha256:" + "d" * 64,
+                platform="linux",
+                adapter_id="fake-linux",
+                adapter_version="v1",
+                capabilities=frozenset({"configure"}),
+            ),
+            outcome="passed",
+            assertions=(AssertionOutcome("configure.accepted", True),),
+            cleanup={"required": False, "verified": True},
+            metrics={},
+            duration_ms=17,
+            evidence_refs=("command-001",),
+        )
+        expected = {
+            "schema": 1,
+            "scenario_id": "functional.configure",
+            "scenario_version": 1,
+            "scenario_set_digest": "e" * 64,
+            "provenance": {
+                "source_repository": "DobbyVPN/DobbyVPN",
+                "source_sha": "a" * 40,
+                "torturer_sha": "b" * 40,
+                "artifact_sha256": "c" * 64,
+                "server_image_digest": "sha256:" + "d" * 64,
+                "platform": "linux",
+                "adapter_id": "fake-linux",
+                "adapter_version": "v1",
+                "capabilities": ["configure"],
+            },
+            "outcome": "passed",
+            "assertions": [{"id": "configure.accepted", "passed": True}],
+            "cleanup": {"required": False, "verified": True},
+            "metrics": {},
+            "duration_ms": 17,
+            "evidence_refs": ["command-001"],
+        }
+        self.assertEqual(result.to_dict(), expected)
+        self.assertEqual(
+            result.to_json(),
+            json.dumps(expected, sort_keys=True, separators=(",", ":")),
+        )
+        self.assertNotIn("reason_code", result.to_dict())
+        self.assertNotIn("monotonic_start_ns", result.to_dict())
+        validate_result_payload(expected)
+
+    def test_v2_evidence_provider_runs_for_unavailable_and_failed_paths(self):
+        reference = EvidenceReference(id="command-001", bytes=17, sha256="f" * 64)
+        calls = []
+
+        def evidence_provider():
+            calls.append(True)
+            return (reference,)
+
+        unavailable = FunctionalEngine("e" * 64, schema_version=2).run(
+            get_scenario("functional.connect-route-identity"),
+            FakeAdapter(capabilities=frozenset({Capability.CONFIGURE})),
+            provenance(),
+            evidence_provider=evidence_provider,
+        )
+        failed = FunctionalEngine("e" * 64, schema_version=2).run(
+            get_scenario("functional.configure"),
+            FakeAdapter(failure=RuntimeError("synthetic")),
+            provenance(),
+            evidence_provider=evidence_provider,
+        )
+        self.assertEqual((unavailable.outcome, failed.outcome), ("unavailable", "failed"))
+        self.assertEqual(calls, [True, True])
+        validate_result_payload(unavailable.to_dict())
+        validate_result_payload(failed.to_dict())
+
+    def test_v2_secret_markers_never_enter_success_failure_unavailable_or_exception_results(self):
+        secret_marker = (
+            "SECRET_MARKER profile-bytes bearer=credential endpoint=https://"
+            "user:pass@private.example 198.51.100.77"
+        )
+        reference = EvidenceReference(id="command-001", bytes=17, sha256="f" * 64)
+
+        class SecretObservationAdapter(FakeAdapter):
+            def __init__(self, *, configured: bool = True, **kwargs):
+                super().__init__(**kwargs)
+                self.configured = configured
+
+            def execute(self, step):
+                observations = super().execute(step)
+                observations["private_diagnostic"] = secret_marker
+                if step.operation == "configure":
+                    observations["configured"] = self.configured
+                return observations
+
+        def evidence_provider():
+            return (reference,)
+
+        success = FunctionalEngine("e" * 64, schema_version=2).run(
+            get_scenario("functional.configure"),
+            SecretObservationAdapter(),
+            provenance(),
+            evidence_provider=evidence_provider,
+        )
+        failure = FunctionalEngine("e" * 64, schema_version=2).run(
+            get_scenario("functional.configure"),
+            SecretObservationAdapter(configured=False),
+            provenance(),
+            evidence_provider=evidence_provider,
+        )
+        unavailable = FunctionalEngine("e" * 64, schema_version=2).run(
+            get_scenario("functional.connect-route-identity"),
+            SecretObservationAdapter(capabilities=frozenset({Capability.CONFIGURE})),
+            provenance(),
+            evidence_provider=evidence_provider,
+        )
+        adapter_exception = FunctionalEngine("e" * 64, schema_version=2).run(
+            get_scenario("functional.configure"),
+            FakeAdapter(failure=RuntimeError(secret_marker)),
+            provenance(),
+            evidence_provider=evidence_provider,
+        )
+
+        self.assertEqual(
+            (success.outcome, failure.outcome, unavailable.outcome, adapter_exception.outcome),
+            ("passed", "failed", "unavailable", "failed"),
+        )
+        for result in (success, failure, unavailable, adapter_exception):
+            serialized = result.to_json()
+            self.assertNotIn(secret_marker, serialized)
+            self.assertNotIn("private_diagnostic", serialized)
+            validate_result_payload(result.to_dict())
+
+    def test_v2_timing_includes_blocking_evidence_finalization(self):
+        reference = EvidenceReference(id="command-001", bytes=17, sha256="f" * 64)
+
+        def blocking_provider():
+            time.sleep(0.01)
+            return (reference,)
+
+        result = FunctionalEngine("e" * 64, schema_version=2).run(
+            get_scenario("functional.configure"),
+            FakeAdapter(),
+            provenance(),
+            evidence_provider=blocking_provider,
+        )
+        payload = result.to_dict()
+        self.assertGreaterEqual(payload["phase_durations_ms"]["evidence"], 5)
+        self.assertGreaterEqual(
+            payload["duration_ms"],
+            sum(payload["phase_durations_ms"].values()),
+        )
+        validate_result_payload(payload)
+
+    def test_v2_evidence_overrun_fails_closed_and_retains_references(self):
+        reference = EvidenceReference(id="command-001", bytes=17, sha256="f" * 64)
+        base = get_scenario("functional.configure")
+        bounded = replace(
+            base,
+            steps=(replace(base.steps[0], timeout_seconds=1),),
+            max_duration_seconds=1,
+        )
+
+        def overrun_provider():
+            time.sleep(1.05)
+            return (reference,)
+
+        result = FunctionalEngine("e" * 64, schema_version=2).run(
+            bounded,
+            FakeAdapter(),
+            provenance(),
+            evidence_provider=overrun_provider,
+        )
+        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(result.reason_code, "SCENARIO_TIMEOUT")
+        self.assertEqual(result.evidence_refs, (reference,))
+        validate_result_payload(result.to_dict())
+
+    def test_v2_rejects_static_evidence_default_without_a_sink_provider(self):
+        with self.assertRaises(ResultValidationError):
+            FunctionalEngine("e" * 64, schema_version=2).run(
+                get_scenario("functional.configure"),
+                FakeAdapter(),
+                provenance(),
+            )
+
+    def test_v2_rejects_manifest_digest_reused_as_artifact_digest(self):
+        duplicate = RunProvenance(
+            source_repository="DobbyVPN/DobbyVPN",
+            source_sha="a" * 40,
+            torturer_sha="b" * 40,
+            artifact_sha256="c" * 64,
+            artifact_manifest_sha256="c" * 64,
+            artifact_kind="package",
+            server_image_digest="sha256:" + "d" * 64,
+            platform="linux",
+            platform_version="24.04",
+            architecture="amd64",
+            adapter_id="fake-linux",
+            adapter_version="v1",
+            capabilities=frozenset(capability.value for capability in Capability),
+        )
+        with self.assertRaisesRegex(
+            ResultValidationError, "artifact and artifact-manifest digests must be distinct"
+        ):
+            FunctionalEngine("e" * 64, schema_version=2).run(
+                get_scenario("functional.configure"),
+                FakeAdapter(),
+                duplicate,
+                evidence_provider=lambda: (
+                    EvidenceReference("command-001", 17, "f" * 64),
+                ),
+            )
+
     def test_restart_second_cycle_failure_cannot_be_masked(self):
         class SecondCycleFailureAdapter(FakeAdapter):
             def execute(self, step):
@@ -204,6 +483,10 @@ class FunctionalContractTests(unittest.TestCase):
             adapter_version="v1",
             capabilities=frozenset({"configure"}),
             provider_kind="private",
+            platform_version="private",
+            architecture="amd64",
+            artifact_kind="manifest",
+            artifact_manifest_sha256="d" * 64,
         )
         result = FunctionalEngine("e" * 64).run(
             get_scenario("functional.configure"),
@@ -228,6 +511,10 @@ class FunctionalContractTests(unittest.TestCase):
                 adapter_id="fake-linux",
                 adapter_version="v1",
                 capabilities=frozenset({"configure"}),
+                platform_version="24.04",
+                architecture="amd64",
+                artifact_kind="package",
+                artifact_manifest_sha256="d" * 64,
             )
 
     def test_engine_reports_missing_capability_as_unavailable(self):

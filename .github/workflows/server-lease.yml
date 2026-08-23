@@ -22,6 +22,10 @@ on:
         description: Exact Torturer commit used by the originating workflow run.
         required: true
         type: string
+      origin_source_sha:
+        description: Exact DobbyVPN source commit used by the originating workflow run.
+        required: true
+        type: string
       origin_workflow_path:
         description: Exact trusted functional workflow path that requested this lease.
         required: false
@@ -61,13 +65,16 @@ jobs:
   lease:
     name: Trusted Render lease
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    # The provider controller has the same hard maximum as every client lane.
+    # Its diagnostic/cleanup reserve is inside this 30-minute job bound.
+    timeout-minutes: 30
     environment: render-functional
     env:
       MODE: ${{ inputs.mode }}
       ORIGIN_RUN_ID: ${{ inputs.origin_run_id }}
       ORIGIN_RUN_ATTEMPT: ${{ inputs.origin_run_attempt }}
       ORIGIN_TORTURER_SHA: ${{ inputs.origin_torturer_sha }}
+      ORIGIN_SOURCE_SHA: ${{ inputs.origin_source_sha }}
       ORIGIN_WORKFLOW_PATH: ${{ inputs.origin_workflow_path }}
       LEASE_RUN_ID: ${{ inputs.lease_run_id }}
       PLATFORM: ${{ inputs.platform }}
@@ -81,10 +88,76 @@ jobs:
       TORTURER_SHA: ${{ github.sha }}
 
     steps:
-      - name: Establish runner-local paths
+      - name: Check out exact trusted Torturer revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: DobbyVPN/Torturer
+          ref: ${{ github.sha }}
+          path: torturer
+          persist-credentials: false
+
+      - name: Establish runner-local paths and hard thirty-minute deadline
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          printf 'LEASE_DIR=%s\n' "$RUNNER_TEMP/dobbyvpn-render-lease" >> "$GITHUB_ENV"
+          umask 077
+          lease_dir="$RUNNER_TEMP/dobbyvpn-render-lease"
+          mkdir -p "$lease_dir"
+          chmod 700 "$lease_dir"
+          printf 'LEASE_DIR=%s\n' "$lease_dir" >> "$GITHUB_ENV"
+          "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" \
+            30 lease-run "$lease_dir/lease-run.json" \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          python3 - "$lease_dir/lease-run.json" <<'PY'
+          import datetime
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          run = json.loads(path.read_text(encoding="utf-8"))
+          if run.get("id") != int(os.environ["GITHUB_RUN_ID"]):
+              raise SystemExit("lease run identity mismatch")
+          started = datetime.datetime.fromisoformat(run["run_started_at"].replace("Z", "+00:00"))
+          deadline = int(started.timestamp()) + 30 * 60
+          reserve = 120
+          cleanup_command_seconds = 44
+          cleanup_kill_grace_seconds = 1
+          plaintext_cleanup_seconds = 4
+          plaintext_kill_grace_seconds = 1
+          evidence_upload_seconds = 60
+          finalization_overhead_seconds = 10
+          finalization_components = (
+              cleanup_command_seconds,
+              cleanup_kill_grace_seconds,
+              plaintext_cleanup_seconds,
+              plaintext_kill_grace_seconds,
+              evidence_upload_seconds,
+              finalization_overhead_seconds,
+          )
+          if sum(finalization_components) > reserve:
+              raise SystemExit(
+                  "finalization sub-budgets exceed the 120-second cleanup reserve"
+              )
+          if int(datetime.datetime.now(datetime.timezone.utc).timestamp()) >= deadline:
+              raise SystemExit("lease workflow already exceeded its hard deadline")
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as output:
+              output.write(f"LEASE_DEADLINE_EPOCH={deadline}\n")
+              output.write(f"LEASE_CLEANUP_RESERVE_SECONDS={reserve}\n")
+              output.write(f"LEASE_CLEANUP_COMMAND_SECONDS={cleanup_command_seconds}\n")
+              output.write(f"LEASE_CLEANUP_KILL_GRACE_SECONDS={cleanup_kill_grace_seconds}\n")
+              output.write(f"LEASE_PLAINTEXT_CLEANUP_SECONDS={plaintext_cleanup_seconds}\n")
+              output.write(f"LEASE_PLAINTEXT_KILL_GRACE_SECONDS={plaintext_kill_grace_seconds}\n")
+              output.write(f"LEASE_EVIDENCE_UPLOAD_SECONDS={evidence_upload_seconds}\n")
+              output.write(f"LEASE_FINALIZATION_OVERHEAD_SECONDS={finalization_overhead_seconds}\n")
+          print(f"lease_workflow_started_epoch={int(started.timestamp())}")
+          print(f"lease_workflow_deadline_epoch={deadline}")
+          print(f"lease_cleanup_reserve_seconds={reserve}")
+          print(f"lease_finalization_sub_budget_sum={sum(finalization_components)}")
+          PY
+          unset GH_TOKEN
 
       - name: Validate trusted lease boundary
         run: |
@@ -111,6 +184,8 @@ jobs:
               raise SystemExit("origin_run_attempt is invalid")
           if not re.fullmatch(r"[0-9a-f]{40}", os.environ["ORIGIN_TORTURER_SHA"]):
               raise SystemExit("origin_torturer_sha is invalid")
+          if not re.fullmatch(r"[0-9a-f]{40}", os.environ["ORIGIN_SOURCE_SHA"]):
+              raise SystemExit("origin_source_sha is invalid")
           origin_platforms = {
               ".github/workflows/functional.yml": "linux",
               ".github/workflows/functional-windows.yml": "windows",
@@ -125,7 +200,7 @@ jobs:
           origin_id = os.environ["ORIGIN_RUN_ID"]
           origin_attempt = os.environ["ORIGIN_RUN_ATTEMPT"]
           expected_lease = hashlib.sha256(
-              f"{origin_id}:{origin_attempt}:{platform}:{os.environ['ORIGIN_TORTURER_SHA']}".encode()
+              f"{origin_id}:{origin_attempt}:{platform}:{os.environ['ORIGIN_TORTURER_SHA']}:{os.environ['ORIGIN_SOURCE_SHA']}".encode()
           ).hexdigest()[:32]
           if os.environ["LEASE_RUN_ID"] != expected_lease:
               raise SystemExit("lease_run_id does not match origin correlation")
@@ -148,14 +223,6 @@ jobs:
           print("trusted_lease_boundary=validated")
           PY
 
-      - name: Check out exact trusted Torturer revision
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          repository: DobbyVPN/Torturer
-          ref: ${{ github.sha }}
-          path: torturer
-          persist-credentials: false
-
       - name: Verify trusted Torturer checkout
         run: |
           set -euo pipefail
@@ -167,8 +234,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ORIGIN_RUN_ID}" \
-            | tee "$LEASE_DIR/origin-run.json"
+          "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" \
+            30 origin-run "$LEASE_DIR/origin-run.json" \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${ORIGIN_RUN_ID}"
           python3 - "$LEASE_DIR/origin-run.json" <<'PY'
           import json
           import os
@@ -199,8 +267,9 @@ jobs:
         run: |
           set -euo pipefail
           artifact_name="render-lease-${LEASE_RUN_ID}-${PLATFORM}"
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${artifact_name}" \
-            | tee "$LEASE_DIR/existing-lease-artifacts.json"
+          "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" \
+            30 existing-lease-artifacts "$LEASE_DIR/existing-lease-artifacts.json" \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${artifact_name}"
           python3 - "$LEASE_DIR/existing-lease-artifacts.json" "$artifact_name" <<'PY'
           import json
           import sys
@@ -221,7 +290,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.artifacts \
+          remaining=$((LEASE_DEADLINE_EPOCH - $(date +%s) - LEASE_CLEANUP_RESERVE_SECONDS))
+          if [ "$remaining" -le 1 ]; then
+            printf 'lease request download reached the cleanup reserve: remaining=%s\n' "$remaining" >&2
+            exit 1
+          fi
+          command_timeout=$((remaining - 1))
+          if [ "$command_timeout" -gt 900 ]; then command_timeout=900; fi
+          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.deadline \
+            --timeout-seconds "$command_timeout" --kill-grace-seconds 1 \
+            env PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.artifacts \
             --repository "$GITHUB_REPOSITORY" \
             --artifact-name "$REQUEST_ARTIFACT_NAME" \
             --run-id "$ORIGIN_RUN_ID" \
@@ -244,10 +322,11 @@ jobs:
               raise SystemExit(f"request artifact contains unexpected files: {sorted(files)}")
           request = json.loads((root / "request.json").read_text(encoding="utf-8"))
           expected = {
-              "schema": 1,
-              "kind": "dobbyvpn.render-lease-request",
+             "schema": 1,
+             "kind": "dobbyvpn.render-lease-request",
               "run_id": os.environ["LEASE_RUN_ID"],
               "platform": os.environ["PLATFORM"],
+             "source_sha": os.environ["ORIGIN_SOURCE_SHA"],
               "image_digest": os.environ["RENDER_IMAGE_DIGEST"],
           }
           if request != expected:
@@ -267,7 +346,21 @@ jobs:
           umask 077
           mkdir -p "$LEASE_DIR"
           test -n "$RENDER_API_TOKEN"
-          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_provider.lease_cli acquire \
+          remaining=$((LEASE_DEADLINE_EPOCH - $(date +%s) - LEASE_CLEANUP_RESERVE_SECONDS))
+          if [ "$remaining" -le 61 ]; then
+            printf 'Render acquisition reached the cleanup reserve: remaining=%s\n' "$remaining" >&2
+            exit 1
+          fi
+          command_timeout=$((remaining - 1))
+          if [ "$command_timeout" -gt 900 ]; then command_timeout=900; fi
+          readiness_timeout=$((command_timeout - 60))
+          if [ "$readiness_timeout" -le 0 ]; then
+            printf 'Render acquisition has no bounded readiness budget: seconds=%s\n' "$readiness_timeout" >&2
+            exit 1
+          fi
+          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.deadline \
+            --timeout-seconds "$command_timeout" --kill-grace-seconds 1 \
+            env PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_provider.lease_cli acquire \
             --request "$LEASE_DIR/request/unpacked/request.json" \
             --owner-id "$RENDER_OWNER_ID" \
             --image-owner-id "$RENDER_IMAGE_OWNER_ID" \
@@ -277,7 +370,7 @@ jobs:
             --lease-output "$LEASE_DIR/lease.json" \
             --journal "$LEASE_DIR/journal.json" \
             --region "$RENDER_REGION" \
-            --timeout-seconds 300 \
+            --timeout-seconds "$readiness_timeout" \
             --poll-seconds 5
           test -f "$LEASE_DIR/profile.toml"
           test -f "$LEASE_DIR/lease.json"
@@ -287,7 +380,17 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          openssl cms -encrypt -binary -aes-256-gcm \
+          remaining=$((LEASE_DEADLINE_EPOCH - $(date +%s) - LEASE_CLEANUP_RESERVE_SECONDS))
+          if [ "$remaining" -le 2 ]; then
+            printf 'profile encryption reached the cleanup reserve: remaining=%s\n' "$remaining" >&2
+            exit 1
+          fi
+          encryption_timeout=$((remaining - 1))
+          if [ "$encryption_timeout" -gt 60 ]; then encryption_timeout=60; fi
+          printf 'profile_encryption_timeout_seconds=%s\n' "$encryption_timeout"
+          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.deadline \
+            --timeout-seconds "$encryption_timeout" --kill-grace-seconds 1 \
+            openssl cms -encrypt -binary -aes-256-gcm \
             -in "$LEASE_DIR/profile.toml" \
             -out "$LEASE_DIR/profile.cms" \
             -outform DER \
@@ -297,6 +400,7 @@ jobs:
 
       - name: Upload encrypted profile and safe lease record
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        timeout-minutes: 1
         with:
           name: render-lease-${{ inputs.lease_run_id }}-${{ inputs.platform }}
           path: |
@@ -308,7 +412,16 @@ jobs:
       - name: Mark the issued lease as actively testing
         run: |
           set -euo pipefail
-          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_provider.lease_cli begin-testing \
+          remaining=$((LEASE_DEADLINE_EPOCH - $(date +%s) - LEASE_CLEANUP_RESERVE_SECONDS))
+          if [ "$remaining" -le 1 ]; then
+            printf 'lease activation reached the cleanup reserve: remaining=%s\n' "$remaining" >&2
+            exit 1
+          fi
+          command_timeout=$((remaining - 1))
+          if [ "$command_timeout" -gt 30 ]; then command_timeout=30; fi
+          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.deadline \
+            --timeout-seconds "$command_timeout" --kill-grace-seconds 1 \
+            env PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_provider.lease_cli begin-testing \
             --lease "$LEASE_DIR/lease.json" \
             --journal "$LEASE_DIR/journal.json"
 
@@ -320,10 +433,19 @@ jobs:
           marker_name="render-complete-${LEASE_RUN_ID}-${PLATFORM}"
           marker_found=false
           for attempt in $(seq 1 180); do
+            remaining=$((LEASE_DEADLINE_EPOCH - $(date +%s) - LEASE_CLEANUP_RESERVE_SECONDS))
+            if [ "$remaining" -le 1 ]; then
+              printf 'completion marker wait reached the cleanup reserve: remaining=%s\n' "$remaining" >&2
+              break
+            fi
+            poll_timeout=30
+            if [ "$poll_timeout" -gt $((remaining - 1)) ]; then
+              poll_timeout=$((remaining - 1))
+            fi
             response="$LEASE_DIR/completion-${attempt}.json"
-            gh api \
-              "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${marker_name}" \
-              | tee "$response"
+            "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" \
+              "$poll_timeout" completion-poll "$response" \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${marker_name}"
             if python3 - "$response" "$ORIGIN_RUN_ID" "$marker_name" <<'PY'
           import json
           import sys
@@ -346,7 +468,11 @@ jobs:
               marker_found=true
               break
             fi
-            sleep 10
+            sleep_seconds=10
+            remaining=$((LEASE_DEADLINE_EPOCH - $(date +%s) - LEASE_CLEANUP_RESERVE_SECONDS))
+            if [ "$remaining" -le 0 ]; then break; fi
+            if [ "$sleep_seconds" -gt "$remaining" ]; then sleep_seconds="$remaining"; fi
+            sleep "$sleep_seconds"
           done
           if [ "$marker_found" != true ]; then
             printf '%s\n' 'functional completion marker deadline expired' >&2
@@ -369,8 +495,19 @@ jobs:
             if [ -f "$LEASE_DIR/lease.json" ]; then
               cleanup_args+=(--lease "$LEASE_DIR/lease.json")
             fi
-            PYTHONPATH="$GITHUB_WORKSPACE/torturer" \
-              python3 -m torturer_provider.lease_cli cleanup "${cleanup_args[@]}"
+            remaining=$((LEASE_DEADLINE_EPOCH - $(date +%s)))
+            if [ "$remaining" -le 1 ]; then
+              printf 'Render cleanup reached the hard deadline: remaining=%s\n' "$remaining" >&2
+              exit 1
+            fi
+            command_timeout=$((remaining - 1))
+            cleanup_command_limit="$LEASE_CLEANUP_COMMAND_SECONDS"
+            if [ "$command_timeout" -gt "$cleanup_command_limit" ]; then
+              command_timeout="$cleanup_command_limit"
+            fi
+            PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.deadline \
+              --timeout-seconds "$command_timeout" --kill-grace-seconds "$LEASE_CLEANUP_KILL_GRACE_SECONDS" \
+              env PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_provider.lease_cli cleanup "${cleanup_args[@]}"
           else
             printf '%s\n' 'no lease journal exists; no provider request reached service creation'
           fi
@@ -379,11 +516,27 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          rm -f "$LEASE_DIR/profile.toml" "$LEASE_DIR/request/unpacked/recipient.crt"
+          lease_dir="${LEASE_DIR:-}"
+          if [ -z "$lease_dir" ]; then
+            printf '%s\n' 'lease directory was never established; no plaintext lease material to remove'
+            exit 0
+          fi
+          remaining=$((LEASE_DEADLINE_EPOCH - $(date +%s)))
+          if [ "$remaining" -le 1 ]; then
+            printf 'plaintext cleanup reached the hard deadline: remaining=%s\n' "$remaining" >&2
+            exit 1
+          fi
+          command_timeout=$((remaining - 1))
+          if [ "$command_timeout" -gt "$LEASE_PLAINTEXT_CLEANUP_SECONDS" ]; then
+            command_timeout="$LEASE_PLAINTEXT_CLEANUP_SECONDS"
+          fi
+          timeout --foreground --signal=TERM --kill-after="${LEASE_PLAINTEXT_KILL_GRACE_SECONDS}s" "${command_timeout}s" \
+            rm -f "$lease_dir/profile.toml" "$lease_dir/request/unpacked/recipient.crt"
 
       - name: Upload safe lease journal
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        timeout-minutes: 1
         with:
           name: render-lease-journal-${{ inputs.lease_run_id }}-${{ inputs.platform }}
           path: |

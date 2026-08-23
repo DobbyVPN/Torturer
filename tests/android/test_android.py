@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 import xml.etree.ElementTree as ElementTree
@@ -11,7 +13,10 @@ from torturer_checks.android import (
     ANDROID_NS,
     AndroidContractError,
     CandidateApks,
+    CLEANUP_RESERVE_SECONDS,
     INTERNAL_LIFECYCLE_TEST,
+    MAX_RUN_SECONDS,
+    RunBudget,
     _contains_enabled_package,
     _run,
     build_command,
@@ -91,6 +96,71 @@ class AndroidDeviceQueryTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, "")
+
+    @unittest.skipUnless(
+        os.name == "posix" and Path("/proc").is_dir(),
+        "detached-descendant regression requires a POSIX /proc process table",
+    )
+    def test_bounded_run_kills_detached_resistant_descendant(self) -> None:
+        from torturer_checks.android import _run
+
+        with tempfile.TemporaryDirectory(prefix="android-timeout-regression-") as directory:
+            root = Path(directory)
+            pid_file = root / "descendant.pid"
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import os, signal, time; "
+                    "pid = os.fork(); "
+                    f"os.setsid() if pid == 0 else None; "
+                    f"marker = open({str(pid_file)!r}, 'w', encoding='ascii'); "
+                    "marker.write(str(os.getpid()) if pid == 0 else str(pid)); marker.close(); "
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN) if pid == 0 else None; "
+                    "time.sleep(60)"
+                ),
+            ]
+            with self.assertRaisesRegex(AndroidContractError, "timed out"):
+                _run(
+                    command,
+                    timeout=0.2,
+                    evidence_directory=root / "evidence",
+                    evidence_label="detached-descendant",
+                )
+            descendant_pid = int(pid_file.read_text(encoding="ascii"))
+            for _ in range(40):
+                try:
+                    os.kill(descendant_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail(f"detached Android command descendant {descendant_pid} survived cleanup")
+
+    def test_run_budget_keeps_the_documented_cleanup_reserve(self) -> None:
+        self.assertEqual(MAX_RUN_SECONDS, 1800)
+        self.assertEqual(CLEANUP_RESERVE_SECONDS, 120)
+        clock = iter((0.0, 0.0, 7.0, 8.1))
+        budget = RunBudget(max_seconds=10, cleanup_reserve_seconds=2, clock=lambda: next(clock))
+        self.assertEqual(budget.operation_timeout(), 8.0)
+        self.assertEqual(budget.operation_timeout(), 1.0)
+        with self.assertRaisesRegex(AndroidContractError, "functional budget"):
+            budget.operation_timeout()
+
+
+class AndroidDiagnosticsPolicyTest(unittest.TestCase):
+    def test_emulator_log_is_retained_without_truncating_diagnostics_in_errors(self) -> None:
+        source = (Path(__file__).resolve().parents[2] / "torturer_checks" / "android.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("stdout=log_handle", source)
+        self.assertIn('log_path.open("xb")', source)
+        self.assertIn("os.chmod(log_path, 0o600)", source)
+        self.assertIn("complete emulator diagnostics retained privately", source)
+        self.assertNotIn("diagnostics[-32768:]", source)
+        self.assertIn("start_new_session=True", source)
+        self.assertIn("_terminate_process_tree", source)
+        self.assertNotIn("subprocess.run(", source)
 
 
 class AndroidManifestTest(unittest.TestCase):
