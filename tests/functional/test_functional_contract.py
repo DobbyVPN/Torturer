@@ -9,12 +9,11 @@ from torturer_contract.functional import (
     Capability,
     FunctionalEngine,
     ResultValidationError,
-    ScenarioAdapter,
     evaluate_assertion,
     get_scenario,
     scenario_catalog,
 )
-from torturer_contract.functional.results import RunProvenance, ScenarioResult, validate_result_payload
+from torturer_contract.functional.results import RunProvenance, validate_result_payload
 from torturer_contract.functional.scenarios import catalog_document
 
 

@@ -25,7 +25,6 @@ from typing import Callable
 from .render import (
     DisposableRenderController,
     RenderAPI,
-    RenderAPIError,
     RenderReaper,
     RenderServiceHandle,
     RenderServiceReady,

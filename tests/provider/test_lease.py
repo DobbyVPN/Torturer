@@ -12,7 +12,6 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from torturer_provider.lease import (  # noqa: E402
-    LeaseCleanupError,
     LeaseState,
     LeaseStateError,
     RenderLease,
