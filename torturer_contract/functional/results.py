@@ -88,6 +88,10 @@ class RunProvenance:
             raise ResultValidationError("provider_kind is invalid")
         if self.provider_kind == "render" and self.server_image_digest is None:
             raise ResultValidationError("Render provenance requires server_image_digest")
+        if self.provider_kind == "private" and self.server_image_digest is not None:
+            raise ResultValidationError(
+                "private provenance must not contain server_image_digest"
+            )
         _require_string(self.platform, "platform", _IDENTIFIER)
         _require_string(self.adapter_id, "adapter_id", _IDENTIFIER)
         _require_string(self.adapter_version, "adapter_version", _VERSION)
@@ -469,7 +473,12 @@ def _validate_v1_result_payload(payload: Mapping[str, object]) -> None:
 
 
 def validate_result_payload(payload: Mapping[str, object]) -> None:
-    """Validate the published v1 payload or metadata-complete v2 payload."""
+    """Apply the canonical semantic model to a schema-shaped result payload.
+
+    The standalone JSON Schema is the shape-level contract.  Callers that
+    perform that independent check must invoke this model validator afterward;
+    it owns cross-field semantics that standard JSON Schema cannot express.
+    """
 
     schema = payload.get("schema")
     if schema == 1:

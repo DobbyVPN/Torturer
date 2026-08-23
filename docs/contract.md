@@ -21,6 +21,28 @@ Before checkout, the called workflow validates the repository form and full
 hexadecimal SHA. It checks out only that repository/SHA pair and records the
 resolved commit.
 
+## Canonical functional result-v2 validation
+
+The standalone `torturer_contract/functional/schema/result-v2.schema.json`
+document is the shape-level wire contract. The canonical validation path must
+apply the Python result model afterward through
+`torturer_contract.functional.results.validate_result_payload`; schema
+validation alone is not a complete result check. The model is deliberately
+the owner of semantic rules that standard JSON Schema cannot express
+portably, including:
+
+- `artifact_sha256` and `artifact_manifest_sha256` must be different;
+- the sum of `phase_durations_ms` values must not exceed `duration_ms`.
+
+Both the schema and model reject a private-provider result carrying
+`server_image_digest`, because that constraint is expressible at both layers.
+
+Consumers must retain both stages when they perform an independent schema
+check: first validate the JSON shape, then invoke the exact pinned Torturer
+model. This keeps the public schema and the executable semantic contract
+explicitly layered rather than allowing a schema-valid but semantically
+invalid result to be ingested.
+
 ## Stable required checks
 
 The intended v1 required checks are:

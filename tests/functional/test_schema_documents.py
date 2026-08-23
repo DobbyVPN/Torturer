@@ -38,6 +38,28 @@ class SchemaDocumentTests(unittest.TestCase):
             }.issubset(result_v2_schema["$defs"]["provenance"]["required"])
         )
 
+    def test_v2_private_provider_branch_forbids_server_image_digest(self):
+        schema_root = Path(__file__).parents[2] / "torturer_contract/functional/schema"
+        schema = json.loads((schema_root / "result-v2.schema.json").read_text(encoding="utf-8"))
+        branches = schema["$defs"]["provenance"]["oneOf"]
+        private = next(
+            branch
+            for branch in branches
+            if branch.get("properties", {}).get("provider_kind", {}).get("const") == "private"
+        )
+        self.assertEqual(private["required"], ["provider_kind"])
+        self.assertEqual(private["not"], {"required": ["server_image_digest"]})
+
+    def test_v2_semantic_constraints_are_model_layer_contract(self):
+        schema_root = Path(__file__).parents[2] / "torturer_contract/functional/schema"
+        schema = json.loads((schema_root / "result-v2.schema.json").read_text(encoding="utf-8"))
+        # Standard JSON Schema has no portable cross-property equality or
+        # aggregate-sum operator. The canonical Python model is the required
+        # second validation stage for these semantic invariants.
+        self.assertNotIn("$data", schema)
+        self.assertNotIn("artifact_manifest_distinct", schema)
+        self.assertNotIn("phase_duration_sum", schema)
+
 
 if __name__ == "__main__":
     unittest.main()
