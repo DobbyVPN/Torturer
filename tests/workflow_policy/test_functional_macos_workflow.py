@@ -61,37 +61,60 @@ class FunctionalMacOSWorkflowPolicyTest(unittest.TestCase):
     def test_client_verifies_provenance_before_candidate_execution(self) -> None:
         client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
         self.assertIn("candidate.py verify", client)
-        self.assertLess(
-            client.index("- name: Verify trusted Torturer checkout and candidate closure"),
-            client.index("- name: Create ephemeral recipient and opaque Render lease request"),
-        )
-        self.assertLess(
-            client.index("- name: Upload public certificate and opaque request"),
-            client.index("- name: Wait for and download exact encrypted Render lease response"),
-        )
-        self.assertLess(
-            client.index("- name: Validate and decrypt encrypted profile"),
-            client.index("- name: Start exact macOS service candidate"),
-        )
+        verify = client.index("- name: Verify trusted Torturer checkout and candidate closure")
+        prepare = client.index("- name: Create ephemeral recipient and opaque Render lease request")
+        preflight_start = client.index("- name: Start exact macOS preflight candidate")
+        preflight_stop = client.index("- name: Stop macOS preflight candidate before Render handoff")
+        upload = client.index("- name: Upload public certificate and opaque request")
+        wait = client.index("- name: Wait for and download exact encrypted Render lease response")
+        decrypt = client.index("- name: Validate and decrypt encrypted profile")
+        functional_start = client.index("- name: Start exact macOS functional candidate")
+        run = client.index("- name: Run canonical macOS functional scenarios")
+        cleanup = client.index("- name: Stop exact macOS service and verify cleanup")
+        self.assertLess(verify, prepare)
+        self.assertLess(prepare, preflight_start)
+        self.assertLess(preflight_start, preflight_stop)
+        self.assertLess(preflight_stop, upload)
+        self.assertLess(upload, wait)
+        self.assertLess(wait, decrypt)
+        self.assertLess(decrypt, functional_start)
+        self.assertLess(functional_start, run)
+        self.assertLess(run, cleanup)
+
         self.assertIn("Prove macOS client runner architecture and elevation", client)
         self.assertIn("--source-sha \"$SOURCE_SHA\"", client)
-        start = client.index("- name: Start exact macOS service candidate")
-        runtime = client[start:]
-        before_candidate = client[:client.index("- name: Start exact macOS service candidate")]
+        before_candidate = client[:preflight_start]
+        preflight_execution = client[preflight_start:preflight_stop]
+        preflight_handoff = client[preflight_stop:upload]
+        token_region = client[upload:decrypt]
+        functional = client[functional_start:cleanup]
+        after_decrypt = client[decrypt:]
         self.assertIn("GH_TOKEN", before_candidate)
         self.assertIn("github.token", before_candidate)
-        self.assertNotIn("GH_TOKEN", runtime)
-        self.assertNotIn("github.token", runtime)
-        self.assertIn("hosted.deadline", runtime)
-        self.assertIn("--platform macos", runtime)
-        self.assertIn("--service-socket", runtime)
-        self.assertIn("control_socket_ready=1", runtime)
-        self.assertIn('dobby-cli\" status', runtime)
-        self.assertIn("--candidate-manifest \"$GITHUB_WORKSPACE/candidate/manifest.json\"", runtime)
-        self.assertIn("DOBBYVPN_CONTROL_SOCKET=%s", runtime)
-        self.assertNotRegex(runtime, r"--artifact(?:\s|=)")
-        self.assertIn("--download-url \"https://proof.ovh.net/files/1Mb.dat\"", runtime)
-        self.assertNotIn("speed.cloudflare.com/__down?", runtime)
+        self.assertNotIn("GH_TOKEN", preflight_execution)
+        self.assertNotIn("github.token", preflight_execution)
+        self.assertNotIn("GH_TOKEN", preflight_handoff)
+        self.assertNotIn("github.token", preflight_handoff)
+        self.assertIn("if: always()", preflight_handoff)
+        self.assertIn("preflight_service_stop_verified=true", preflight_handoff)
+        self.assertIn('sudo -n kill -TERM "$service_pid"', preflight_handoff)
+        self.assertIn("PREFLIGHT_SERVICE_CONTROL_SOCKET", preflight_handoff)
+        self.assertIn('test -z "$children"', preflight_handoff)
+        self.assertIn("GH_TOKEN", token_region)
+        self.assertIn("github.token", token_region)
+        for forbidden in ("windows_grpcvpnserver.exe", "macos_grpcvpnserver", "dobby-cli", "Start-Process", "taskkill.exe", "PREFLIGHT_SERVICE_PID"):
+            self.assertNotIn(forbidden, token_region)
+        self.assertNotIn("GH_TOKEN", functional)
+        self.assertNotIn("github.token", functional)
+        self.assertNotIn("GH_TOKEN", after_decrypt)
+        self.assertNotIn("github.token", after_decrypt)
+        self.assertIn("hosted.deadline", functional)
+        self.assertIn("--platform macos", functional)
+        self.assertIn("--service-socket", functional)
+        self.assertIn("--candidate-manifest \"$GITHUB_WORKSPACE/candidate/manifest.json\"", functional)
+        self.assertNotRegex(functional, r"--artifact(?:\s|=)")
+        self.assertIn("--download-url \"https://proof.ovh.net/files/1Mb.dat\"", functional)
+        self.assertNotIn("speed.cloudflare.com/__down?", functional)
 
     def test_render_handoff_is_opaque_and_bound_to_macos_origin(self) -> None:
         self.assertIn("render-request-${lease_run_id}-${PLATFORM}", self.text)
