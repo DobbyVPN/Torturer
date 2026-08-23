@@ -251,6 +251,7 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
         steps=_COMMON_CONNECT
         + (
             _step("network", "network_transition", 30),
+            _step("disconnect", "disconnect", 10),
             _step("cleanup", "inspect_cleanup", 15),
         ),
         required_capabilities=frozenset(
@@ -260,6 +261,7 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
                 Capability.TUNNEL_INTERFACE,
                 Capability.ROUTING_IDENTITY,
                 Capability.NETWORK_TRANSITION,
+                Capability.DISCONNECT,
                 Capability.RESOURCE_CLEANUP,
             }
         ),
@@ -268,9 +270,10 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
             "tunnel.established",
             "routing.identity_changed",
             "network.transition",
+            "disconnect.clean",
             "cleanup.restored",
         ),
-        max_duration_seconds=116,
+        max_duration_seconds=126,
     ),
     ScenarioDefinition(
         id="functional.sleep-wake",
@@ -278,6 +281,7 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
         steps=_COMMON_CONNECT
         + (
             _step("sleep_wake", "sleep_wake", 30),
+            _step("disconnect", "disconnect", 10),
             _step("cleanup", "inspect_cleanup", 15),
         ),
         required_capabilities=frozenset(
@@ -287,6 +291,7 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
                 Capability.TUNNEL_INTERFACE,
                 Capability.ROUTING_IDENTITY,
                 Capability.SLEEP_WAKE,
+                Capability.DISCONNECT,
                 Capability.RESOURCE_CLEANUP,
             }
         ),
@@ -295,9 +300,10 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
             "tunnel.established",
             "routing.identity_changed",
             "sleep_wake.transition",
+            "disconnect.clean",
             "cleanup.restored",
         ),
-        max_duration_seconds=116,
+        max_duration_seconds=126,
     ),
     ScenarioDefinition(
         id="functional.product-process-loss",
@@ -305,6 +311,7 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
         steps=_COMMON_CONNECT
         + (
             _step("process_loss", "process_loss", 45),
+            _step("disconnect", "disconnect", 10),
             _step("cleanup", "inspect_cleanup", 15),
         ),
         required_capabilities=frozenset(
@@ -314,6 +321,7 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
                 Capability.TUNNEL_INTERFACE,
                 Capability.ROUTING_IDENTITY,
                 Capability.PROCESS_LOSS,
+                Capability.DISCONNECT,
                 Capability.RESOURCE_CLEANUP,
             }
         ),
@@ -322,9 +330,10 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
             "tunnel.established",
             "routing.identity_changed",
             "process_loss.recovered",
+            "disconnect.clean",
             "cleanup.restored",
         ),
-        max_duration_seconds=131,
+        max_duration_seconds=141,
     ),
     ScenarioDefinition(
         id="functional.bounded-endurance",
@@ -352,6 +361,7 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
             "tunnel.established",
             "routing.identity_changed",
             "endurance.bounded",
+            "traffic.metrics_positive",
             "disconnect.clean",
             "cleanup.restored",
         ),

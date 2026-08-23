@@ -23,7 +23,7 @@ from torturer_checks.hosted.run import (
     build_parser,
 )
 from torturer_contract.functional.capabilities import Capability
-from torturer_contract.functional.engine import FunctionalEngine
+from torturer_contract.functional.engine import FunctionalEngine, ScenarioExecutionError
 from torturer_contract.functional.scenarios import ScenarioStep, get_scenario, scenario_catalog
 
 
@@ -178,6 +178,39 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertGreater(float(result["download_mbps"]), 0)
         self.assertGreater(float(result["upload_mbps"]), 0)
 
+    def test_linux_endurance_does_not_start_a_partial_tail_transfer(self) -> None:
+        adapter = LinuxHostedAdapter(
+            cli=self.cli, profile=self.profile, runner=self.runner,
+            download_url="https://download.example.test/blob",
+            upload_url="https://upload.example.test/blob",
+        )
+        metrics = {"latency_ms": 1.0, "download_mbps": 2.0, "upload_mbps": 3.0}
+        with (
+            mock.patch.object(adapter, "_connected", return_value=True),
+            mock.patch.object(adapter, "_external_ip", return_value="203.0.113.10"),
+            mock.patch.object(adapter, "_throughput", return_value=metrics) as throughput,
+            mock.patch(
+                "torturer_checks.hosted.linux.time.monotonic",
+                side_effect=[100.0, 100.0, 101.0, 159.0, 159.5],
+            ),
+            mock.patch("torturer_checks.hosted.linux.time.sleep") as sleep,
+        ):
+            result = adapter._endurance(60.0)
+
+        self.assertEqual(result, {"endurance_verified": True, **metrics})
+        throughput.assert_called_once_with(30.0)
+        self.assertEqual(sleep.call_args_list, [mock.call(1.0), mock.call(0.5)])
+
+    def test_linux_endurance_rejects_zero_complete_samples(self) -> None:
+        adapter = LinuxHostedAdapter(
+            cli=self.cli, profile=self.profile, runner=self.runner,
+            download_url="https://download.example.test/blob",
+            upload_url="https://upload.example.test/blob",
+        )
+        with mock.patch("torturer_checks.hosted.linux.time.monotonic", side_effect=[100.0, 100.0]):
+            with self.assertRaisesRegex(ScenarioExecutionError, "ENDURANCE_NO_COMPLETE_SAMPLE"):
+                adapter._endurance(0.0)
+
     def test_hosted_runner_can_select_a_bounded_canonical_subset(self) -> None:
         parsed = build_parser().parse_args([
             "--platform", "linux", "--cli", str(self.cli), "--profile", str(self.profile),
@@ -204,7 +237,7 @@ class HostedCLIAdapterTests(unittest.TestCase):
         selected = _select_scenarios(None)
         self.assertEqual(selected, scenario_catalog())
         total_seconds = sum(item.max_duration_seconds for item in selected) + 5 * len(selected)
-        self.assertEqual(total_seconds, 1160)
+        self.assertEqual(total_seconds, 1190)
 
     def test_default_lane_partitions_all_applicable_and_unsupported_scenarios(self) -> None:
         selected = _select_scenarios(None)
