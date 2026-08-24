@@ -415,7 +415,9 @@ jobs:
           }
           mkdir -p "$SERVICE_DIR"
           control_socket="$SERVICE_DIR/control.sock"
-          service_log="$SERVICE_DIR/service.raw.log"
+          service_log="$HANDOFF_DIR/service.raw.log"
+          : > "$service_log"
+          chmod 600 "$service_log"
           expected_service="$GITHUB_WORKSPACE/candidate/ubuntu_grpcvpnserver"
           expected_exe="$(readlink -f "$expected_service")"
           peer_uid="$(id -u)"
@@ -464,7 +466,7 @@ jobs:
             if [ -S "$control_socket" ]; then
               if actual_exe="$(sudo -n readlink -f "/proc/$service_pid/exe")"; then
                 if [ "$actual_exe" != "$expected_exe" ]; then
-                  process_snapshot="$SERVICE_DIR/service-executable-mismatch.raw.log"
+                  process_snapshot="$HANDOFF_DIR/service-executable-mismatch.raw.log"
                   snapshot_status=0
                   sudo -n ps -o pid,ppid,uid,gid,state,etime,args -p "$service_pid" > "$process_snapshot" 2>&1 || snapshot_status=$?
                   emit_private_evidence service-process-mismatch "$process_snapshot"
@@ -473,7 +475,7 @@ jobs:
                   exit 1
                 fi
               else
-                process_snapshot="$SERVICE_DIR/service-executable-probe.raw.log"
+                process_snapshot="$HANDOFF_DIR/service-executable-probe.raw.log"
                 snapshot_status=0
                 sudo -n ps -o pid,ppid,uid,gid,state,etime,args -p "$service_pid" > "$process_snapshot" 2>&1 || snapshot_status=$?
                 emit_private_evidence service-process-probe "$process_snapshot"
@@ -578,7 +580,7 @@ jobs:
               done
             fi
             test "$stopped" = true
-            children_snapshot="$SERVICE_DIR/service-children.raw.log"
+            children_snapshot="$HANDOFF_DIR/service-children.raw.log"
             children_status=0
             ps -eo pid=,ppid=,args= > "$children_snapshot" 2>&1 || children_status=$?
             children_count="$(awk -v parent="$service_pid" '$2 == parent {count++} END {print count + 0}' "$children_snapshot")"
