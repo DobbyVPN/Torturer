@@ -537,6 +537,54 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertEqual(reused_log.read_bytes(), b"previous service evidence\n")
         self.assertEqual(launched_log.stat().st_mode & 0o777, 0o600)
 
+    def test_linux_restart_uses_detached_launcher_when_runner_provides_one(self) -> None:
+        root = Path(self.directory.name)
+        binary = root / "service-detached"
+        binary.write_bytes(b"synthetic service")
+        binary.chmod(0o700)
+        socket_path = root / "detached-control.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(socket_path))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        pid_file = root / "detached-service.pid"
+        raw_directory = root / "detached-service-raw"
+        raw_directory.mkdir(mode=0o700)
+
+        class DetachedServiceRunner:
+            def __init__(self) -> None:
+                self.detached_calls: list[tuple[str, ...]] = []
+                self.probe_calls: list[tuple[str, ...]] = []
+
+            def run_detached(self, command, *, timeout_seconds):
+                self.detached_calls.append(tuple(command))
+                return CommandResult(tuple(command), 0, b"789\n", b"")
+
+            def run(self, command, *, timeout_seconds):
+                argv = tuple(command)
+                self.probe_calls.append(argv)
+                if argv[2:4] == ("kill", "-0"):
+                    return CommandResult(argv, 0, b"", b"")
+                if argv[2:4] == ("readlink", "-f"):
+                    return CommandResult(argv, 0, (str(binary.resolve()) + "\n").encode(), b"")
+                raise AssertionError(argv)
+
+        runner = DetachedServiceRunner()
+        controller = LinuxServiceProcessController(
+            pid=123,
+            binary=binary,
+            socket=socket_path,
+            library_path=None,
+            pid_file=pid_file,
+            runner=runner,
+            raw_directory=raw_directory,
+        )
+        controller._start(10.0)
+
+        self.assertEqual(controller.pid, 789)
+        self.assertEqual(len(runner.detached_calls), 1)
+        self.assertEqual(runner.detached_calls[0][2:5], ("sh", "-c", _SERVICE_LAUNCH_SCRIPT))
+
     def test_subprocess_runner_retains_complete_stdout_and_stderr_bytes(self) -> None:
         raw = Path(self.directory.name) / "raw"
         runner = SubprocessRunner(raw)
@@ -569,6 +617,25 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertNotEqual(
             evidence[0]["evidence_sha256"], hashlib.sha256(retained_path.read_bytes()).hexdigest()
         )
+
+    @unittest.skipUnless(os.name == "posix", "detached launcher assertion requires POSIX")
+    def test_subprocess_runner_detached_launcher_allows_intended_child_and_retains_leader(self) -> None:
+        raw = Path(self.directory.name) / "detached-launch-raw"
+        runner = SubprocessRunner(raw)
+        script = "sleep 60 >/dev/null 2>&1 & printf '%s\\n' \"$!\""
+        result = runner.run_detached(("sh", "-c", script), timeout_seconds=5)
+        self.assertEqual(result.returncode, 0)
+        child_pid = int(result.stdout.decode("ascii").strip())
+        try:
+            os.kill(child_pid, 0)
+            retained = next(raw.glob("command-001*.raw.log")).read_bytes()
+            self.assertIn(b"DETACHED_LAUNCH_LEADER_STATUS=gone", retained)
+            self.assertNotIn(b"PROCESS_TREE_UNPROVEN", retained)
+        finally:
+            try:
+                os.kill(child_pid, 9)
+            except ProcessLookupError:
+                pass
 
     def test_macos_process_census_is_bounded_and_retained(self) -> None:
         completed = subprocess.CompletedProcess(
