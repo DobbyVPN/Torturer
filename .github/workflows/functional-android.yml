@@ -744,16 +744,19 @@ jobs:
           mkdir -p "$RUNNER_TEMP/controller"
           "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" 30 controller-run "$RUNNER_TEMP/controller/controller-run.json" \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          python3 - "$RUNNER_TEMP/controller/controller-run.json" <<'PY'
+          controller_deadline_epoch="$(python3 - "$RUNNER_TEMP/controller/controller-run.json" <<'PY'
           import datetime, json, os, sys
           from pathlib import Path
           run = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           if run.get("id") != int(os.environ["GITHUB_RUN_ID"]): raise SystemExit("controller run identity mismatch")
           started = datetime.datetime.fromisoformat(run["run_started_at"].replace("Z", "+00:00"))
           deadline = int(started.timestamp()) + 30 * 60
-          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as env: env.write(f"CONTROLLER_DEADLINE_EPOCH={deadline}\n")
-          print(f"controller_deadline_epoch={deadline}")
+          print(deadline)
           PY
+          )"
+          export CONTROLLER_DEADLINE_EPOCH="$controller_deadline_epoch"
+          printf 'CONTROLLER_DEADLINE_EPOCH=%s\n' "$controller_deadline_epoch" >> "$GITHUB_ENV"
+          printf 'controller_deadline_epoch=%s\n' "$controller_deadline_epoch"
           found=false
           for attempt in $(seq 1 180); do
             remaining=$((CONTROLLER_DEADLINE_EPOCH - $(date +%s) - 120))
