@@ -1616,18 +1616,36 @@ class HostedCLIAdapter:
                 if not last_metrics:
                     raise ScenarioExecutionError("ENDURANCE_NO_COMPLETE_SAMPLE")
                 return {"endurance_verified": True, **last_metrics}
-            # A download/upload pair needs a meaningful transfer window. Once
-            # at least one complete sample exists, preserve the final partial
-            # interval instead of starting a transfer pair that is guaranteed
-            # to be terminated by the endurance deadline.
+            # A download/upload pair needs a meaningful transfer window. Take
+            # one complete traffic sample, then spend the rest of the bounded
+            # interval observing the live session. Repeating public transfer
+            # endpoints throughout the interval makes the endurance result
+            # depend on an unrelated endpoint's transient rate limit rather
+            # than on the VPN session remaining routed and responsive.
             if last_metrics and remaining < _MIN_ENDURANCE_SAMPLE_SECONDS:
                 time.sleep(remaining)
                 return {"endurance_verified": True, **last_metrics}
-            if not self._connected(min(30.0, remaining)):
-                raise ScenarioExecutionError("ENDURANCE_DISCONNECTED")
-            if not self._routing_identity_changed(min(30.0, remaining)):
-                raise ScenarioExecutionError("ENDURANCE_ROUTING_LOST")
-            last_metrics = self._throughput(min(30.0, remaining))
+            try:
+                if not self._connected(min(30.0, remaining)):
+                    raise ScenarioExecutionError("ENDURANCE_DISCONNECTED")
+            except ScenarioExecutionError as error:
+                if error.reason_code == "COMMAND_TIMEOUT":
+                    raise ScenarioExecutionError("ENDURANCE_STATUS_TIMEOUT") from error
+                raise
+            try:
+                if not self._routing_identity_changed(min(30.0, remaining)):
+                    raise ScenarioExecutionError("ENDURANCE_ROUTING_LOST")
+            except ScenarioExecutionError as error:
+                if error.reason_code == "COMMAND_TIMEOUT":
+                    raise ScenarioExecutionError("ENDURANCE_IDENTITY_TIMEOUT") from error
+                raise
+            if not last_metrics:
+                try:
+                    last_metrics = self._throughput(min(30.0, remaining))
+                except ScenarioExecutionError as error:
+                    if error.reason_code == "COMMAND_TIMEOUT":
+                        raise ScenarioExecutionError("ENDURANCE_THROUGHPUT_TIMEOUT") from error
+                    raise
             if time.monotonic() >= deadline:
                 return {"endurance_verified": True, **last_metrics}
             time.sleep(min(5.0, max(0.0, deadline - time.monotonic())))
