@@ -163,7 +163,10 @@ class LinuxServiceProcessController:
             str(log_path),
         )
         try:
-            result = self.runner.run(
+            launcher = getattr(self.runner, "run_detached", None)
+            if not callable(launcher):
+                launcher = self.runner.run
+            result = launcher(
                 command,
                 timeout_seconds=min(
                     10.0, self._remaining(deadline, "SERVICE_RESTART_TIMEOUT")
@@ -289,13 +292,29 @@ class LinuxHostedAdapter(HostedCLIAdapter):
                 )
                 if up.returncode != 0:
                     raise ScenarioExecutionError("NETWORK_UP_FAILED")
-        if not self._connected(self._remaining(deadline, "NETWORK_TUNNEL_NOT_RESTORED")):
-            raise ScenarioExecutionError("NETWORK_TUNNEL_NOT_RESTORED")
-        if not self._routing_identity_changed(
-            self._remaining(deadline, "NETWORK_ROUTING_NOT_RESTORED")
-        ):
-            raise ScenarioExecutionError("NETWORK_ROUTING_NOT_RESTORED")
-        return {"network_transition_verified": time.monotonic() <= deadline}
+        last_error: ScenarioExecutionError | None = None
+        while True:
+            remaining = self._remaining(deadline, "NETWORK_TUNNEL_NOT_RESTORED")
+            try:
+                if not self._connected(remaining):
+                    last_error = ScenarioExecutionError("NETWORK_TUNNEL_NOT_RESTORED")
+                elif self._routing_identity_changed(remaining):
+                    return {"network_transition_verified": time.monotonic() <= deadline}
+                else:
+                    last_error = ScenarioExecutionError("NETWORK_ROUTING_NOT_RESTORED")
+            except ScenarioExecutionError as error:
+                if error.reason_code not in {
+                    "STATUS_FAILED",
+                    "STATUS_INVALID",
+                    "EXTERNAL_IDENTITY_FAILED",
+                    "EXTERNAL_IDENTITY_INVALID",
+                }:
+                    raise
+                last_error = error
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.5, self._remaining(deadline, "NETWORK_TUNNEL_NOT_RESTORED")))
+        raise last_error or ScenarioExecutionError("NETWORK_ROUTING_NOT_RESTORED")
 
     def _privileged(self, args: tuple[str, ...], timeout: float, failure: str):
         try:

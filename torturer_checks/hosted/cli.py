@@ -336,6 +336,75 @@ class SubprocessRunner:
         self._retain(result, time.monotonic() - started, b"PROCESS_TREE_STATUS=gone\n")
         return result
 
+    def run_detached(self, command: Sequence[str], *, timeout_seconds: float) -> CommandResult:
+        """Run a short launcher while intentionally retaining its detached child.
+
+        The ordinary runner proves that the entire child tree disappears when
+        a command completes.  A service restart is the one deliberate
+        exception: the launcher must exit while the exact service child stays
+        alive for the adapter to probe.  Keep the leader bounded and retain
+        its complete output, but do not apply ordinary completion tree cleanup
+        to the service it just launched.
+        """
+
+        if timeout_seconds <= 0 or any(not isinstance(item, str) or not item for item in command):
+            raise HostedAdapterError("INVALID_COMMAND")
+        argv = tuple(command)
+        self._sequence += 1
+        started = time.monotonic()
+        deadline = started + timeout_seconds
+        try:
+            process = subprocess.Popen(
+                list(argv),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                **_process_group_kwargs(),
+            )
+            try:
+                stdout, stderr = process.communicate(timeout=_remaining_until(deadline))
+            except subprocess.TimeoutExpired as error:
+                partial_stdout = _output_bytes(error.stdout)
+                partial_stderr = _output_bytes(error.stderr)
+                diagnostics = bytearray(b"DETACHED_LAUNCH_TIMEOUT=1\n")
+                diagnostics.extend(
+                    _kill_process_tree(process, _remaining_until(deadline))
+                )
+                try:
+                    recovered_stdout, recovered_stderr = process.communicate(
+                        timeout=_remaining_until(deadline)
+                    )
+                except subprocess.TimeoutExpired as recovery_error:
+                    diagnostics.extend(b"DETACHED_LAUNCH_OUTPUT_DRAIN_TIMEOUT=1\n")
+                    recovered_stdout = _output_bytes(recovery_error.stdout)
+                    recovered_stderr = _output_bytes(recovery_error.stderr)
+                    _kill_process(process)
+                    reaped, drained_stdout, drained_stderr, reap_notes = _bounded_reap_process(
+                        process, _remaining_until(deadline)
+                    )
+                    recovered_stdout = _merge_output(recovered_stdout, drained_stdout)
+                    recovered_stderr = _merge_output(recovered_stderr, drained_stderr)
+                    diagnostics.extend(reap_notes)
+                    if not reaped:
+                        diagnostics.extend(b"DETACHED_LAUNCH_REAP_TIMEOUT=1\n")
+                stdout = _merge_output(partial_stdout, recovered_stdout)
+                stderr = _merge_output(partial_stderr, recovered_stderr)
+                result = CommandResult(argv, 124, stdout, stderr, timed_out=True)
+                self._retain(result, time.monotonic() - started, bytes(diagnostics))
+                raise HostedAdapterError("COMMAND_TIMEOUT")
+            result = CommandResult(argv, process.returncode, stdout, stderr)
+            self._retain(
+                result,
+                time.monotonic() - started,
+                b"DETACHED_LAUNCH_LEADER_STATUS=gone\n",
+            )
+            if time.monotonic() > deadline:
+                self._evidence[-1]["deadline_exceeded"] = True
+                raise HostedAdapterError("COMMAND_DEADLINE_EXCEEDED")
+            return result
+        except OSError as error:
+            self._retain_exception(argv, error, time.monotonic() - started)
+            raise HostedAdapterError("COMMAND_UNAVAILABLE") from error
+
     def safe_evidence(self) -> tuple[dict[str, object], ...]:
         """Return diagnostics metadata without private filenames or payloads."""
         return tuple(
@@ -1613,13 +1682,16 @@ class HostedCLIAdapter:
                 "--output", os.devnull,
                 "--write-out", "%{time_total}\t%{size_download}",
             )
-        result = self.runner.run(
-            (
-                "curl", "--fail", "--location", "--show-error",
-                "--max-time", str(max(1, int(timeout))), *transfer_args, url,
-            ),
-            timeout_seconds=timeout,
-        )
+        try:
+            result = self.runner.run(
+                (
+                    "curl", "--fail", "--location", "--show-error",
+                    "--max-time", str(max(1, int(timeout))), *transfer_args, url,
+                ),
+                timeout_seconds=timeout,
+            )
+        except HostedAdapterError as error:
+            raise ScenarioExecutionError(error.code) from error
         if result.timed_out or result.returncode != 0:
             raise ScenarioExecutionError("THROUGHPUT_FAILED")
         try:
