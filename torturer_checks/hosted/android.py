@@ -271,23 +271,6 @@ class AndroidHostedAdapter:
             started, float(scenario.max_duration_seconds)
         )
         try:
-            # `run-as` does not promise that the app-private files directory
-            # exists before the instrumentation process has opened it. Create
-            # it explicitly before either the streamed or push/copy staging
-            # path; otherwise the first payload fails with PATH_MISSING.
-            self._adb(
-                (
-                    "shell",
-                    "-T",
-                    "run-as",
-                    _PACKAGE_NAME,
-                    "mkdir",
-                    "-p",
-                    "files",
-                ),
-                _remaining(deadline, "ANDROID_PROFILE_STAGE_TIMEOUT"),
-                "ANDROID_PROFILE_STAGE_FAILED",
-            )
             stream_payloads = callable(getattr(self.runner, "run_with_input", None))
             if stream_payloads:
                 try:
@@ -302,7 +285,7 @@ class AndroidHostedAdapter:
                         _PACKAGE_NAME,
                         "sh",
                         "-c",
-                        f"cat > {device_profile}",
+                         f"mkdir -p files && cat > {device_profile}",
                     ),
                     _remaining(deadline, "ANDROID_PROFILE_STAGE_TIMEOUT"),
                     "ANDROID_PROFILE_STAGE_FAILED",
@@ -339,7 +322,7 @@ class AndroidHostedAdapter:
                         _PACKAGE_NAME,
                         "sh",
                         "-c",
-                        f"cat > {device_command}",
+                         f"mkdir -p files && cat > {device_command}",
                     ),
                     _remaining(deadline, "ANDROID_COMMAND_STAGE_TIMEOUT"),
                     "ANDROID_COMMAND_STAGE_FAILED",
