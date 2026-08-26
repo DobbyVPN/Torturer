@@ -209,6 +209,9 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          # Git Bash otherwise rewrites the OpenSSL /CN subject as a Windows path.
+          export MSYS_NO_PATHCONV=1
+          export MSYS2_ARG_CONV_EXCL='*'
           timeout --foreground --signal=KILL 60s openssl req -x509 -newkey rsa:3072 -nodes -days 1 \
             -subj "/CN=dobbyvpn-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             -keyout "$HANDOFF_DIR/recipient.key" -out "$HANDOFF_DIR/recipient.crt"
