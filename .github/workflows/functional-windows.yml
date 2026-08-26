@@ -248,6 +248,37 @@ jobs:
               printf 'diagnostic_evidence label=%s state=missing\n' "$label"
             fi
           }
+          emit_private_classification() {
+            label="$1"
+            file="$2"
+            if [ -f "$file" ]; then
+              classification="$(python - "$file" <<'PY'
+          import sys
+          from pathlib import Path
+
+          data = Path(sys.argv[1]).read_bytes()
+          lower = data.lower()
+          rules = (
+              (b"failed to initialize secure local logging", "LOG_INIT_FAILED"),
+              (b"failed to prepare control authentication", "CONTROL_AUTH_INIT_FAILED"),
+              (b"failed to listen", "LISTEN_FAILED"),
+              (b"access is denied", "ACCESS_DENIED"),
+              (b"not a valid win32 application", "WIN32_INVALID_IMAGE"),
+              (b"panic", "PANIC"),
+          )
+          for needle, code in rules:
+              if needle in lower:
+                  print(code)
+                  break
+          else:
+              print("OTHER_ERROR" if lower.strip() else "EMPTY")
+          PY
+              )"
+              printf 'diagnostic_classification label=%s code=%s\n' "$label" "$classification"
+            else
+              printf 'diagnostic_classification label=%s code=MISSING\n' "$label"
+            fi
+          }
           # These single-quoted commands are interpreted by PowerShell, not Bash.
           # The preflight process is stopped and verified before any token-bearing Render step.
           # shellcheck disable=SC2016
@@ -285,6 +316,9 @@ jobs:
               emit_private_evidence preflight-service-probe "$probe_log"
               emit_private_evidence preflight-service-log "$service_log"
               emit_private_evidence preflight-service-error "$service_err"
+              emit_private_classification preflight-service-probe "$probe_log"
+              emit_private_classification preflight-service-log "$service_log"
+              emit_private_classification preflight-service-error "$service_err"
               printf 'preflight_service_readiness=failed code=SERVICE_EXITED status=%s\n' "$probe_status" >&2
               exit 1
             fi
@@ -298,6 +332,8 @@ jobs:
           if [ "$ready" != true ]; then
             emit_private_evidence preflight-service-timeout "$service_log"
             emit_private_evidence preflight-service-error "$service_err"
+            emit_private_classification preflight-service-timeout "$service_log"
+            emit_private_classification preflight-service-error "$service_err"
             printf 'preflight_service_readiness=failed code=CONTROL_PORT_TIMEOUT\n' >&2
             exit 1
           fi
@@ -333,6 +369,37 @@ jobs:
                 "$label" "$evidence_id" "$bytes" "$digest"
             else
               printf 'diagnostic_evidence label=%s state=missing\n' "$label"
+            fi
+          }
+          emit_private_classification() {
+            label="$1"
+            file="$2"
+            if [ -f "$file" ]; then
+              classification="$(python - "$file" <<'PY'
+          import sys
+          from pathlib import Path
+
+          data = Path(sys.argv[1]).read_bytes()
+          lower = data.lower()
+          rules = (
+              (b"failed to initialize secure local logging", "LOG_INIT_FAILED"),
+              (b"failed to prepare control authentication", "CONTROL_AUTH_INIT_FAILED"),
+              (b"failed to listen", "LISTEN_FAILED"),
+              (b"access is denied", "ACCESS_DENIED"),
+              (b"not a valid win32 application", "WIN32_INVALID_IMAGE"),
+              (b"panic", "PANIC"),
+          )
+          for needle, code in rules:
+              if needle in lower:
+                  print(code)
+                  break
+          else:
+              print("OTHER_ERROR" if lower.strip() else "EMPTY")
+          PY
+              )"
+              printf 'diagnostic_classification label=%s code=%s\n' "$label" "$classification"
+            else
+              printf 'diagnostic_classification label=%s code=MISSING\n' "$label"
             fi
           }
           # No candidate process may remain while the Render handoff uses the GitHub credential.
@@ -552,6 +619,8 @@ jobs:
           if [ "$ready" != true ]; then
             emit_private_evidence service-readiness-timeout "$service_log"
             emit_private_evidence service-error-timeout "$service_err"
+            emit_private_classification service-readiness-timeout "$service_log"
+            emit_private_classification service-error-timeout "$service_err"
             printf 'service_readiness=failed code=CONTROL_PORT_TIMEOUT\n' >&2
             exit 1
           fi
