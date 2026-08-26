@@ -527,7 +527,8 @@ def main(argv: list[str] | None = None) -> int:
             )
     except (CandidateClosureError, OSError, ValueError) as error:
         print(
-            f"candidate_closure status=failed code={type(error).__name__}",
+            f"candidate_closure status=failed code={type(error).__name__} "
+            f"reason={error}",
             file=sys.stderr,
         )
         return 1
