@@ -560,20 +560,36 @@ jobs:
             "") ;;
             0|*[!0-9]*) printf 'cleanup received invalid service pid=%s\n' "$service_pid" >&2; exit 1 ;;
           esac
-          if [ -n "$service_pid" ] && sudo -n kill -0 "$service_pid"; then
+          service_state_probe="$HANDOFF_DIR/service-state-probes.raw.log"
+          : > "$service_state_probe"
+          process_is_live() {
+            local pid="$1" state probe_status=0
+            sudo -n ps -o state= -p "$pid" >> "$service_state_probe" 2>&1 || probe_status=$?
+            state="$(awk 'NF {last=$1} END {print last}' "$service_state_probe")"
+            if [ "$probe_status" -ne 0 ] || ! sudo -n kill -0 "$pid"; then
+              return 1
+            fi
+            case "$state" in
+              Z*|z*) return 1 ;;
+              *) return 0 ;;
+            esac
+          }
+          if [ -n "$service_pid" ] && process_is_live "$service_pid"; then
             sudo -n kill -TERM "$service_pid"
             stopped=false
             for _ in $(seq 1 30); do
-              if ! sudo -n kill -0 "$service_pid"; then
+              if ! process_is_live "$service_pid"; then
                 stopped=true
                 break
               fi
               sleep 1
             done
             if [ "$stopped" != true ]; then
-              sudo -n kill -KILL "$service_pid"
+              kill_status=0
+              sudo -n kill -KILL "$service_pid" || kill_status=$?
+              printf 'candidate_service_kill=KILL status=%s\n' "$kill_status"
               for _ in $(seq 1 10); do
-                if ! sudo -n kill -0 "$service_pid"; then
+                if ! process_is_live "$service_pid"; then
                   stopped=true
                   break
                 fi
@@ -593,6 +609,7 @@ jobs:
           else
             printf '%s\n' 'candidate service was not running at cleanup'
           fi
+          emit_private_evidence service-state-probes "$service_state_probe"
 
       - name: Upload safe functional result
         if: always()
