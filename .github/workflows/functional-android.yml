@@ -679,6 +679,7 @@ jobs:
           from __future__ import annotations
 
           import hashlib
+          import json
           import re
           import sys
           from pathlib import Path
@@ -753,6 +754,19 @@ jobs:
                       return code
               return "NONEMPTY" if lower.strip() else "EMPTY"
 
+          def safe_stderr_display(stderr: bytes) -> str:
+              """Expose a bounded, secret-safe reason without replacing raw evidence."""
+              value = stderr.decode("utf-8", errors="replace").replace("\x00", " ")
+              value = re.sub(r"(?i)(?:[A-Za-z]:[\\/]|/)[^\r\n]*", "<path>", value)
+              value = re.sub(
+                  r"(?i)\b(?:token|key|secret|password|authorization)\b\s*[:=]\s*\S+",
+                  "<redacted>",
+                  value,
+              )
+              value = re.sub(r"(?i)\b[0-9a-f]{32,}\b", "<hex>", value)
+              value = " ".join(value.split())
+              return value[:240] if value else "<empty>"
+
           def classify(argv: str, output: str, returncode: str, op: str) -> str:
               lower = output.lower()
               command_lower = argv.lower()
@@ -801,7 +815,9 @@ jobs:
                       f"android_command_diagnostic sequence={sequence} operation={op} "
                       f"code={code} returncode={returncode} stdout_bytes={len(stdout)} "
                       f"stderr_bytes={len(stderr)} stderr_code={stderr_code(stderr)} "
-                      f"stderr_sha256={stderr_digest} raw_bytes={len(payload)}\n"
+                      f"stderr_sha256={stderr_digest} "
+                      f"stderr_display={json.dumps(safe_stderr_display(stderr), ensure_ascii=True)} "
+                      f"raw_bytes={len(payload)}\n"
                   )
           PY
           chmod 600 "$diagnostic"
