@@ -670,6 +670,78 @@ jobs:
             --expected-unavailable functional.network-transition=ANDROID_UPLINK_TOGGLE_UNSUPPORTED \
             --expected-unavailable functional.bounded-endurance=ANDROID_ENDURANCE_SEAM_UNSUPPORTED
 
+      - name: Report safe Android command diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          diagnostic="$HANDOFF_DIR/android-command-diagnostic.txt"
+          : > "$diagnostic"
+          python3 - "$HANDOFF_DIR/hosted-command-raw" "$diagnostic" <<'PY'
+          from __future__ import annotations
+
+          import re
+          import sys
+          from pathlib import Path
+
+          raw_dir = Path(sys.argv[1])
+          output = Path(sys.argv[2])
+          files = sorted(raw_dir.glob("*.raw.log")) if raw_dir.is_dir() else []
+
+          def classify(payload: bytes) -> str:
+              text = payload.decode("utf-8", errors="replace")
+              lower = text.lower()
+              if "run-as" in lower and "not debuggable" in lower:
+                  return "RUN_AS_NOT_DEBUGGABLE"
+              if "run-as" in lower and any(
+                  marker in lower for marker in ("permission denied", "access denied", "denied")
+              ):
+                  return "RUN_AS_PERMISSION_DENIED"
+              if "run-as" in lower and any(
+                  marker in lower
+                  for marker in ("package not found", "unknown package", "does not exist")
+              ):
+                  return "RUN_AS_PACKAGE_MISSING"
+              if "run-as" in lower and "not found" in lower:
+                  return "RUN_AS_COMMAND_UNAVAILABLE"
+              if "broken pipe" in lower or "stdin" in lower or "input" in lower:
+                  return "ADB_STDIN_FAILED"
+              if any(
+                  marker in lower
+                  for marker in ("device offline", "no devices", "device not found", "device unauthorized")
+              ):
+                  return "ADB_DEVICE_UNAVAILABLE"
+              if "returncode=0" in lower:
+                  return "OK"
+              if "returncode=" in lower:
+                  return "COMMAND_FAILED"
+              return "RAW_FORMAT_INVALID"
+
+          output.write_text("schema=1\n", encoding="ascii")
+          with output.open("a", encoding="ascii") as stream:
+              for sequence, path in enumerate(files, start=1):
+                  payload = path.read_bytes()
+                  match = re.search(rb"^returncode=([^\n]*)$", payload, re.MULTILINE)
+                  returncode = match.group(1).decode("ascii", errors="replace") if match else "unknown"
+                  code = classify(payload)
+                  stream.write(
+                      f"android_command_diagnostic sequence={sequence} code={code} "
+                      f"returncode={returncode} raw_bytes={len(payload)}\n"
+                  )
+          PY
+          chmod 600 "$diagnostic"
+          cat "$diagnostic"
+
+      - name: Upload safe Android command diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: android-command-diagnostic-${{ env.LEASE_RUN_ID }}
+          path: ${{ env.HANDOFF_DIR }}/android-command-diagnostic.txt
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Stop Android emulator and verify cleanup
         if: always()
         shell: bash
