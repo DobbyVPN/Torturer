@@ -327,7 +327,11 @@ class HostedAndroidAdapterTests(unittest.TestCase):
         self.assertEqual(result.outcome, "passed")
 
     def test_late_logcat_runner_error_is_rehydrated_without_masking_product_result(self) -> None:
-        for error_code in ("COMMAND_TIMEOUT", "COMMAND_DEADLINE_EXCEEDED"):
+        for error_code in (
+            "COMMAND_TIMEOUT",
+            "COMMAND_DEADLINE_EXCEEDED",
+            "ADB_DEVICE_UNAVAILABLE",
+        ):
             with self.subTest(error_code=error_code):
                 runner = RaisingPartialLogcatRunner(
                     Path(self.directory.name) / f"late-logcat-{error_code.lower()}",
