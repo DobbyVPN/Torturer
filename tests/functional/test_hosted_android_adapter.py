@@ -395,6 +395,12 @@ class HostedAndroidAdapterTests(unittest.TestCase):
         self.assertGreaterEqual(len(staged), 2)
         self.assertTrue(all(call[2] == "-T" for call in staged))
         self.assertIn("mkdir -p files && cat > files/", staged[0][-1])
+        # adb's shell transport joins argv elements before the remote shell
+        # parses them.  The complete ``sh -c`` payload must therefore be
+        # shell-quoted, otherwise ``sh -c`` receives only ``mkdir`` and the
+        # Android toybox command fails with a missing operand.
+        self.assertTrue(staged[0][-1].startswith("'"))
+        self.assertTrue(staged[0][-1].endswith("'"))
 
     def test_nonempty_logcat_timeout_is_retained_without_masking_product_result(self) -> None:
         runner = PartialLogcatRunner(Path(self.directory.name) / "partial-logcat-raw")
