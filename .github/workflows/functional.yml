@@ -122,6 +122,7 @@ jobs:
             printf 'HANDOFF_DIR=%s\n' "$RUNNER_TEMP/dobbyvpn-render-handoff"
             printf 'SERVICE_DIR=%s\n' "$RUNNER_TEMP/dobbyvpn-service"
             printf 'RESULT_PATH=%s\n' "$RUNNER_TEMP/dobbyvpn-render-handoff/functional-result.json"
+            printf 'LEASE_RUN_ID=unassigned\n'
           } >> "$GITHUB_ENV"
 
       - name: Validate trusted functional inputs

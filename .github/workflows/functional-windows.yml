@@ -131,7 +131,7 @@ jobs:
           handoff="$RUNNER_TEMP/dobbyvpn-render-handoff"
           service="$RUNNER_TEMP/dobbyvpn-service"
           mkdir -p "$handoff" "$service"
-          printf 'HANDOFF_DIR=%s\nSERVICE_DIR=%s\nRESULT_PATH=%s\n' \
+          printf 'HANDOFF_DIR=%s\nSERVICE_DIR=%s\nRESULT_PATH=%s\nLEASE_RUN_ID=unassigned\n' \
             "$handoff" "$service" "$handoff/functional-result.json" >> "$GITHUB_ENV"
 
       - name: Prove Windows client runner architecture and elevation
