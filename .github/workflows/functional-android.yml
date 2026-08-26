@@ -296,27 +296,6 @@ jobs:
           emit_private_evidence android-kvm-accel-check "$accel_check_log"
           printf 'android_kvm_acceleration_check=usable\n'
 
-      - name: Establish hard thirty-minute workflow deadline
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" 30 origin-run "$HANDOFF_DIR/origin-run.json" \
-            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          python3 - "$HANDOFF_DIR/origin-run.json" <<'PY'
-          import datetime, json, os, sys
-          from pathlib import Path
-          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          if value.get("id") != int(os.environ["GITHUB_RUN_ID"]):
-              raise SystemExit("workflow run identity mismatch")
-          started = datetime.datetime.fromisoformat(value["run_started_at"].replace("Z", "+00:00"))
-          deadline = int(started.timestamp()) + 30 * 60
-          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as output:
-              output.write(f"RUN_DEADLINE_EPOCH={deadline}\n")
-          print(f"run_deadline_epoch={deadline}")
-          PY
-
       - name: Create ephemeral recipient and opaque Render lease request
         shell: bash
         run: |
@@ -347,6 +326,27 @@ jobs:
           ref: ${{ github.sha }}
           path: torturer
           persist-credentials: false
+
+      - name: Establish hard thirty-minute workflow deadline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" 30 origin-run "$HANDOFF_DIR/origin-run.json" \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          python3 - "$HANDOFF_DIR/origin-run.json" <<'PY'
+          import datetime, json, os, sys
+          from pathlib import Path
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if value.get("id") != int(os.environ["GITHUB_RUN_ID"]):
+              raise SystemExit("workflow run identity mismatch")
+          started = datetime.datetime.fromisoformat(value["run_started_at"].replace("Z", "+00:00"))
+          deadline = int(started.timestamp()) + 30 * 60
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as output:
+              output.write(f"RUN_DEADLINE_EPOCH={deadline}\n")
+          print(f"run_deadline_epoch={deadline}")
+          PY
 
       - name: Download and verify exact Android candidate closure
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
