@@ -719,6 +719,7 @@ class AndroidHostedAdapter:
         failure_code: str,
         *,
         allow_nonzero: bool = False,
+        allow_partial_timeout: bool = False,
         input_bytes: bytes | None = None,
     ) -> CommandResult:
         if self.adb is None:
@@ -744,7 +745,7 @@ class AndroidHostedAdapter:
                 result = self.runner.run(command, timeout_seconds=timeout_seconds)
         except HostedAdapterError as error:
             raise ScenarioExecutionError(error.code) from error
-        if result.timed_out:
+        if result.timed_out and not allow_partial_timeout:
             raise ScenarioExecutionError("ANDROID_COMMAND_TIMEOUT")
         if result.returncode != 0 and not allow_nonzero:
             raise ScenarioExecutionError(failure_code)
@@ -759,11 +760,24 @@ class AndroidHostedAdapter:
             ("shell", "ps", "-A"),
         ):
             try:
-                self._adb(
+                result = self._adb(
                     command,
                     _finalization_timeout(deadline, "ANDROID_DIAGNOSTICS_TIMEOUT"),
                     "ANDROID_DIAGNOSTICS_FAILED",
+                    allow_nonzero=command[0] == "logcat",
+                    allow_partial_timeout=command[0] == "logcat",
                 )
+                # A full-buffer logcat dump can exceed the short per-scenario
+                # finalization slice.  The runner has already retained every
+                # byte received before the bounded timeout; accept that
+                # partial diagnostic only when it contains output, while
+                # preserving a failure for an empty or non-timeout command.
+                if command[0] == "logcat" and result.timed_out:
+                    if result.stdout:
+                        continue
+                    error = error or ScenarioExecutionError("ANDROID_DIAGNOSTICS_FAILED")
+                elif command[0] == "logcat" and result.returncode != 0:
+                    error = error or ScenarioExecutionError("ANDROID_DIAGNOSTICS_FAILED")
             except ScenarioExecutionError as failure:
                 error = error or failure
         return error

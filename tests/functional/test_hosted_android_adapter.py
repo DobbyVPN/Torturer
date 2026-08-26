@@ -132,6 +132,16 @@ class InputAndroidRunner(FakeAndroidRunner):
         return self.run(command, timeout_seconds=timeout_seconds)
 
 
+class PartialLogcatRunner(FakeAndroidRunner):
+    """Synthetic runner for a bounded, non-empty logcat timeout."""
+
+    def run(self, command, *, timeout_seconds):
+        result = super().run(command, timeout_seconds=timeout_seconds)
+        if tuple(command)[1:2] == ("logcat",):
+            return CommandResult(tuple(command), 124, b"partial logcat bytes\n", b"", timed_out=True)
+        return result
+
+
 def _provenance(adapter: AndroidHostedAdapter) -> RunProvenance:
     return RunProvenance(
         source_repository="DobbyVPN/DobbyVPN",
@@ -384,6 +394,23 @@ class HostedAndroidAdapterTests(unittest.TestCase):
         ]
         self.assertGreaterEqual(len(staged), 2)
         self.assertTrue(all(call[2] == "-T" for call in staged))
+
+    def test_nonempty_logcat_timeout_is_retained_without_masking_product_result(self) -> None:
+        runner = PartialLogcatRunner(Path(self.directory.name) / "partial-logcat-raw")
+        adapter = AndroidHostedAdapter(
+            runner=runner,
+            profile=self.profile,
+            adb=self.adb,
+            source_sha=_SOURCE_SHA,
+            identity_url="https://identity.example.test/ip",
+            latency_url="https://latency.example.test/blob",
+            download_url="https://download.example.test/blob",
+            upload_url="https://upload.example.test/blob",
+        )
+        result = FunctionalEngine("e" * 64).run(
+            get_scenario("functional.configure"), adapter, _provenance(adapter)
+        )
+        self.assertEqual(result.outcome, "passed")
 
     def test_missing_or_non_executable_adb_fails_closed(self) -> None:
         with self.assertRaisesRegex(HostedAdapterError, "ANDROID_ADB_UNAVAILABLE"):

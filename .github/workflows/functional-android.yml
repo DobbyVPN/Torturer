@@ -734,7 +734,29 @@ jobs:
                   return "force-stop"
               return "other"
 
-          def classify(payload: bytes, argv: str, output: str, returncode: str) -> str:
+          def stderr_code(stderr: bytes) -> str:
+              lower = stderr.decode("utf-8", errors="replace").lower()
+              markers = (
+                  ("not debuggable", "NOT_DEBUGGABLE"),
+                  ("permission denied", "PERMISSION_DENIED"),
+                  ("access denied", "ACCESS_DENIED"),
+                  ("unknown package", "PACKAGE_UNKNOWN"),
+                  ("package not found", "PACKAGE_MISSING"),
+                  ("does not exist", "PATH_MISSING"),
+                  ("no such file", "PATH_MISSING"),
+                  ("cannot create", "CREATE_FAILED"),
+                  ("can't create", "CREATE_FAILED"),
+                  ("read-only file system", "READ_ONLY_FILESYSTEM"),
+                  ("closed", "CHANNEL_CLOSED"),
+                  ("broken pipe", "BROKEN_PIPE"),
+                  ("protocol fault", "PROTOCOL_FAULT"),
+              )
+              for marker, code in markers:
+                  if marker in lower:
+                      return code
+              return "NONEMPTY" if lower.strip() else "EMPTY"
+
+          def classify(argv: str, output: str, returncode: str, op: str) -> str:
               lower = output.lower()
               command_lower = argv.lower()
               if "run-as" in command_lower and "not debuggable" in lower:
@@ -750,7 +772,9 @@ jobs:
                   return "RUN_AS_PACKAGE_MISSING"
               if "run-as" in command_lower and "not found" in lower:
                   return "RUN_AS_COMMAND_UNAVAILABLE"
-              if any(marker in lower for marker in ("broken pipe", "stdin", "standard input")):
+              if op in {"profile-stage", "command-stage"} and any(
+                  marker in lower for marker in ("broken pipe", "stdin", "standard input")
+              ):
                   return "ADB_STDIN_FAILED"
               if any(
                   marker in lower
@@ -773,12 +797,14 @@ jobs:
                   stdout = section(payload, "stdout")
                   stderr = section(payload, "stderr")
                   output = stdout + b"\n" + stderr
-                  code = classify(payload, argv, output.decode("utf-8", errors="replace"), returncode)
+                  op = operation(argv)
+                  code = classify(argv, output.decode("utf-8", errors="replace"), returncode, op)
                   stderr_digest = hashlib.sha256(stderr).hexdigest()
                   stream.write(
-                      f"android_command_diagnostic sequence={sequence} operation={operation(argv)} "
+                      f"android_command_diagnostic sequence={sequence} operation={op} "
                       f"code={code} returncode={returncode} stdout_bytes={len(stdout)} "
-                      f"stderr_bytes={len(stderr)} stderr_sha256={stderr_digest} raw_bytes={len(payload)}\n"
+                      f"stderr_bytes={len(stderr)} stderr_code={stderr_code(stderr)} "
+                      f"stderr_sha256={stderr_digest} raw_bytes={len(payload)}\n"
                   )
           PY
           chmod 600 "$diagnostic"
