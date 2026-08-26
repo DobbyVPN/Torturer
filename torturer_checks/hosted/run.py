@@ -29,7 +29,10 @@ from .factory import adapter_for_platform
 
 ROOT = Path(__file__).resolve().parents[2]
 _SHA40 = set("0123456789abcdef")
-_MAX_LANE_SECONDS = 1200
+# The hosted engine's own ceiling matches the public 30-minute functional
+# lane contract.  Workflows may reserve part of that window for provisioning
+# and cleanup, but the engine must not impose a contradictory 20-minute cap.
+_MAX_LANE_SECONDS = 1_800
 _RESET_TIMEOUT_SECONDS = 5
 _OPAQUE_EVIDENCE_ID = re.compile(r"[a-z][0-9a-f]{31}\Z")
 

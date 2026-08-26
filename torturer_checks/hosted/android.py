@@ -401,6 +401,15 @@ class AndroidHostedAdapter:
         try:
             _ensure_owner_only_directory(raw_directory)
         except HostedAdapterError as error:
+            # SubprocessRunner retains a complete raw record before raising
+            # COMMAND_TIMEOUT.  For the deliberately best-effort logcat
+            # diagnostic, recover that retained partial stream as a normal
+            # timed-out result so _capture_diagnostics can accept it when
+            # bytes were actually captured.  This keeps the original bytes
+            # intact while avoiding a false finalization failure merely
+            # because Android's log buffer is larger than the short reserve.
+            if allow_partial_timeout and error.code == "COMMAND_TIMEOUT":
+                return self._partial_timeout_result(command)
             raise ScenarioExecutionError(error.code) from error
         assert self.source_sha is not None
         token = hashlib.sha256(
@@ -493,13 +502,47 @@ class AndroidHostedAdapter:
             raise ScenarioExecutionError(failure_code)
         return result
 
+    def _partial_timeout_result(self, command: tuple[str, ...]) -> CommandResult:
+        """Rehydrate a timed-out command from the runner's retained raw file."""
+
+        raw_directory = getattr(self.runner, "raw_directory", None)
+        if not isinstance(raw_directory, Path):
+            return CommandResult(command, 124, timed_out=True)
+        try:
+            candidates = list(raw_directory.glob("command-*.raw.log"))
+            if not candidates:
+                return CommandResult(command, 124, timed_out=True)
+            raw_path = max(candidates, key=lambda path: path.stat().st_mtime_ns)
+            payload = raw_path.read_bytes()
+        except OSError:
+            return CommandResult(command, 124, timed_out=True)
+
+        def section(name: str) -> bytes:
+            match = re.search(
+                rb"(?ms)^" + name.encode("ascii") + rb"-begin\n(.*?)\n"
+                + name.encode("ascii") + rb"-end\n",
+                payload,
+            )
+            return match.group(1) if match else b""
+
+        return CommandResult(
+            command,
+            124,
+            stdout=section("stdout"),
+            stderr=section("stderr"),
+            timed_out=True,
+        )
+
     def _capture_diagnostics(self, deadline: float) -> ScenarioExecutionError | None:
         error: ScenarioExecutionError | None = None
+        # Drain bounded structural diagnostics first.  A large Android log
+        # buffer may consume the remaining slice and is intentionally last;
+        # its partial bytes are still retained and accepted below.
         for command in (
-            ("logcat", "-d", "-b", "all"),
             ("shell", "dumpsys", "connectivity"),
             ("shell", "dumpsys", "package", _PACKAGE_NAME),
             ("shell", "ps", "-A"),
+            ("logcat", "-d", "-b", "all"),
         ):
             try:
                 result = self._adb(

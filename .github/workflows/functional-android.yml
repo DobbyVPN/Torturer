@@ -653,7 +653,7 @@ jobs:
         run: |
           set -euo pipefail
           remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 120))
-          # Android's six applicable canonical scenarios plus resets have a 621-second declared maximum.
+          # Android's six applicable canonical scenarios plus resets have a 633-second declared maximum.
           if [ "$remaining" -lt 650 ]; then printf 'insufficient Android canonical budget before cleanup reserve: seconds=%s\n' "$remaining" >&2; exit 1; fi
           if [ "$remaining" -gt 1260 ]; then remaining=1260; fi
           printf 'canonical_lane_timeout_seconds=%s\n' "$remaining"
