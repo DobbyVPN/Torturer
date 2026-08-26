@@ -259,6 +259,12 @@ jobs:
           data = Path(sys.argv[1]).read_bytes()
           lower = data.lower()
           rules = (
+              (b"set explicit runtime path acl", "CONTROL_TOKEN_ACL_SET_FAILED"),
+              (b"resolve installed-user sid", "CONTROL_TOKEN_USER_SID_FAILED"),
+              (b"resolve current windows user", "CONTROL_TOKEN_USER_FAILED"),
+              (b"invalid desktop control token", "CONTROL_TOKEN_INVALID"),
+              (b"programdata is required", "CONTROL_TOKEN_PROGRAMDATA_MISSING"),
+              (b"the requested operation requires elevation", "ELEVATION_REQUIRED"),
               (b"failed to initialize secure local logging", "LOG_INIT_FAILED"),
               (b"failed to prepare control authentication", "CONTROL_AUTH_INIT_FAILED"),
               (b"failed to listen", "LISTEN_FAILED"),
@@ -382,6 +388,12 @@ jobs:
           data = Path(sys.argv[1]).read_bytes()
           lower = data.lower()
           rules = (
+              (b"set explicit runtime path acl", "CONTROL_TOKEN_ACL_SET_FAILED"),
+              (b"resolve installed-user sid", "CONTROL_TOKEN_USER_SID_FAILED"),
+              (b"resolve current windows user", "CONTROL_TOKEN_USER_FAILED"),
+              (b"invalid desktop control token", "CONTROL_TOKEN_INVALID"),
+              (b"programdata is required", "CONTROL_TOKEN_PROGRAMDATA_MISSING"),
+              (b"the requested operation requires elevation", "ELEVATION_REQUIRED"),
               (b"failed to initialize secure local logging", "LOG_INIT_FAILED"),
               (b"failed to prepare control authentication", "CONTROL_AUTH_INIT_FAILED"),
               (b"failed to listen", "LISTEN_FAILED"),
