@@ -25,6 +25,15 @@ class DeadlineError(ValueError):
     """The requested command or deadline is unsafe."""
 
 
+def _safe_reason(error: Exception) -> str:
+    """Expose a bounded diagnostic code without echoing command/path data."""
+
+    reason = str(error).strip()
+    if not reason or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for character in reason):
+        return type(error).__name__
+    return reason[:128]
+
+
 def _bounded(value: int, *, name: str, maximum: int) -> int:
     if not 1 <= value <= maximum:
         raise DeadlineError(f"{name} must be between 1 and {maximum} seconds")
@@ -136,7 +145,11 @@ def main(argv: list[str] | None = None) -> int:
             grace_seconds=args.kill_grace_seconds,
         )
     except DeadlineError as error:
-        print(f"hosted-deadline invalid-request={type(error).__name__}", file=sys.stderr)
+        print(
+            f"hosted-deadline invalid-request={type(error).__name__} "
+            f"reason={_safe_reason(error)}",
+            file=sys.stderr,
+        )
         return 2
     except OSError as error:
         print(f"hosted-deadline launch-error={type(error).__name__}", file=sys.stderr)
