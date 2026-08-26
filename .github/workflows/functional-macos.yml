@@ -156,6 +156,14 @@ jobs:
           printf 'source_repository=%s\nsource_sha=%s\nplatform=%s\ntorturer_sha=%s\nserver_image_digest=%s\n' \
             "$SOURCE_REPOSITORY" "$SOURCE_SHA" "$PLATFORM" "$TORTURER_SHA" "$SERVER_IMAGE_DIGEST"
 
+      - name: Check out exact trusted Torturer revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: DobbyVPN/Torturer
+          ref: ${{ github.sha }}
+          path: torturer
+          persist-credentials: false
+
       - name: Establish hard thirty-minute workflow deadline
         env:
           GH_TOKEN: ${{ github.token }}
@@ -179,14 +187,6 @@ jobs:
           print(f"workflow_started_epoch={int(started.timestamp())}\nrun_deadline_epoch={deadline}")
           PY
           unset GH_TOKEN
-
-      - name: Check out exact trusted Torturer revision
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          repository: DobbyVPN/Torturer
-          ref: ${{ github.sha }}
-          path: torturer
-          persist-credentials: false
 
       - name: Download and verify exact macOS candidate closure
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
