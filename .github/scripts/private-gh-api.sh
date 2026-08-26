@@ -58,7 +58,12 @@ for raw_path in sys.argv[1:]:
             os.name != "nt" and stat.S_IMODE(details.st_mode) != 0o600
         ):
             raise SystemExit("private-gh-api evidence file is unsafe")
-        os.fsync(descriptor)
+        # Windows' FlushFileBuffers rejects a read-only CRT descriptor with
+        # EBADF; the producer already closed the redirected file before this
+        # verification opens it, so the read-only check does not need a flush
+        # on that platform.  POSIX keeps the explicit durability barrier.
+        if os.name != "nt":
+            os.fsync(descriptor)
     finally:
         os.close(descriptor)
 PY
