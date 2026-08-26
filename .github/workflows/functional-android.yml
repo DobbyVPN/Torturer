@@ -428,6 +428,9 @@ jobs:
           PY
             chmod 600 "$exit_log"
             emit_private_evidence android-emulator-exit "$exit_log"
+            printf '%s\n' 'android_emulator_exit_diagnostic_begin'
+            sed -n '1,4p' "$exit_log"
+            printf '%s\n' 'android_emulator_exit_diagnostic_end'
           }
           adb="$ANDROID_SDK_ROOT/platform-tools/adb"
           adb_bounded() {
