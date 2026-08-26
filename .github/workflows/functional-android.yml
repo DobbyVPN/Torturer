@@ -681,6 +681,7 @@ jobs:
           python3 - "$HANDOFF_DIR/hosted-command-raw" "$diagnostic" <<'PY'
           from __future__ import annotations
 
+          import hashlib
           import re
           import sys
           from pathlib import Path
@@ -689,32 +690,76 @@ jobs:
           output = Path(sys.argv[2])
           files = sorted(raw_dir.glob("*.raw.log")) if raw_dir.is_dir() else []
 
-          def classify(payload: bytes) -> str:
-              text = payload.decode("utf-8", errors="replace")
-              lower = text.lower()
-              if "run-as" in lower and "not debuggable" in lower:
+          def section(payload: bytes, name: str) -> bytes:
+              match = re.search(
+                  rb"(?ms)^" + name.encode("ascii") + rb"-begin\n(.*?)\n" +
+                  name.encode("ascii") + rb"-end\n",
+                  payload,
+              )
+              return match.group(1) if match else b""
+
+          def command_line(payload: bytes) -> str:
+              match = re.search(rb"^argv=(.*)$", payload, re.MULTILINE)
+              return match.group(1).decode("utf-8", errors="replace") if match else ""
+
+          def operation(argv: str) -> str:
+              lower = argv.lower()
+              if "run-as" in lower and "cat > files/" in lower:
+                  if ".profile" in lower:
+                      return "profile-stage"
+                  if ".command.json" in lower:
+                      return "command-stage"
+              if "run-as" in lower and "chmod" in lower:
+                  if ".profile" in lower:
+                      return "profile-chmod"
+                  if ".command.json" in lower:
+                      return "command-chmod"
+              if " am instrument " in f" {lower} ":
+                  return "instrumentation"
+              if " exec-out " in f" {lower} ":
+                  return "observation"
+              if " logcat " in f" {lower} ":
+                  return "logcat"
+              if " dumpsys " in f" {lower} ":
+                  return "dumpsys"
+              if " shell ps " in f" {lower} ":
+                  return "process-list"
+              if " shell pidof " in f" {lower} ":
+                  return "process-probe"
+              if " shell run-as " in f" {lower} " and " rm " in f" {lower} ":
+                  return "private-cleanup"
+              if " shell rm " in f" {lower} ":
+                  return "temporary-cleanup"
+              if " force-stop " in f" {lower} ":
+                  return "force-stop"
+              return "other"
+
+          def classify(payload: bytes, argv: str, output: str, returncode: str) -> str:
+              lower = output.lower()
+              command_lower = argv.lower()
+              if "run-as" in command_lower and "not debuggable" in lower:
                   return "RUN_AS_NOT_DEBUGGABLE"
-              if "run-as" in lower and any(
+              if "run-as" in command_lower and any(
                   marker in lower for marker in ("permission denied", "access denied", "denied")
               ):
                   return "RUN_AS_PERMISSION_DENIED"
-              if "run-as" in lower and any(
+              if "run-as" in command_lower and any(
                   marker in lower
                   for marker in ("package not found", "unknown package", "does not exist")
               ):
                   return "RUN_AS_PACKAGE_MISSING"
-              if "run-as" in lower and "not found" in lower:
+              if "run-as" in command_lower and "not found" in lower:
                   return "RUN_AS_COMMAND_UNAVAILABLE"
-              if "broken pipe" in lower or "stdin" in lower or "input" in lower:
+              if any(marker in lower for marker in ("broken pipe", "stdin", "standard input")):
                   return "ADB_STDIN_FAILED"
               if any(
                   marker in lower
                   for marker in ("device offline", "no devices", "device not found", "device unauthorized")
               ):
                   return "ADB_DEVICE_UNAVAILABLE"
-              if "returncode=0" in lower:
+              if returncode == "0":
                   return "OK"
-              if "returncode=" in lower:
+              if returncode != "unknown":
                   return "COMMAND_FAILED"
               return "RAW_FORMAT_INVALID"
 
@@ -724,10 +769,16 @@ jobs:
                   payload = path.read_bytes()
                   match = re.search(rb"^returncode=([^\n]*)$", payload, re.MULTILINE)
                   returncode = match.group(1).decode("ascii", errors="replace") if match else "unknown"
-                  code = classify(payload)
+                  argv = command_line(payload)
+                  stdout = section(payload, "stdout")
+                  stderr = section(payload, "stderr")
+                  output = stdout + b"\n" + stderr
+                  code = classify(payload, argv, output.decode("utf-8", errors="replace"), returncode)
+                  stderr_digest = hashlib.sha256(stderr).hexdigest()
                   stream.write(
-                      f"android_command_diagnostic sequence={sequence} code={code} "
-                      f"returncode={returncode} raw_bytes={len(payload)}\n"
+                      f"android_command_diagnostic sequence={sequence} operation={operation(argv)} "
+                      f"code={code} returncode={returncode} stdout_bytes={len(stdout)} "
+                      f"stderr_bytes={len(stderr)} stderr_sha256={stderr_digest} raw_bytes={len(payload)}\n"
                   )
           PY
           chmod 600 "$diagnostic"

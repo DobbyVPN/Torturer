@@ -124,6 +124,14 @@ class ExternalControlRunner(FakeAndroidRunner):
         return super().run(command, timeout_seconds=timeout_seconds)
 
 
+class InputAndroidRunner(FakeAndroidRunner):
+    """Synthetic runner that exercises the real stdin staging path."""
+
+    def run_with_input(self, command, *, timeout_seconds, input_bytes):
+        del input_bytes
+        return self.run(command, timeout_seconds=timeout_seconds)
+
+
 def _provenance(adapter: AndroidHostedAdapter) -> RunProvenance:
     return RunProvenance(
         source_repository="DobbyVPN/DobbyVPN",
@@ -353,6 +361,29 @@ class HostedAndroidAdapterTests(unittest.TestCase):
         )
         self.assertIsInstance(adapter, AndroidHostedAdapter)
         self.assertEqual(adapter.capabilities, self.adapter.capabilities)
+
+    def test_binary_staging_disables_pty_allocation(self) -> None:
+        runner = InputAndroidRunner(Path(self.directory.name) / "input-raw")
+        adapter = AndroidHostedAdapter(
+            runner=runner,
+            profile=self.profile,
+            adb=self.adb,
+            source_sha=_SOURCE_SHA,
+            identity_url="https://identity.example.test/ip",
+            latency_url="https://latency.example.test/blob",
+            download_url="https://download.example.test/blob",
+            upload_url="https://upload.example.test/blob",
+        )
+        result = FunctionalEngine("e" * 64).run(
+            get_scenario("functional.configure"), adapter, _provenance(adapter)
+        )
+        self.assertEqual(result.outcome, "passed")
+        staged = [
+            call for call in runner.calls
+            if len(call) > 5 and call[1:4] == ("shell", "-T", "run-as")
+        ]
+        self.assertGreaterEqual(len(staged), 2)
+        self.assertTrue(all(call[2] == "-T" for call in staged))
 
     def test_missing_or_non_executable_adb_fails_closed(self) -> None:
         with self.assertRaisesRegex(HostedAdapterError, "ANDROID_ADB_UNAVAILABLE"):
