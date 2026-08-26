@@ -85,14 +85,17 @@ jobs:
       RENDER_IMAGE_PATH: ${{ vars.RENDER_IMAGE_PATH }}
       RENDER_IMAGE_DIGEST: ${{ vars.RENDER_IMAGE_DIGEST }}
       RENDER_REGION: ${{ vars.RENDER_REGION }}
-      TORTURER_SHA: ${{ github.sha }}
+      # The lease is dispatched asynchronously.  The branch may advance between
+      # the client workflow and this controller, so trust only the exact
+      # revision recorded by the originating client run.
+      TORTURER_SHA: ${{ inputs.origin_torturer_sha }}
 
     steps:
       - name: Check out exact trusted Torturer revision
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: DobbyVPN/Torturer
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.origin_torturer_sha }}
           path: torturer
           persist-credentials: false
 

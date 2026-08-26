@@ -88,6 +88,8 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         self.assertNotIn("actions/runs/${ORIGIN_RUN_ID}/artifacts", self.text)
         self.assertIn("one Render lease already exists for this origin/platform", self.text)
         self.assertIn("ORIGIN_TORTURER_SHA: ${{ inputs.origin_torturer_sha }}", self.text)
+        self.assertIn("TORTURER_SHA: ${{ inputs.origin_torturer_sha }}", self.text)
+        self.assertIn("ref: ${{ inputs.origin_torturer_sha }}", self.text)
         self.assertIn("ORIGIN_SOURCE_SHA: ${{ inputs.origin_source_sha }}", self.text)
         self.assertIn("origin_source_sha is invalid", self.text)
         self.assertIn("origin_workflow_path:", self.text)
