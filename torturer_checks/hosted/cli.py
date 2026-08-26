@@ -170,7 +170,15 @@ class SubprocessRunner:
         self._sequence = 0
         self._evidence: list[dict[str, object]] = []
 
-    def run(self, command: Sequence[str], *, timeout_seconds: float) -> CommandResult:
+    def run(
+        self,
+        command: Sequence[str],
+        *,
+        timeout_seconds: float,
+        input_bytes: bytes | None = None,
+    ) -> CommandResult:
+        if input_bytes is not None and not isinstance(input_bytes, bytes):
+            raise HostedAdapterError("INVALID_INPUT_BYTES")
         if timeout_seconds <= 0 or any(not isinstance(item, str) or not item for item in command):
             raise HostedAdapterError("INVALID_COMMAND")
         argv = tuple(command)
@@ -192,6 +200,7 @@ class SubprocessRunner:
         try:
             process = subprocess.Popen(
                 list(argv),
+                stdin=subprocess.PIPE if input_bytes is not None else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 **_process_group_kwargs(),
@@ -199,7 +208,15 @@ class SubprocessRunner:
             snapshot_provider = _ProcessSnapshotProvider()
             monitor = _ProcessTreeMonitor(process.pid, snapshot_provider)
             monitor.start()
-            stdout, stderr = process.communicate(timeout=work_timeout)
+            if input_bytes is None:
+                # Preserve the ordinary runner's minimal communicate call;
+                # synthetic process doubles and existing callers rely on it.
+                stdout, stderr = process.communicate(timeout=work_timeout)
+            else:
+                stdout, stderr = process.communicate(
+                    input=input_bytes,
+                    timeout=work_timeout,
+                )
             monitor_stopped = monitor.stop(
                 _remaining_until(deadline, cap=cleanup_reserve)
             )
@@ -339,6 +356,31 @@ class SubprocessRunner:
             raise HostedAdapterError("COMMAND_UNAVAILABLE") from error
         self._retain(result, time.monotonic() - started, b"PROCESS_TREE_STATUS=gone\n")
         return result
+
+    def run_with_input(
+        self,
+        command: Sequence[str],
+        *,
+        timeout_seconds: float,
+        input_bytes: bytes,
+    ) -> CommandResult:
+        """Run a command with private bytes supplied on stdin.
+
+        The ordinary command path intentionally has no stdin payload.  A
+        hosted Android app cannot reliably copy a file from ``/data/local/tmp``
+        into its package-private directory on current emulator images, so the
+        Android adapter uses this narrow path to stream the already validated
+        profile/command bytes through ``adb shell run-as``.  The bytes are
+        never written to the command vector or diagnostic metadata; stdout,
+        stderr, exit status, and process-tree evidence retain the same
+        complete owner-only treatment as every other command.
+        """
+
+        return self.run(
+            command,
+            timeout_seconds=timeout_seconds,
+            input_bytes=input_bytes,
+        )
 
     def run_detached(self, command: Sequence[str], *, timeout_seconds: float) -> CommandResult:
         """Run a short launcher while intentionally retaining its detached child.
