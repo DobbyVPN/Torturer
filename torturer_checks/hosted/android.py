@@ -649,15 +649,6 @@ class AndroidHostedAdapter:
         try:
             _ensure_owner_only_directory(raw_directory)
         except HostedAdapterError as error:
-            # SubprocessRunner retains a complete raw record before raising
-            # COMMAND_TIMEOUT.  For the deliberately best-effort logcat
-            # diagnostic, recover that retained partial stream as a normal
-            # timed-out result so _capture_diagnostics can accept it when
-            # bytes were actually captured.  This keeps the original bytes
-            # intact while avoiding a false finalization failure merely
-            # because Android's log buffer is larger than the short reserve.
-            if allow_partial_timeout and error.code == "COMMAND_TIMEOUT":
-                return self._partial_timeout_result(command)
             raise ScenarioExecutionError(error.code) from error
         assert self.source_sha is not None
         token = hashlib.sha256(
@@ -760,6 +751,19 @@ class AndroidHostedAdapter:
             else:
                 result = self.runner.run(command, timeout_seconds=timeout_seconds)
         except HostedAdapterError as error:
+            # SubprocessRunner retains a complete raw record before raising
+            # COMMAND_TIMEOUT or COMMAND_DEADLINE_EXCEEDED. For the
+            # deliberately best-effort logcat diagnostic, recover that
+            # retained stream as a normal timed-out result so
+            # _capture_diagnostics can accept it when bytes were actually
+            # captured. This keeps the original bytes intact while avoiding
+            # a false finalization failure merely because Android's log
+            # buffer is larger than the short reserve.
+            if allow_partial_timeout and error.code in {
+                "COMMAND_TIMEOUT",
+                "COMMAND_DEADLINE_EXCEEDED",
+            }:
+                return self._partial_timeout_result(command)
             raise ScenarioExecutionError(error.code) from error
         if result.timed_out and not allow_partial_timeout:
             raise ScenarioExecutionError("ANDROID_COMMAND_TIMEOUT")
