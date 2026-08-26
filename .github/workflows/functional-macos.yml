@@ -143,6 +143,83 @@ jobs:
           sudo -n id
           test "$(uname -m)" = arm64
 
+      - name: Install portable bounded-timeout helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout_bin="$RUNNER_TEMP/dobbyvpn-timeout-bin"
+          mkdir -p "$timeout_bin"
+          python3 - "$timeout_bin/timeout" <<'PY'
+          import os
+          from pathlib import Path
+          import stat
+          import textwrap
+          import sys
+
+          path = Path(sys.argv[1])
+          path.write_text(textwrap.dedent(r'''#!/usr/bin/env python3
+              import os
+              import signal
+              import subprocess
+              import sys
+              import time
+
+              def seconds(value: str) -> float:
+                  suffixes = (("h", 3600.0), ("m", 60.0), ("s", 1.0))
+                  for suffix, multiplier in suffixes:
+                      if value.endswith(suffix):
+                          number = value[:-1]
+                          break
+                  else:
+                      number, multiplier = value, 1.0
+                  parsed = float(number) * multiplier
+                  if parsed <= 0:
+                      raise ValueError("timeout duration must be positive")
+                  return parsed
+
+              arguments = sys.argv[1:]
+              signal_number = signal.SIGTERM
+              kill_after = 0.0
+              while arguments and arguments[0].startswith("--"):
+                  option = arguments.pop(0)
+                  if option == "--foreground":
+                      continue
+                  if option.startswith("--signal="):
+                      signal_number = getattr(signal, "SIG" + option.split("=", 1)[1].upper())
+                      continue
+                  if option.startswith("--kill-after="):
+                      kill_after = seconds(option.split("=", 1)[1])
+                      continue
+                  raise SystemExit("unsupported timeout option")
+              if len(arguments) < 2:
+                  raise SystemExit("timeout requires a duration and command")
+              limit = seconds(arguments.pop(0))
+              process = subprocess.Popen(arguments, start_new_session=True)
+              try:
+                  process.wait(timeout=limit)
+              except subprocess.TimeoutExpired:
+                  try:
+                      os.killpg(process.pid, signal_number)
+                  except ProcessLookupError:
+                      pass
+                  try:
+                      process.wait(timeout=kill_after)
+                  except subprocess.TimeoutExpired:
+                      try:
+                          os.killpg(process.pid, signal.SIGKILL)
+                      except ProcessLookupError:
+                          pass
+                      process.wait()
+                  raise SystemExit(124)
+              raise SystemExit(process.returncode)
+          '''), encoding="utf-8")
+          path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+          os.chmod(path.parent, 0o700)
+          with Path(os.environ["GITHUB_PATH"]).open("a", encoding="utf-8") as output:
+              output.write(f"{path.parent}\n")
+          print(f"portable_timeout_helper={path}")
+          PY
+
       - name: Validate trusted functional inputs
         shell: bash
         run: |
