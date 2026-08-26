@@ -257,8 +257,15 @@ jobs:
           service_log="$SERVICE_DIR/preflight-service.raw.log"
           service_err="$SERVICE_DIR/preflight-service.stderr.raw.log"
           service_binary="$GITHUB_WORKSPACE/candidate/windows_grpcvpnserver.exe"
+          service_binary_windows="$(cygpath -w "$service_binary" | tr -d '\r')"
+          service_log_windows="$(cygpath -w "$service_log" | tr -d '\r')"
+          service_err_windows="$(cygpath -w "$service_err" | tr -d '\r')"
+          export DOBBYVPN_WINDOWS_SERVICE_BINARY="$service_binary_windows"
+          export DOBBYVPN_WINDOWS_SERVICE_LOG="$service_log_windows"
+          export DOBBYVPN_WINDOWS_SERVICE_ERR="$service_err_windows"
           # shellcheck disable=SC2016
-          service_pid="$(powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; $p=Start-Process -FilePath $args[0] -ArgumentList @("-port","50051") -RedirectStandardOutput $args[1] -RedirectStandardError $args[2] -PassThru; $p.Id' "$service_binary" "$service_log" "$service_err")"
+          service_pid="$(powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; $p=Start-Process -FilePath $env:DOBBYVPN_WINDOWS_SERVICE_BINARY -ArgumentList @("-port","50051") -RedirectStandardOutput $env:DOBBYVPN_WINDOWS_SERVICE_LOG -RedirectStandardError $env:DOBBYVPN_WINDOWS_SERVICE_ERR -PassThru; $p.Id')"
+          unset DOBBYVPN_WINDOWS_SERVICE_BINARY DOBBYVPN_WINDOWS_SERVICE_LOG DOBBYVPN_WINDOWS_SERVICE_ERR
           case "$service_pid" in ""|*[!0-9]*) printf 'invalid preflight service pid=%s\n' "$service_pid" >&2; exit 1;; esac
           printf '%s\n' "$service_pid" > "$HANDOFF_DIR/preflight-service.pid"
           printf 'PREFLIGHT_SERVICE_PID=%s\nPREFLIGHT_SERVICE_PID_FILE=%s\nPREFLIGHT_SERVICE_LOG=%s\n' "$service_pid" "$HANDOFF_DIR/preflight-service.pid" "$service_log" >> "$GITHUB_ENV"
@@ -502,8 +509,15 @@ jobs:
           service_log="$SERVICE_DIR/service.raw.log"
           service_err="$SERVICE_DIR/service.stderr.raw.log"
           service_binary="$GITHUB_WORKSPACE/candidate/windows_grpcvpnserver.exe"
+          service_binary_windows="$(cygpath -w "$service_binary" | tr -d '\r')"
+          service_log_windows="$(cygpath -w "$service_log" | tr -d '\r')"
+          service_err_windows="$(cygpath -w "$service_err" | tr -d '\r')"
+          export DOBBYVPN_WINDOWS_SERVICE_BINARY="$service_binary_windows"
+          export DOBBYVPN_WINDOWS_SERVICE_LOG="$service_log_windows"
+          export DOBBYVPN_WINDOWS_SERVICE_ERR="$service_err_windows"
           # shellcheck disable=SC2016
-          service_pid="$(powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; $p=Start-Process -FilePath $args[0] -ArgumentList @("-port","50051") -RedirectStandardOutput $args[1] -RedirectStandardError $args[2] -PassThru; $p.Id' "$service_binary" "$service_log" "$service_err")"
+          service_pid="$(powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; $p=Start-Process -FilePath $env:DOBBYVPN_WINDOWS_SERVICE_BINARY -ArgumentList @("-port","50051") -RedirectStandardOutput $env:DOBBYVPN_WINDOWS_SERVICE_LOG -RedirectStandardError $env:DOBBYVPN_WINDOWS_SERVICE_ERR -PassThru; $p.Id')"
+          unset DOBBYVPN_WINDOWS_SERVICE_BINARY DOBBYVPN_WINDOWS_SERVICE_LOG DOBBYVPN_WINDOWS_SERVICE_ERR
           case "$service_pid" in ""|*[!0-9]*) printf 'invalid service pid=%s\n' "$service_pid" >&2; exit 1;; esac
           printf '%s\n' "$service_pid" > "$HANDOFF_DIR/service.pid"
           printf 'SERVICE_PID=%s\nSERVICE_BINARY=%s\nSERVICE_PID_FILE=%s\nSERVICE_LOG=%s\n' "$service_pid" "$service_binary" "$HANDOFF_DIR/service.pid" "$service_log" >> "$GITHUB_ENV"
