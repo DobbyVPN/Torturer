@@ -235,6 +235,35 @@ jobs:
           printf 'source_repository=%s\nsource_sha=%s\nplatform=%s\ntorturer_sha=%s\nserver_image_digest=%s\n' \
             "$SOURCE_REPOSITORY" "$SOURCE_SHA" "$PLATFORM" "$TORTURER_SHA" "$SERVER_IMAGE_DIGEST"
 
+      - name: Select OpenSSL 3 for authenticated CMS handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl_bin=""
+          for candidate in \
+            /opt/homebrew/opt/openssl@3/bin/openssl \
+            /usr/local/opt/openssl@3/bin/openssl; do
+            if [ -x "$candidate" ]; then openssl_bin="$candidate"; break; fi
+          done
+          if [ -z "$openssl_bin" ]; then
+            if ! command -v brew; then
+              printf '%s\n' 'OpenSSL 3 is unavailable and Homebrew is not installed' >&2
+              exit 1
+            fi
+            brew install openssl@3
+            for candidate in \
+              /opt/homebrew/opt/openssl@3/bin/openssl \
+              /usr/local/opt/openssl@3/bin/openssl; do
+              if [ -x "$candidate" ]; then openssl_bin="$candidate"; break; fi
+            done
+          fi
+          test -n "$openssl_bin"
+          openssl_dir="$(dirname "$openssl_bin")"
+          export PATH="$openssl_dir:$PATH"
+          printf '%s\n' "$openssl_dir" >> "$GITHUB_PATH"
+          printf 'openssl_selected=%s\n' "$openssl_bin"
+          openssl version
+
       - name: Check out exact trusted Torturer revision
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
