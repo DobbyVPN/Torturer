@@ -191,9 +191,24 @@ def _regular(path: Path, description: str) -> os.stat_result:
     return details
 
 
-def _descriptor_identity(details: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
-    """Return the identity and mutation-sensitive metadata of an open file."""
+def _descriptor_identity(details: os.stat_result) -> tuple[int, ...]:
+    """Return portable identity and mutation metadata for an open file.
 
+    Windows exposes ``st_ctime`` as creation time (and deprecated that field
+    in Python 3.12), while the path and descriptor stat implementations can
+    report different creation-time values for the same NTFS file.  The
+    stable file identity, size, and last-write time are the useful checks on
+    that platform; POSIX keeps the stricter ownership, mode, and ctime checks.
+    """
+
+    common = (
+        details.st_dev,
+        details.st_ino,
+        details.st_size,
+        getattr(details, "st_mtime_ns", int(details.st_mtime * 1_000_000_000)),
+    )
+    if os.name == "nt":
+        return common
     return (
         details.st_dev,
         details.st_ino,
