@@ -106,6 +106,26 @@ class PartialLogcatRunner(FakeAndroidRunner):
         return result
 
 
+class RaisingPartialLogcatRunner(FakeAndroidRunner):
+    """Synthetic runner that raises after retaining a late logcat stream."""
+
+    def __init__(self, raw_directory: Path, error_code: str) -> None:
+        super().__init__(raw_directory)
+        self.error_code = error_code
+
+    def run(self, command, *, timeout_seconds):
+        if tuple(command)[1:2] == ("logcat",):
+            path = self.raw_directory / "command-late-logcat.raw.log"
+            path.write_bytes(
+                b"argv=adb logcat -d -b all\n"
+                b"returncode=0\n"
+                b"stdout-begin\npartial logcat bytes\nstdout-end\n"
+                b"stderr-begin\n\nstderr-end\n"
+            )
+            raise HostedAdapterError(self.error_code)
+        return super().run(command, timeout_seconds=timeout_seconds)
+
+
 def _provenance(adapter: AndroidHostedAdapter) -> RunProvenance:
     return RunProvenance(
         source_repository="DobbyVPN/DobbyVPN",
@@ -305,6 +325,28 @@ class HostedAndroidAdapterTests(unittest.TestCase):
             get_scenario("functional.configure"), adapter, _provenance(adapter)
         )
         self.assertEqual(result.outcome, "passed")
+
+    def test_late_logcat_runner_error_is_rehydrated_without_masking_product_result(self) -> None:
+        for error_code in ("COMMAND_TIMEOUT", "COMMAND_DEADLINE_EXCEEDED"):
+            with self.subTest(error_code=error_code):
+                runner = RaisingPartialLogcatRunner(
+                    Path(self.directory.name) / f"late-logcat-{error_code.lower()}",
+                    error_code,
+                )
+                adapter = AndroidHostedAdapter(
+                    runner=runner,
+                    profile=self.profile,
+                    adb=self.adb,
+                    source_sha=_SOURCE_SHA,
+                    identity_url="https://identity.example.test/ip",
+                    latency_url="https://latency.example.test/blob",
+                    download_url="https://download.example.test/blob",
+                    upload_url="https://upload.example.test/blob",
+                )
+                result = FunctionalEngine("e" * 64).run(
+                    get_scenario("functional.configure"), adapter, _provenance(adapter)
+                )
+                self.assertEqual(result.outcome, "passed")
 
     def test_missing_or_non_executable_adb_fails_closed(self) -> None:
         with self.assertRaisesRegex(HostedAdapterError, "ANDROID_ADB_UNAVAILABLE"):
