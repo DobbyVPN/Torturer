@@ -762,6 +762,7 @@ class AndroidHostedAdapter:
             if allow_partial_timeout and error.code in {
                 "COMMAND_TIMEOUT",
                 "COMMAND_DEADLINE_EXCEEDED",
+                "ADB_DEVICE_UNAVAILABLE",
             }:
                 return self._partial_timeout_result(command)
             raise ScenarioExecutionError(error.code) from error
