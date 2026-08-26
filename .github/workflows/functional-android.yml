@@ -66,6 +66,30 @@ jobs:
           git -C torturer status --porcelain=v1 --untracked-files=all
           test -z "$(git -C torturer status --porcelain=v1 --untracked-files=all)"
 
+      - name: Validate candidate Go version
+        id: go_version
+        shell: bash
+        env:
+          GO_VERSION_FILE: ${{ github.workspace }}/candidate/.go-version
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = Path(os.environ["GO_VERSION_FILE"]).read_text(encoding="utf-8").strip()
+          if not re.fullmatch(r"1\.\d{1,2}(?:\.\d{1,2})?(?:rc\d+|beta\d+)?", version):
+              raise SystemExit("candidate .go-version must contain one supported numeric Go version")
+          Path(os.environ["GITHUB_OUTPUT"]).write_text(f"version={version}\n", encoding="utf-8")
+          PY
+
+      - name: Set up candidate Go version
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: ${{ steps.go_version.outputs.version }}
+          cache: false
+
       - name: Set up JDK 17
         uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95
         with:
@@ -93,7 +117,7 @@ jobs:
           }
           sdk_install_log="$toolchain_dir/sdkmanager-install.raw.log"
           sdk_install_status=0
-          timeout --foreground --signal=TERM --kill-after=10s 300s sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;36.0.0" > "$sdk_install_log" 2>&1 || sdk_install_status=$?
+          timeout --foreground --signal=TERM --kill-after=10s 300s sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;36.0.0" "ndk;27.2.12479018" "cmake;3.22.1" > "$sdk_install_log" 2>&1 || sdk_install_status=$?
           emit_private_evidence android-build-sdkmanager-install "$sdk_install_log"
           if [ "$sdk_install_status" -ne 0 ]; then
             printf 'android_build_toolchain=failed code=SDKMANAGER_INSTALL status=%s\n' "$sdk_install_status" >&2
@@ -107,6 +131,45 @@ jobs:
             printf 'android_build_toolchain=failed code=SDKMANAGER_LIST status=%s\n' "$sdk_list_status" >&2
             exit "$sdk_list_status"
           fi
+          printf 'ANDROID_NDK_HOME=%s/ndk/27.2.12479018\n' "$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Download candidate Go modules
+        shell: bash
+        working-directory: candidate/go_module
+        run: |
+          set -euo pipefail
+          go mod download
+          go mod tidy
+
+      - name: Install pinned gomobile toolchain
+        shell: bash
+        env:
+          CANDIDATE_DIR: ${{ github.workspace }}/candidate
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018
+        run: |
+          set -euo pipefail
+          mobile_version='v0.0.0-20260520154334-0e4426e1883d'
+          go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260520154334-0e4426e1883d
+          go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260520154334-0e4426e1883d
+          gopath="$(go env GOPATH)"
+          tool_dir="$gopath/bin"
+          mkdir -p "$gopath/pkg/gomobile"
+          export PATH="$tool_dir:$PATH"
+          echo "$tool_dir" >> "$GITHUB_PATH"
+          for tool in gomobile gobind; do
+            test -x "$tool_dir/$tool"
+            go version -m "$tool_dir/$tool" | \
+              grep -F 'golang.org/x/mobile' | \
+              grep -F "$mobile_version"
+          done
+          cd "$GITHUB_WORKSPACE/candidate/go_module"
+          go get "golang.org/x/mobile/bind@$(go list -m -f '{{.Version}}' golang.org/x/mobile)"
+          if ! git -C "$CANDIDATE_DIR" diff --quiet --no-ext-diff --; then
+            echo "candidate source mutated during pinned mobile preparation" >&2
+            git -C "$CANDIDATE_DIR" diff --no-ext-diff -- >&2
+            exit 1
+          fi
+          test -z "$(git -C "$CANDIDATE_DIR" status --porcelain=v1 --untracked-files=all)"
 
       - name: Verify checkout and build Android candidate
         shell: bash
