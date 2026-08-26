@@ -157,7 +157,8 @@ jobs:
           import sys
 
           path = Path(sys.argv[1])
-          path.write_text(textwrap.dedent(r'''#!/usr/bin/env python3
+          path.write_text(textwrap.dedent(r'''
+              #!/usr/bin/env python3
               import os
               import signal
               import subprocess
@@ -212,7 +213,7 @@ jobs:
                       process.wait()
                   raise SystemExit(124)
               raise SystemExit(process.returncode)
-          '''), encoding="utf-8")
+          ''').lstrip(), encoding="utf-8")
           path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
           os.chmod(path.parent, 0o700)
           with Path(os.environ["GITHUB_PATH"]).open("a", encoding="utf-8") as output:
