@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import time
 from typing import Mapping
 import uuid
@@ -147,7 +148,7 @@ class AndroidHostedAdapter:
     """Run canonical scenarios through DobbyVPN Android instrumentation."""
 
     adapter_id = "hosted-android-app"
-    adapter_version = "v3"
+    adapter_version = "v4"
 
     def __init__(
         self,
@@ -258,7 +259,13 @@ class AndroidHostedAdapter:
                         _PACKAGE_NAME,
                         "sh",
                         "-c",
-                         f"mkdir -p files && cat > {device_profile}",
+                        # ``adb shell`` joins its argument vector before it
+                        # sends it to the device shell.  Quote the complete
+                        # ``sh -c`` payload so the remote shell passes the
+                        # command as one argument; without this, ``sh -c``
+                        # receives only ``mkdir`` and toybox reports
+                        # ``mkdir: Needs 1 argument``.
+                        shlex.quote(f"mkdir -p files && cat > {device_profile}"),
                     ),
                     _remaining(deadline, "ANDROID_PROFILE_STAGE_TIMEOUT"),
                     "ANDROID_PROFILE_STAGE_FAILED",
@@ -295,7 +302,7 @@ class AndroidHostedAdapter:
                         _PACKAGE_NAME,
                         "sh",
                         "-c",
-                         f"mkdir -p files && cat > {device_command}",
+                        shlex.quote(f"mkdir -p files && cat > {device_command}"),
                     ),
                     _remaining(deadline, "ANDROID_COMMAND_STAGE_TIMEOUT"),
                     "ANDROID_COMMAND_STAGE_FAILED",
