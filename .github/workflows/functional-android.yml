@@ -396,6 +396,39 @@ jobs:
           emulator_pid=$!
           printf '%s\n' "$emulator_pid" > "$HANDOFF_DIR/emulator.pid"
           printf 'EMULATOR_PID=%s\nADB_PATH=%s\nEMULATOR_LOG=%s\n' "$emulator_pid" "$ANDROID_SDK_ROOT/platform-tools/adb" "$emulator_log" >> "$GITHUB_ENV"
+          emulator_exit_diagnostic() {
+            emulator_wait_status=0
+            wait "$emulator_pid" || emulator_wait_status=$?
+            exit_log="$SERVICE_DIR/emulator-exit.raw.log"
+            python3 - "$emulator_log" "$emulator_wait_status" <<'PY' > "$exit_log" 2>&1
+          from hashlib import sha256
+          from pathlib import Path
+          import re
+          import sys
+
+          log_path = Path(sys.argv[1])
+          wait_status = sys.argv[2]
+          payload = log_path.read_bytes() if log_path.is_file() else b""
+          reasons = []
+          for raw_line in payload.decode("utf-8", "replace").splitlines():
+              safe_line = re.sub(r"(?:[A-Za-z]:)?[\\/][^\s,;)]*", "<path>", raw_line)
+              safe_line = re.sub(
+                  r"(?i)\b(?:token|key|secret|password|authorization)\b\s*[:=]\s*\S+",
+                  "<redacted>",
+                  safe_line,
+              )
+              safe_line = re.sub(r"(?i)\b[0-9a-f]{32,}\b", "<hex>", safe_line)
+              safe_line = re.sub(r"\s+", " ", safe_line).strip()
+              if re.search(r"(?i)\b(panic|error|fatal|failed|failure|abort)\b", safe_line):
+                  reasons.append(safe_line[:240])
+          print(f"emulator_wait_status={wait_status}")
+          print(f"emulator_log_bytes={len(payload)}")
+          print(f"emulator_log_sha256={sha256(payload).hexdigest()}")
+          print("emulator_exit_reason=" + (" | ".join(reasons) if reasons else "none"))
+          PY
+            chmod 600 "$exit_log"
+            emit_private_evidence android-emulator-exit "$exit_log"
+          }
           adb="$ANDROID_SDK_ROOT/platform-tools/adb"
           adb_bounded() {
             timeout --foreground --signal=TERM --kill-after=10s 120s "$adb" "$@"
@@ -411,6 +444,7 @@ jobs:
           device_ready=false
           for attempt in $(seq 1 90); do
             if ! kill -0 "$emulator_pid"; then
+              emulator_exit_diagnostic
               emit_private_evidence android-emulator-exited "$emulator_log"
               printf 'android_emulator_readiness=failed code=DEVICE_TIMEOUT\n' >&2
               exit 1
@@ -434,6 +468,7 @@ jobs:
           booted=false
           for attempt in $(seq 1 90); do
             if ! kill -0 "$emulator_pid"; then
+              emulator_exit_diagnostic
               emit_private_evidence android-emulator-boot-exited "$emulator_log"
               printf 'android_emulator_readiness=failed code=BOOT_TIMEOUT\n' >&2
               exit 1
