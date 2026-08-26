@@ -66,30 +66,6 @@ jobs:
           git -C torturer status --porcelain=v1 --untracked-files=all
           test -z "$(git -C torturer status --porcelain=v1 --untracked-files=all)"
 
-      - name: Validate candidate Go version
-        id: go_version
-        shell: bash
-        env:
-          GO_VERSION_FILE: ${{ github.workspace }}/candidate/.go-version
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import os
-          import re
-          from pathlib import Path
-
-          version = Path(os.environ["GO_VERSION_FILE"]).read_text(encoding="utf-8").strip()
-          if not re.fullmatch(r"1\.\d{1,2}(?:\.\d{1,2})?(?:rc\d+|beta\d+)?", version):
-              raise SystemExit("candidate .go-version must contain one supported numeric Go version")
-          Path(os.environ["GITHUB_OUTPUT"]).write_text(f"version={version}\n", encoding="utf-8")
-          PY
-
-      - name: Set up candidate Go version
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
-        with:
-          go-version: ${{ steps.go_version.outputs.version }}
-          cache: false
-
       - name: Set up JDK 17
         uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95
         with:
@@ -164,7 +140,7 @@ jobs:
           done
           cd "$GITHUB_WORKSPACE/candidate/go_module"
           go get "golang.org/x/mobile/bind@$(go list -m -f '{{.Version}}' golang.org/x/mobile)"
-          if ! git -C "$CANDIDATE_DIR" diff --quiet --no-ext-diff --; then
+          if ! git -C "$CANDIDATE_DIR" diff --no-ext-diff --exit-code --; then
             echo "candidate source mutated during pinned mobile preparation" >&2
             git -C "$CANDIDATE_DIR" diff --no-ext-diff -- >&2
             exit 1
