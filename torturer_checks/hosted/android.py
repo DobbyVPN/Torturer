@@ -253,6 +253,7 @@ class AndroidHostedAdapter:
                 self._adb(
                     (
                         "shell",
+                        "-T",
                         "run-as",
                         _PACKAGE_NAME,
                         "sh",
@@ -289,6 +290,7 @@ class AndroidHostedAdapter:
                 self._adb(
                     (
                         "shell",
+                        "-T",
                         "run-as",
                         _PACKAGE_NAME,
                         "sh",
