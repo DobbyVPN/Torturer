@@ -49,8 +49,15 @@ for raw_path in sys.argv[1:]:
     descriptor = os.open(raw_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
         details = os.fstat(descriptor)
-        if not stat.S_ISREG(details.st_mode) or stat.S_IMODE(details.st_mode) != 0o600:
-            raise SystemExit("private-gh-api evidence inode is unsafe")
+        # Git Bash maps NTFS ACLs to synthetic POSIX mode bits, so a file
+        # created under ``umask 077`` can still report 0666 through fstat.
+        # The runner's private temp directory and inherited Windows ACL are
+        # the confidentiality boundary there; keep the strict mode check on
+        # POSIX while still requiring a regular file on every platform.
+        if not stat.S_ISREG(details.st_mode) or (
+            os.name != "nt" and stat.S_IMODE(details.st_mode) != 0o600
+        ):
+            raise SystemExit("private-gh-api evidence file is unsafe")
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
