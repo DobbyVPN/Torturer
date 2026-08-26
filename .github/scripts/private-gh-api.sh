@@ -100,6 +100,20 @@ for raw_line in payload.decode("utf-8", "replace").splitlines():
         safe_line,
     ):
         reasons.append(safe_line[:240])
+if not reasons:
+    for raw_line in payload.decode("utf-8", "replace").splitlines():
+        safe_line = re.sub(r"https?://[^\s]+", "<url>", raw_line)
+        safe_line = re.sub(
+            r"(?i)\b(?:token|key|secret|password|authorization)\b\s*[:=]\s*\S+",
+            "<redacted>",
+            safe_line,
+        )
+        safe_line = re.sub(r"(?:[A-Za-z]:)?[\\/][^\s,;)]*", "<path>", safe_line)
+        safe_line = re.sub(r"(?i)\b[0-9a-f]{32,}\b", "<hex>", safe_line)
+        safe_line = re.sub(r"\s+", " ", safe_line).strip()
+        if safe_line:
+            reasons.append(safe_line[:240])
+            break
 print("github_api_error_reason=" + (" | ".join(reasons[:4]) if reasons else "unclassified"))
 PY
 fi
