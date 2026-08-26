@@ -129,9 +129,10 @@ jobs:
           set -euo pipefail
           handoff="$RUNNER_TEMP/dobbyvpn-render-handoff"
           service="$RUNNER_TEMP/dobbyvpn-service"
-          mkdir -p "$handoff" "$service"
-          printf 'HANDOFF_DIR=%s\nSERVICE_DIR=%s\nRESULT_PATH=%s\nLEASE_RUN_ID=unassigned\n' \
-            "$handoff" "$service" "$handoff/functional-result.json" >> "$GITHUB_ENV"
+          diagnostics="$RUNNER_TEMP/dobbyvpn-diagnostics"
+          mkdir -p "$handoff" "$service" "$diagnostics"
+          printf 'HANDOFF_DIR=%s\nSERVICE_DIR=%s\nDIAGNOSTIC_DIR=%s\nRESULT_PATH=%s\nLEASE_RUN_ID=unassigned\n' \
+            "$handoff" "$service" "$diagnostics" "$handoff/functional-result.json" >> "$GITHUB_ENV"
 
       - name: Prove macOS client runner architecture and elevation
         shell: bash
@@ -325,8 +326,11 @@ jobs:
           }
           # The preflight process is stopped and verified before any token-bearing Render step.
           mkdir -p "$SERVICE_DIR"
+          mkdir -p "$DIAGNOSTIC_DIR"
           control_socket="$SERVICE_DIR/preflight.control.sock"
-          service_log="$SERVICE_DIR/preflight-service.raw.log"
+          service_log="$DIAGNOSTIC_DIR/preflight-service.raw.log"
+          : > "$service_log"
+          chmod 600 "$service_log"
           service_binary="$GITHUB_WORKSPACE/candidate/macos_grpcvpnserver"
           peer_uid="$(id -u)"
           service_pid="$(sudo -n sh -c 'set -eu; env DOBBYVPN_CONTROL_SOCKET="$1" DOBBYVPN_CONTROL_PEER_UID="$2" "$3" > "$4" 2>&1 & printf "%s\n" "$!"' dobbyvpn-preflight-service "$control_socket" "$peer_uid" "$service_binary" "$service_log")"
@@ -359,7 +363,7 @@ jobs:
           socket_owner="$(stat -f '%Su' "$control_socket")"
           printf 'preflight_control_socket_ready=1\n'
           test "$socket_mode" = 600
-          status_log="$SERVICE_DIR/preflight-control-status.raw.log"
+          status_log="$DIAGNOSTIC_DIR/preflight-control-status.raw.log"
           status_code=0
           DOBBYVPN_CONTROL_SOCKET="$control_socket" "$GITHUB_WORKSPACE/candidate/dobby-cli" status > "$status_log" 2>&1 || status_code=$?
           emit_private_evidence preflight-control-status "$status_log"
@@ -419,7 +423,7 @@ jobs:
             stopped=true
           fi
           test "$stopped" = true
-          children_snapshot="$SERVICE_DIR/preflight-children.raw.log"
+          children_snapshot="$DIAGNOSTIC_DIR/preflight-children.raw.log"
           children_status=0
           ps -axo pid=,ppid=,command= > "$children_snapshot" 2>&1 || children_status=$?
           children_count="$(awk -v parent="$service_pid" '$2 == parent {count++} END {print count + 0}' "$children_snapshot")"
@@ -558,8 +562,11 @@ jobs:
           }
           # This is the second start: all Render credential-bearing operations have finished.
           mkdir -p "$SERVICE_DIR"
+          mkdir -p "$DIAGNOSTIC_DIR"
           control_socket="$SERVICE_DIR/control.sock"
-          service_log="$SERVICE_DIR/service.raw.log"
+          service_log="$DIAGNOSTIC_DIR/service.raw.log"
+          : > "$service_log"
+          chmod 600 "$service_log"
           service_binary="$GITHUB_WORKSPACE/candidate/macos_grpcvpnserver"
           peer_uid="$(id -u)"
           service_pid="$(sudo -n sh -c 'set -eu; env DOBBYVPN_CONTROL_SOCKET="$1" DOBBYVPN_CONTROL_PEER_UID="$2" "$3" > "$4" 2>&1 & printf "%s\n" "$!"' dobbyvpn-service "$control_socket" "$peer_uid" "$service_binary" "$service_log")"
@@ -592,7 +599,7 @@ jobs:
           socket_owner="$(stat -f '%Su' "$control_socket")"
           printf 'control_socket_ready=1\n'
           test "$socket_mode" = 600
-          status_log="$SERVICE_DIR/control-status.raw.log"
+          status_log="$DIAGNOSTIC_DIR/control-status.raw.log"
           status_code=0
           DOBBYVPN_CONTROL_SOCKET="$control_socket" "$GITHUB_WORKSPACE/candidate/dobby-cli" status > "$status_log" 2>&1 || status_code=$?
           emit_private_evidence control-status "$status_log"
@@ -663,7 +670,7 @@ jobs:
               done
             fi
             test "$stopped" = true
-            children_snapshot="$SERVICE_DIR/service-children.raw.log"
+            children_snapshot="$DIAGNOSTIC_DIR/service-children.raw.log"
             children_status=0
             ps -axo pid=,ppid=,command= > "$children_snapshot" 2>&1 || children_status=$?
             children_count="$(awk -v parent="$service_pid" '$2 == parent {count++} END {print count + 0}' "$children_snapshot")"

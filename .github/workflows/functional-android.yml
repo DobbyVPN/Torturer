@@ -383,14 +383,29 @@ jobs:
             fi
           }
           avd_name=dobby-functional-api35
+          avd_home="$SERVICE_DIR/avd"
+          mkdir -p "$avd_home"
+          export ANDROID_AVD_HOME="$avd_home"
+          printf 'ANDROID_AVD_HOME=%s\n' "$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
           avd_log="$SERVICE_DIR/avdmanager-create.raw.log"
           avd_status=0
-          timeout --foreground --signal=TERM --kill-after=10s 120s avdmanager create avd --force --name "$avd_name" --package "system-images;android-35;google_apis;x86_64" --device pixel > "$avd_log" 2>&1 || avd_status=$?
+          printf 'no\n' | timeout --foreground --signal=TERM --kill-after=10s 120s avdmanager create avd --force --name "$avd_name" --package "system-images;android-35;google_apis;x86_64" --device pixel > "$avd_log" 2>&1 || avd_status=$?
           emit_private_evidence android-avdmanager-create "$avd_log"
           if [ "$avd_status" -ne 0 ]; then
             printf 'android_avd_setup=failed code=AVDMANAGER_CREATE status=%s\n' "$avd_status" >&2
             exit "$avd_status"
           fi
+          avd_list_log="$SERVICE_DIR/avdmanager-list.raw.log"
+          avd_list_status=0
+          timeout --foreground --signal=TERM --kill-after=10s 30s avdmanager list avd > "$avd_list_log" 2>&1 || avd_list_status=$?
+          emit_private_evidence android-avdmanager-list "$avd_list_log"
+          if [ "$avd_list_status" -ne 0 ]; then
+            printf 'android_avd_setup=failed code=AVDMANAGER_LIST status=%s\n' "$avd_list_status" >&2
+            exit "$avd_list_status"
+          fi
+          test -f "$avd_home/$avd_name.ini"
+          test -d "$avd_home/$avd_name.avd"
+          printf 'android_avd_ready=true name=%s home=%s\n' "$avd_name" "$ANDROID_AVD_HOME"
           emulator_log="$SERVICE_DIR/emulator.raw.log"
           setsid timeout --foreground --signal=TERM --kill-after=10s 1500s "$ANDROID_SDK_ROOT/emulator/emulator" -avd "$avd_name" -port 5554 -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -accel on -no-snapshot -wipe-data > "$emulator_log" 2>&1 &
           emulator_pid=$!
