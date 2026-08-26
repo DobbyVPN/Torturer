@@ -47,6 +47,12 @@ def _observation(error_code: str | None = None) -> bytes:
         "second_routing_identity_changed": True,
         "final_disconnect_clean": True,
         "cleanup_verified": True,
+        # The candidate emits these additive fields even though hosted
+        # Android currently advertises none of the corresponding external
+        # control capabilities.
+        "network_transition_verified": False,
+        "sleep_wake_verified": False,
+        "process_loss_verified": False,
     }
     if error_code is not None:
         value["error_code"] = error_code

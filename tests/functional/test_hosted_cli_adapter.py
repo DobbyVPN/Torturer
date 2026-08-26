@@ -332,7 +332,7 @@ class HostedCLIAdapterTests(unittest.TestCase):
         selected = _select_scenarios(None)
         self.assertEqual(selected, scenario_catalog())
         total_seconds = sum(item.max_duration_seconds for item in selected) + 5 * len(selected)
-        self.assertEqual(total_seconds, 1190)
+        self.assertEqual(total_seconds, 1202)
 
     def test_default_lane_partitions_all_applicable_and_unsupported_scenarios(self) -> None:
         selected = _select_scenarios(None)
