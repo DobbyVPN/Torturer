@@ -203,6 +203,10 @@ class SubprocessRunner:
             monitor_stopped = monitor.stop(
                 _remaining_until(deadline, cap=cleanup_reserve)
             )
+            # The macOS census is cached for monitor sampling.  Force a fresh
+            # snapshot after the leader has exited before proving its tree is
+            # gone; otherwise a just-exited leader can look alive briefly.
+            snapshot_provider.invalidate()
             tree_diagnostics, tree_status = _finish_process_tree(
                 process,
                 monitor.identities,
@@ -752,6 +756,12 @@ class _ProcessSnapshotProvider:
         self._has_cached = False
         self._diagnostics = bytearray()
 
+    def invalidate(self) -> None:
+        """Discard a cached census before a lifecycle proof boundary."""
+
+        with self._lock:
+            self._has_cached = False
+
     def __call__(self) -> dict[int, tuple[int, int, str, str]] | None:
         if os.name != "posix" or Path("/proc").is_dir():
             return _process_snapshot()
@@ -921,6 +931,8 @@ def _finish_process_tree(
     """Prove a normally-returned leader left no observed descendant behind."""
 
     deadline = time.monotonic() + max(0.0, timeout)
+    if snapshot_provider is not None:
+        snapshot_provider.invalidate()
     identities = _merge_process_identities(
         observed,
         _tracked_processes(process.pid, snapshot_provider),
@@ -944,6 +956,8 @@ def _finish_process_tree(
                 snapshot_provider=snapshot_provider,
             )
         )
+        if snapshot_provider is not None:
+            snapshot_provider.invalidate()
         status = _tree_status(process.pid, identities, snapshot_provider)
     if status == "gone":
         diagnostics.extend(b"PROCESS_TREE_STATUS=gone\n")
@@ -1121,6 +1135,8 @@ def _kill_process_tree(
     diagnostics = bytearray()
     timeout = max(0.0, timeout)
     deadline = time.monotonic() + timeout
+    if snapshot_provider is not None:
+        snapshot_provider.invalidate()
     identities = _merge_process_identities(
         identities,
         _tracked_processes(process.pid, snapshot_provider),
@@ -1224,6 +1240,8 @@ def _kill_process_tree(
                 + repr(error).encode("utf-8", errors="replace")
                 + b"\n"
             )
+        if snapshot_provider is not None:
+            snapshot_provider.invalidate()
         status = _wait_tree_gone(process.pid, identities, deadline, snapshot_provider)
     if status != "gone":
         diagnostics.extend(b"PROCESS_TREE_SURVIVORS=1\n")

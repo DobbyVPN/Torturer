@@ -740,6 +740,30 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], 0.25)
         self.assertIn(b"ps diagnostic\n", provider.diagnostics)
 
+    def test_macos_process_census_can_be_invalidated_at_proof_boundary(self) -> None:
+        first = subprocess.CompletedProcess(
+            ("ps",),
+            0,
+            b"123 1 123 Mon Aug 23 10:00:00 2026\n",
+            b"",
+        )
+        second = subprocess.CompletedProcess(("ps",), 0, b"", b"")
+        with (
+            mock.patch.object(Path, "is_dir", return_value=False),
+            mock.patch(
+                "torturer_checks.hosted.cli.subprocess.run",
+                side_effect=[first, second],
+            ) as run,
+        ):
+            provider = _ProcessSnapshotProvider()
+            self.assertEqual(len(provider()), 1)
+            # The monitor's short cache is intentional, but must not cross a
+            # completion/cleanup proof boundary.
+            self.assertEqual(len(provider()), 1)
+            provider.invalidate()
+            self.assertEqual(provider(), {})
+        self.assertEqual(run.call_count, 2)
+
     def test_subprocess_runner_never_overwrites_another_runner_sequence(self) -> None:
         raw = Path(self.directory.name) / "shared-raw"
         first = SubprocessRunner(raw)
