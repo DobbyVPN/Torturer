@@ -20,6 +20,7 @@ import select
 import signal
 import stat
 import subprocess
+import sys
 import threading
 import time
 from typing import Protocol, Sequence
@@ -37,6 +38,8 @@ _MIN_PROCESS_CLEANUP_SECONDS = 0.01
 _PROCESS_REAP_RESERVE_SECONDS = 0.05
 _PROCESS_TREE_PROOF_RESERVE_SECONDS = 0.05
 _PROCESS_TREE_MONITOR_STOP_RESERVE_SECONDS = 0.01
+_ROUTE_CONVERGENCE_POLL_SECONDS = 0.5
+_SUBREAPER_STATUS_LIMIT = 1024
 
 
 def _opaque_evidence_id() -> str:
@@ -200,14 +203,53 @@ class SubprocessRunner:
             deadline,
             cap=max(0.0, timeout_seconds - cleanup_reserve),
         )
+        status_reader: int | None = None
+        status_writer: int | None = None
+        try:
+            if _linux_containment_required():
+                status_reader, status_writer = os.pipe()
+                launch_argv = _linux_contained_argv(
+                    argv,
+                    status_fd=status_writer,
+                )
+            else:
+                launch_argv = argv
+        except OSError as error:
+            _close_descriptor(status_reader)
+            _close_descriptor(status_writer)
+            self._retain_runner_failure(
+                argv,
+                "SUBREAPER_UNAVAILABLE",
+                time.monotonic() - started,
+            )
+            raise HostedAdapterError("SUBREAPER_UNAVAILABLE") from error
+        except HostedAdapterError as error:
+            _close_descriptor(status_reader)
+            _close_descriptor(status_writer)
+            self._retain_runner_failure(
+                argv,
+                error.code,
+                time.monotonic() - started,
+            )
+            raise
         process: subprocess.Popen[bytes] | None = None
         try:
-            process = subprocess.Popen(
-                list(argv),
-                stdin=subprocess.PIPE if input_bytes is not None else None,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                **_process_group_kwargs(),
+            popen_kwargs: dict[str, object] = _process_group_kwargs()
+            if status_writer is not None:
+                popen_kwargs["pass_fds"] = (status_writer,)
+            try:
+                process = subprocess.Popen(
+                    list(launch_argv),
+                    stdin=subprocess.PIPE if input_bytes is not None else None,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    **popen_kwargs,
+                )
+            finally:
+                _close_descriptor(status_writer)
+                status_writer = None
+            process._torturer_subreaper_contained = (  # type: ignore[attr-defined]
+                launch_argv != argv
             )
             snapshot_provider = _ProcessSnapshotProvider()
             monitor = _ProcessTreeMonitor(
@@ -241,6 +283,13 @@ class SubprocessRunner:
                 snapshot_provider=snapshot_provider,
                 deadline=deadline,
             )
+            subreaper_diagnostics, subreaper_failure = _consume_subreaper_status(
+                status_reader,
+                required=launch_argv != argv,
+                deadline=deadline,
+            )
+            status_reader = None
+            tree_diagnostics += subreaper_diagnostics
             tree_diagnostics += snapshot_provider.diagnostics
             result = CommandResult(argv, process.returncode, stdout, stderr)
             self._retain(result, time.monotonic() - started, tree_diagnostics)
@@ -249,6 +298,8 @@ class SubprocessRunner:
                 raise HostedAdapterError("COMMAND_DEADLINE_EXCEEDED")
             if tree_status != "gone":
                 raise HostedAdapterError("PROCESS_TREE_UNPROVEN")
+            if launch_argv != argv and subreaper_failure is not None:
+                raise HostedAdapterError(subreaper_failure)
             return result
         except subprocess.TimeoutExpired as error:
             partial_stdout = _output_bytes(error.stdout)
@@ -445,6 +496,14 @@ class SubprocessRunner:
                 kill_diagnostics += b"PROCESS_TREE_STATUS=gone\n"
             else:
                 kill_diagnostics += b"EVIDENCE_INCOMPLETE=1 reason=final-tree\n"
+            subreaper_diagnostics, _subreaper_failure = _consume_subreaper_status(
+                status_reader,
+                required=launch_argv != argv,
+                expect_complete=False,
+                deadline=deadline,
+            )
+            status_reader = None
+            kill_diagnostics += subreaper_diagnostics
             stdout = _merge_output(partial_stdout, recovered_stdout)
             stderr = _merge_output(partial_stderr, recovered_stderr)
             result = CommandResult(argv, 124, stdout, stderr, timed_out=True)
@@ -504,6 +563,14 @@ class SubprocessRunner:
                         + repr(reap_error).encode("utf-8", errors="replace")
                         + b"\nEVIDENCE_INCOMPLETE=1 reason=process-reap-error\n"
                     )
+                subreaper_diagnostics, _subreaper_failure = _consume_subreaper_status(
+                    status_reader,
+                    required=launch_argv != argv,
+                    expect_complete=False,
+                    deadline=deadline,
+                )
+                status_reader = None
+                diagnostics.extend(subreaper_diagnostics)
                 self._retain(
                     CommandResult(
                         argv,
@@ -515,6 +582,9 @@ class SubprocessRunner:
                     bytes(diagnostics),
                 )
             raise HostedAdapterError("COMMAND_UNAVAILABLE") from error
+        finally:
+            _close_descriptor(status_reader)
+            _close_descriptor(status_writer)
         self._retain(result, time.monotonic() - started, b"PROCESS_TREE_STATUS=gone\n")
         return result
 
@@ -763,6 +833,42 @@ class SubprocessRunner:
             "evidence_sha256": evidence_sha256,
         })
 
+    def _retain_runner_failure(
+        self,
+        command: Sequence[str],
+        code: str,
+        duration_seconds: float,
+    ) -> None:
+        """Retain a fail-closed runner setup error without losing original argv."""
+
+        label = f"command-{self._sequence:03d}"
+        path, descriptor = self._allocate_evidence(label, ".runner-error.raw.log")
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(
+                b"argv="
+                + " ".join(command).encode("utf-8", errors="replace")
+                + b"\nrunner_error="
+                + code.encode("ascii", errors="replace")
+                + b"\n"
+            )
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(path, 0o600)
+        evidence_bytes, evidence_sha256 = _evidence_metadata(path)
+        self._evidence.append({
+            "sequence": self._sequence,
+            "evidence_id": _opaque_evidence_id(),
+            "evidence_file": path.name,
+            "returncode": None,
+            "timed_out": False,
+            "duration_ms": max(0, int(duration_seconds * 1000)),
+            "stdout_bytes": 0,
+            "stderr_bytes": 0,
+            "runner_error": code,
+            "evidence_bytes": evidence_bytes,
+            "evidence_sha256": evidence_sha256,
+        })
+
     def _allocate_evidence(self, label: str, suffix: str) -> tuple[Path, int]:
         """Reserve a fresh evidence file without ever replacing an old one."""
 
@@ -835,6 +941,138 @@ def _process_group_kwargs() -> dict[str, int | bool]:
         creation_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         return {"creationflags": creation_flag} if creation_flag else {}
     return {"start_new_session": True}
+
+
+def _linux_containment_required() -> bool:
+    """Return whether this host can use the Linux command supervisor."""
+
+    return os.name == "posix" and Path("/proc").is_dir()
+
+
+def _linux_contained_argv(
+    command: Sequence[str],
+    *,
+    status_fd: int,
+) -> tuple[str, ...]:
+    """Keep orphaned Linux descendants owned by one command supervisor."""
+
+    if not _linux_containment_required():
+        return tuple(command)
+    if status_fd < 0:
+        raise HostedAdapterError("SUBREAPER_UNAVAILABLE")
+    helper = Path(__file__).resolve().with_name("linux_subreaper.py")
+    try:
+        info = helper.stat()
+    except OSError as error:
+        raise HostedAdapterError("SUBREAPER_UNAVAILABLE") from error
+    if not stat.S_ISREG(info.st_mode):
+        raise HostedAdapterError("SUBREAPER_UNAVAILABLE")
+    return (
+        sys.executable,
+        str(helper),
+        "--status-fd",
+        str(status_fd),
+        "--",
+        *command,
+    )
+
+
+def _close_descriptor(descriptor: int | None) -> None:
+    if descriptor is None:
+        return
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+def _consume_subreaper_status(
+    descriptor: int | None,
+    *,
+    required: bool,
+    deadline: float,
+    expect_complete: bool = True,
+) -> tuple[bytes, str | None]:
+    """Read and validate the helper-only control channel after process exit."""
+
+    if descriptor is None:
+        if required:
+            return (
+                b"SUBREAPER_STATUS=MISSING\n"
+                b"EVIDENCE_INCOMPLETE=1 reason=subreaper-status\n",
+                "SUBREAPER_UNAVAILABLE",
+            )
+        return b"", None
+
+    status = bytearray()
+    read_error = False
+    read_timed_out = False
+    try:
+        try:
+            os.set_blocking(descriptor, False)
+        except OSError:
+            read_error = True
+        while len(status) <= _SUBREAPER_STATUS_LIMIT:
+            if read_error:
+                break
+            try:
+                chunk = os.read(descriptor, _SUBREAPER_STATUS_LIMIT + 1 - len(status))
+            except InterruptedError:
+                continue
+            except BlockingIOError:
+                remaining = _remaining_until(deadline)
+                if remaining <= 0:
+                    read_timed_out = True
+                    break
+                try:
+                    readable, _, _ = select.select(
+                        [descriptor],
+                        [],
+                        [],
+                        remaining,
+                    )
+                except (OSError, ValueError):
+                    read_error = True
+                    break
+                if not readable:
+                    read_timed_out = True
+                    break
+                continue
+            except OSError:
+                read_error = True
+                break
+            if not chunk:
+                break
+            status.extend(chunk)
+    finally:
+        _close_descriptor(descriptor)
+
+    records = tuple(status.splitlines())
+    diagnostics = b"SUBREAPER_STATUS_BEGIN\n" + bytes(status)
+    if status and not status.endswith(b"\n"):
+        diagnostics += b"\n"
+    diagnostics += b"SUBREAPER_STATUS_END\n"
+    if read_error or read_timed_out or len(status) > _SUBREAPER_STATUS_LIMIT:
+        if read_timed_out:
+            diagnostics += b"SUBREAPER_STATUS_READ_TIMEOUT=1\n"
+        return (
+            diagnostics
+            + b"SUBREAPER_STATUS_INVALID=1\n"
+            + b"EVIDENCE_INCOMPLETE=1 reason=subreaper-status\n",
+            "SUBREAPER_UNAVAILABLE",
+        )
+    if not expect_complete:
+        return diagnostics + b"SUBREAPER_STATUS_INTERRUPTED=1\n", None
+    if records == (b"READY", b"COMPLETE"):
+        return diagnostics, None
+    if b"EXEC_FAILED" in records:
+        return diagnostics, "COMMAND_UNAVAILABLE"
+    return (
+        diagnostics
+        + b"SUBREAPER_STATUS_INVALID=1\n"
+        + b"EVIDENCE_INCOMPLETE=1 reason=subreaper-status\n",
+        "SUBREAPER_UNAVAILABLE",
+    )
 
 
 @dataclass(frozen=True)
@@ -926,6 +1164,128 @@ def _proc_stat(
         # Permission, malformed, and other read failures must not be folded
         # into "gone" by callers that have time left to retry/prove them.
         raise _ProcessProbeError from error
+
+
+def _linux_child_pids(
+    pid: int, *, deadline: float | None = None,
+) -> tuple[int, ...] | None:
+    """Return direct Linux children without enumerating every host process.
+
+    Linux records children per task rather than only on the thread-group
+    leader. Read every task's ``children`` file so a child created by a
+    worker thread remains part of the launched tree. A vanished task is an
+    ordinary lifecycle race; malformed, unreadable, or deadline-crossing
+    state is inconclusive and therefore fails closed.
+    """
+
+    if deadline is not None and time.monotonic() >= deadline:
+        return None
+    task_directory = Path(f"/proc/{pid}/task")
+    try:
+        tasks = tuple(task_directory.iterdir())
+    except FileNotFoundError:
+        return ()
+    except OSError as error:
+        raise _ProcessProbeError from error
+    children: set[int] = set()
+    for task in tasks:
+        if deadline is not None and time.monotonic() >= deadline:
+            return None
+        if not task.name.isdigit():
+            continue
+        try:
+            value = (task / "children").read_text(encoding="ascii")
+        except FileNotFoundError:
+            # The task vanished after it was listed. This sample cannot prove
+            # whether it created a child immediately before exit, so the
+            # complete tree is unknown and the monitor must retry.
+            return None
+        except OSError as error:
+            raise _ProcessProbeError from error
+        if deadline is not None and time.monotonic() > deadline:
+            return None
+        for field in value.split():
+            try:
+                child = int(field)
+            except ValueError as error:
+                raise _ProcessProbeError from error
+            if child <= 0:
+                raise _ProcessProbeError
+            children.add(child)
+    return tuple(sorted(children))
+
+
+def _linux_tracked_processes(
+    root_pid: int,
+    *,
+    deadline: float | None = None,
+    process: subprocess.Popen[bytes] | None = None,
+) -> tuple[_ProcessIdentity, ...]:
+    """Capture only one launched Linux tree using targeted procfs links."""
+
+    pending: list[tuple[int, int | None]] = [(root_pid, None)]
+    seen: set[int] = set()
+    identities: list[_ProcessIdentity] = []
+    while pending:
+        if deadline is not None and time.monotonic() >= deadline:
+            if process is not None:
+                process._torturer_tree_census_observed = False  # type: ignore[attr-defined]
+            return ()
+        pid, expected_parent = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        try:
+            value = _proc_stat(pid, deadline=deadline)
+            children = _linux_child_pids(pid, deadline=deadline)
+        except _ProcessProbeError:
+            if process is not None:
+                process._torturer_tree_census_observed = False  # type: ignore[attr-defined]
+            return ()
+        if children is None:
+            if process is not None:
+                process._torturer_tree_census_observed = False  # type: ignore[attr-defined]
+            return ()
+        if value is None:
+            if (
+                pid == root_pid
+                and expected_parent is None
+                and process is not None
+                and getattr(process, "_torturer_subreaper_contained", False)
+                and process.poll() is not None
+                and process.returncode is not None
+                and process.returncode >= 0
+            ):
+                # The trusted supervisor exits only after reaping every
+                # adopted descendant. Its normal exit is therefore a complete
+                # empty-tree observation even though procfs already vanished.
+                process._torturer_tree_census_observed = True  # type: ignore[attr-defined]
+                return ()
+            if process is not None:
+                process._torturer_tree_census_observed = False  # type: ignore[attr-defined]
+            return ()
+        parent_pid, process_group, start_time, _state = value
+        if expected_parent is not None and parent_pid != expected_parent:
+            if process is not None:
+                process._torturer_tree_census_observed = False  # type: ignore[attr-defined]
+            return ()
+        try:
+            confirmed = _proc_stat(pid, deadline=deadline)
+        except _ProcessProbeError:
+            confirmed = None
+        if confirmed is None or confirmed[1:3] != value[1:3]:
+            # Do not bind children read from one process lifetime to a reused
+            # PID observed moments later.
+            if process is not None:
+                process._torturer_tree_census_observed = False  # type: ignore[attr-defined]
+            return ()
+        identities.append(
+            _ProcessIdentity(pid, str(start_time), process_group)
+        )
+        pending.extend((child, pid) for child in children)
+    if process is not None:
+        process._torturer_tree_census_observed = True  # type: ignore[attr-defined]
+    return tuple(identities)
 
 
 def _windows_process_start_time(
@@ -1241,6 +1601,12 @@ def _tracked_processes(
     deadline: float | None = None,
     process: subprocess.Popen[bytes] | None = None,
 ) -> tuple[_ProcessIdentity, ...]:
+    if os.name == "posix" and Path("/proc").is_dir():
+        return _linux_tracked_processes(
+            root_pid,
+            deadline=deadline,
+            process=process,
+        )
     snapshot = (
         snapshot_provider(deadline)
         if snapshot_provider is not None
@@ -1353,6 +1719,11 @@ def _tree_status(
             )
             if direct_status != "unknown":
                 return direct_status
+            if deadline is not None and time.monotonic() >= deadline:
+                # Do not start a whole-host fallback census after the proof
+                # interval has already expired. The direct probe remains
+                # inconclusive and cleanup therefore fails closed.
+                return "unknown"
         snapshot = (
             snapshot_provider(deadline)
             if snapshot_provider is not None
@@ -1418,15 +1789,21 @@ def _direct_tree_status(
         return "unknown"
     if any(live):
         return "alive"
+    if deadline is not None and time.monotonic() >= deadline:
+        return "unknown"
     try:
         os.killpg(root_pid, 0)
     except ProcessLookupError:
-        return "gone"
+        status = "gone"
     except PermissionError:
         return "unknown"
     except OSError:
         return "unknown"
-    return "alive"
+    else:
+        status = "alive"
+    if deadline is not None and time.monotonic() > deadline:
+        return "unknown"
+    return status
 
 
 def _merge_process_identities(
@@ -1519,8 +1896,18 @@ def _wait_tree_gone(
     *,
     allow_direct_fallback: bool = False,
     census_complete: bool = False,
+    process: subprocess.Popen[bytes] | None = None,
 ) -> str:
     while time.monotonic() < deadline:
+        if process is not None:
+            try:
+                # Reap an exited leader without waiting. Otherwise its zombie
+                # keeps the process group observable even after every member
+                # has received SIGKILL, forcing an unrelated global census to
+                # distinguish a zombie-only group from a live survivor.
+                process.poll()
+            except OSError:
+                return "unknown"
         status = _tree_status(
             root_pid,
             identities,
@@ -2019,6 +2406,7 @@ def _kill_process_tree(
             snapshot_provider,
             allow_direct_fallback=True,
             census_complete=census_complete,
+            process=process,
         )
         if status != "gone":
             # A detached child is no longer reachable through the leader's
@@ -2064,6 +2452,7 @@ def _kill_process_tree(
                 snapshot_provider,
                 allow_direct_fallback=True,
                 census_complete=census_complete,
+                process=process,
             )
         if status != "gone":
             diagnostics.extend(b"PROCESS_TREE_KILL_FAILURE=1\n")
@@ -2099,6 +2488,7 @@ def _kill_process_tree(
             snapshot_provider,
             allow_direct_fallback=True,
             census_complete=census_complete,
+            process=process,
         )
         if status == "gone":
             diagnostics.extend(b"PROCESS_TREE_STATUS=gone\n")
@@ -2133,6 +2523,7 @@ def _kill_process_tree(
         snapshot_provider,
         allow_direct_fallback=True,
         census_complete=census_complete,
+        process=process,
     )
     if status != "gone":
         diagnostics.extend(
@@ -2162,6 +2553,7 @@ def _kill_process_tree(
             snapshot_provider,
             allow_direct_fallback=True,
             census_complete=census_complete,
+            process=process,
         )
     if status != "gone":
         diagnostics.extend(b"PROCESS_TREE_SURVIVORS=1\n")
@@ -2447,7 +2839,7 @@ class HostedCLIAdapter:
             key = "second_tunnel_interface" if step.id == "second-tunnel" else "tunnel_interface"
             return {key: self._connected(timeout)}
         if operation == "observe_routing_identity":
-            changed = self._routing_identity_changed(timeout)
+            changed = self._wait_for_routing_identity_changed(timeout)
             key = "second_routing_identity_changed" if step.id == "second-routing" else "routing_identity_changed"
             return {key: changed}
         if operation == "measure_stability":
@@ -2517,8 +2909,25 @@ class HostedCLIAdapter:
 
     def _routing_identity_changed(self, timeout: float) -> bool:
         current = self._external_ip(timeout)
-        self._tunneled_ips.add(current)
-        return self._baseline_ip is not None and current != self._baseline_ip
+        changed = self._baseline_ip is not None and current != self._baseline_ip
+        if changed:
+            self._tunneled_ips.add(current)
+        return changed
+
+    def _wait_for_routing_identity_changed(self, timeout: float) -> bool:
+        """Observe eventual route convergence within the caller's step bound."""
+
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if self._routing_identity_changed(remaining):
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(_ROUTE_CONVERGENCE_POLL_SECONDS, remaining))
 
     def _connected(self, timeout: float) -> bool:
         result = self._command(("status", "--json"), timeout, "STATUS_FAILED")
@@ -2586,10 +2995,10 @@ class HostedCLIAdapter:
                 return {"endurance_verified": True, **last_metrics}
             # A download/upload pair needs a meaningful transfer window. Take
             # one complete traffic sample, then spend the rest of the bounded
-            # interval observing the live session. Repeating public transfer
-            # endpoints throughout the interval makes the endurance result
-            # depend on an unrelated endpoint's transient rate limit rather
-            # than on the VPN session remaining routed and responsive.
+            # interval observing the live session. Repeating transfers
+            # throughout the interval makes the endurance result depend on a
+            # transient measurement-service response rather than on the VPN
+            # session remaining routed and responsive.
             if last_metrics and remaining < _MIN_ENDURANCE_SAMPLE_SECONDS:
                 time.sleep(remaining)
                 return {"endurance_verified": True, **last_metrics}
@@ -2601,7 +3010,7 @@ class HostedCLIAdapter:
                     raise ScenarioExecutionError("ENDURANCE_STATUS_TIMEOUT") from error
                 raise
             try:
-                if not self._routing_identity_changed(min(30.0, remaining)):
+                if not self._wait_for_routing_identity_changed(min(30.0, remaining)):
                     raise ScenarioExecutionError("ENDURANCE_ROUTING_LOST")
             except ScenarioExecutionError as error:
                 if error.reason_code == "COMMAND_TIMEOUT":
@@ -2727,23 +3136,30 @@ class HostedCLIAdapter:
 
     def _cleanup_verified(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
-
-        def remaining() -> float:
-            value = deadline - time.monotonic()
-            if value <= 0:
-                raise ScenarioExecutionError("CLEANUP_TIMEOUT")
-            return value
-
-        result = self._command(("status", "--json"), remaining(), "CLEANUP_STATUS_FAILED")
-        try:
-            value = json.loads(result.stdout_text)
-        except (TypeError, ValueError) as error:
-            raise ScenarioExecutionError("CLEANUP_STATUS_INVALID") from error
-        if not isinstance(value, dict) or value.get("state") != "Disconnected":
-            return False
         if self._baseline_ip is None or not self._tunneled_ips:
             return False
-        return self._external_ip(remaining()) not in self._tunneled_ips
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            result = self._command(
+                ("status", "--json"), remaining, "CLEANUP_STATUS_FAILED"
+            )
+            try:
+                value = json.loads(result.stdout_text)
+            except (TypeError, ValueError) as error:
+                raise ScenarioExecutionError("CLEANUP_STATUS_INVALID") from error
+            if isinstance(value, dict) and value.get("state") == "Disconnected":
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                if self._external_ip(remaining) not in self._tunneled_ips:
+                    return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            delay = min(_ROUTE_CONVERGENCE_POLL_SECONDS, remaining)
+            time.sleep(delay)
 
 
 __all__ = [
