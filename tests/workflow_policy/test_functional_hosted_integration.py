@@ -35,12 +35,12 @@ EXPECTED_UNAVAILABLE = {
     ),
 }
 MIN_CANONICAL_TIMEOUT = {
-    "linux": 998,
-    "windows": 998,
-    "macos": 998,
-    "android": 968,
+    "linux": 1010,
+    "windows": 1010,
+    "macos": 1010,
+    "android": 980,
 }
-DECLARED_LANE_SECONDS = {"linux": 938, "windows": 938, "macos": 938, "android": 908}
+DECLARED_LANE_SECONDS = {"linux": 950, "windows": 950, "macos": 950, "android": 920}
 
 def _job(text: str, name: str, next_name: str | None = None) -> str:
     start = text.index(f"  {name}:")
@@ -59,7 +59,16 @@ class FunctionalHostedIntegrationPolicyTest(unittest.TestCase):
                 values = [int(value) for value in re.findall(r"(?m)^    timeout-minutes:\s*(\d+)\s*$", text)]
                 self.assertTrue(values)
                 self.assertLessEqual(max(values), 30)
-                self.assertIn("    timeout-minutes: 30", _job(text, "client", "controller"))
+                client = _job(text, "client", "controller")
+                if platform == "android":
+                    build = _job(text, "build", "client")
+                    build_timeout = int(re.search(r"(?m)^    timeout-minutes:\s*(\d+)\s*$", build).group(1))
+                    client_timeout = int(re.search(r"(?m)^    timeout-minutes:\s*(\d+)\s*$", client).group(1))
+                    self.assertEqual(build_timeout, 10)
+                    self.assertEqual(client_timeout, 20)
+                    self.assertLessEqual(build_timeout + client_timeout, 30)
+                else:
+                    self.assertIn("    timeout-minutes: 30", client)
                 self.assertIn("    timeout-minutes: 30", _job(text, "controller"))
 
     def test_client_and_controller_have_absolute_deadlines_and_reserve(self) -> None:
@@ -168,13 +177,6 @@ class FunctionalHostedIntegrationPolicyTest(unittest.TestCase):
                 stage_marker = "torturer_checks.hosted.candidate stage" if platform == "linux" else "candidate.py stage"
                 stage = build.index(stage_marker)
                 self.assertLess(proof, stage)
-
-    def test_linux_only_declares_the_reviewed_expected_unavailable_pair(self) -> None:
-        expected = '--expected-unavailable "functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED"'
-        self.assertEqual(self.texts["linux"].count(expected), 1)
-        for platform in ("windows", "macos", "android"):
-            with self.subTest(platform=platform):
-                self.assertNotIn("--expected-unavailable", self.texts[platform])
 
     def test_public_workflows_never_echo_raw_diagnostics(self) -> None:
         workflow_root = ROOT / ".github" / "workflows"

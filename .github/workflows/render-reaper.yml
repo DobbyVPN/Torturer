@@ -13,7 +13,7 @@ on:
         default: "900"
         type: string
       active_service_ids:
-        description: Comma-separated service IDs that must never be reaped.
+        description: Comma-separated exact service IDs (including an Outline/upload-sink pair) that must never be reaped.
         required: false
         default: ""
         type: string

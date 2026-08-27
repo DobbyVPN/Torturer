@@ -326,22 +326,27 @@ class DesktopSliceHelperTest(unittest.TestCase):
                     sys.executable,
                     "-c",
                     (
-                        "import os, signal, time; "
+                        "import os, signal, sys, time; "
+                        "print('leader-before-cleanup-stdout', flush=True); "
+                        "print('leader-before-cleanup-stderr', file=sys.stderr, flush=True); "
                         "pid=os.fork(); "
                         f"marker=open({str(child_pid_file)!r}, 'w', encoding='ascii'); marker.write(str(os.getpid()) if pid == 0 else str(pid)); marker.close(); "
                         "signal.signal(signal.SIGTERM, signal.SIG_IGN) if pid == 0 else None; "
                         "time.sleep(60)"
                     ),
                 )
+                leaders: list[object] = []
 
                 def fake_cleanup(
                     process: object,
                     *,
-                    grace_seconds: float,
+                    grace_seconds: float | None = None,
                     description: str,
                     force_immediately: bool = False,
                     evidence_directory: Path | None = None,
+                    deadline: float | None = None,
                 ) -> ProcessTreeResult:
+                    leaders.append(process)
                     process.kill()  # type: ignore[attr-defined]
                     return ProcessTreeResult(False, (process.pid,), ("injected survivor",))  # type: ignore[attr-defined]
 
@@ -362,6 +367,19 @@ class DesktopSliceHelperTest(unittest.TestCase):
                         self.assertEqual(
                             [warning for warning in captured if issubclass(warning.category, ResourceWarning)],
                             [],
+                        )
+                        self.assertTrue(leaders)
+                        for leader in leaders:
+                            self.assertIsNotNone(leader.poll())  # type: ignore[attr-defined]
+                            self.assertTrue(leader.stdout.closed)  # type: ignore[attr-defined]
+                            self.assertTrue(leader.stderr.closed)  # type: ignore[attr-defined]
+                        self.assertEqual(
+                            (evidence / "pipe-survivor-load.stdout.raw.log").read_bytes(),
+                            b"leader-before-cleanup-stdout\n",
+                        )
+                        self.assertEqual(
+                            (evidence / "pipe-survivor-load.stderr.raw.log").read_bytes(),
+                            b"leader-before-cleanup-stderr\n",
                         )
                     finally:
                         if child_pid_file.exists():

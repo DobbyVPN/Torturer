@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 import unittest
 
+from .lease_validator_helpers import adversarial_leases, run_validator, valid_lease
+
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "functional-macos.yml"
@@ -35,6 +37,7 @@ class FunctionalMacOSWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("hosted.deadline", self.text)
         self.assertIn("--kill-grace-seconds 30", self.text)
         self.assertIn("for attempt in $(seq 1 360); do", self.text)
+        self.assertIn("if int(datetime.datetime.now(datetime.timezone.utc).timestamp()) >= deadline:", self.text)
         self.assertIn("timeout-minutes: 30", self.text)
 
     def test_actions_are_immutable_and_minimal(self) -> None:
@@ -116,14 +119,29 @@ class FunctionalMacOSWorkflowPolicyTest(unittest.TestCase):
         self.assertNotRegex(functional, r"--artifact(?:\s|=)")
         self.assertIn("--download-url \"https://proof.ovh.net/files/1Mb.dat\"", functional)
         self.assertNotIn("speed.cloudflare.com/__down?", functional)
+        self.assertIn('upload_url="$(cat "$HANDOFF_DIR/upload-url.txt")"', functional)
+        self.assertIn('--upload-url "$upload_url"', functional)
         self.assertIn("TORTURER_HOSTED_DEADLINE_EVIDENCE_DIR=", functional)
         self.assertIn("TORTURER_HOSTED_DEADLINE_SUMMARY_PATH=", functional)
         self.assertIn('>> "$GITHUB_ENV"', functional)
         self.assertIn("--summary-output", functional)
         self.assertIn("FUNCTIONAL_STATUS=", functional)
-        self.assertIn("timeout --foreground --signal=TERM --kill-after=1s 30s route -n get default", self.text)
+        self.assertIn('route_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 120 - 1))', self.text)
+        self.assertIn('timeout --foreground --signal=TERM --kill-after=1s "${route_timeout}s" route -n get default', self.text)
+        self.assertIn("readiness_reserve_seconds=180", functional)
+        self.assertIn('timeout --foreground --signal=TERM --kill-after=1s "${status_timeout}s"', functional)
+        self.assertIn('timeout --foreground --signal=TERM --kill-after=1s "${identity_probe_timeout}s"', functional)
         self.assertIn("TMPDIR=", self.text[functional_start:])
         self.assertIn("DOBBY_LOG_PATH=", self.text[functional_start:])
+        self.assertIn("SERVICE_IDENTITY_FILE=", functional)
+        self.assertIn("service.identity.json", functional)
+        self.assertIn("SERVER_SINK_IMAGE_DIGEST", client)
+        self.assertIn("--expect-file upload.cms", client)
+        self.assertIn('test -f "$LEASE_RESPONSE_DIR/upload.cms"', client)
+        self.assertIn('"schema": 2', client)
+        self.assertIn('{"outline", "upload-sink"}', client)
+        self.assertIn('"provider_generation"', client)
+        self.assertIn('"url", "path", "password", "secret"', client)
 
     def test_render_handoff_is_opaque_and_bound_to_macos_origin(self) -> None:
         self.assertIn("render-request-${lease_run_id}-${PLATFORM}", self.text)
@@ -152,7 +170,7 @@ class FunctionalMacOSWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("if: always()", self.text[result:marker])
         self.assertIn("if: always()", self.text[marker:remove])
         self.assertIn("sudo -n kill -TERM", self.text[stop:result])
-        self.assertIn("rm -f \"$HANDOFF_DIR/profile.toml\" \"$HANDOFF_DIR/recipient.key\"", self.text)
+        self.assertIn("rm -f \"$HANDOFF_DIR/profile.toml\" \"$HANDOFF_DIR/upload-url.txt\" \"$HANDOFF_DIR/recipient.key\"", self.text)
         self.assertIn("if: always()", self.text[retain:restore])
         self.assertIn("if: always()", self.text[failure_evidence:result])
         upload = self.text[failure_evidence:result]
@@ -161,6 +179,9 @@ class FunctionalMacOSWorkflowPolicyTest(unittest.TestCase):
         self.assertNotIn("service.raw.log", upload)
         self.assertNotIn("hosted-command-raw", upload)
         self.assertNotIn("profile.toml", upload)
+        self.assertNotIn("profile.cms", upload)
+        self.assertNotIn("upload.cms", upload)
+        self.assertNotIn("upload-url.txt", upload)
         self.assertNotIn("recipient.key", upload)
 
     def test_no_diagnostic_suppression(self) -> None:
@@ -170,8 +191,41 @@ class FunctionalMacOSWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("control_socket_ready=1", self.text)
         self.assertIn("SERVICE_CONTROL_SOCKET=%s", self.text)
         self.assertIn("emit_private_evidence", self.text)
+
+    def test_schema_two_validator_rejects_identity_binding_and_private_field_attacks(self) -> None:
+        self.assertEqual(run_validator(self.text, valid_lease("macos")).returncode, 0)
+        for label, lease in adversarial_leases("macos").items():
+            with self.subTest(label=label):
+                self.assertNotEqual(run_validator(self.text, lease).returncode, 0)
+
+    def test_expired_and_short_budgets_fail_closed(self) -> None:
+        client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
+        self.assertIn('if [ "$readiness_remaining" -le 0 ]; then', client)
+        self.assertIn('if [ "$route_remaining" -le 0 ]; then', client)
+        self.assertIn('if [ "$route_timeout" -gt "$route_remaining" ]; then', client)
+        self.assertIn('if [ "$status_timeout" -le 0 ]; then', client)
+        self.assertIn('if [ "$openssl_timeout" -le 0 ]; then', client)
+        self.assertIn('if [ "$transfer_timeout" -le 0 ]; then', client)
         self.assertGreaterEqual(self.text.count("umask 077"), 4)
-        self.assertIn('chmod 700 "$handoff" "$service" "$diagnostics"', self.text)
+        self.assertIn('private_root="$RUNNER_TEMP/dobbyvpn-private"', self.text)
+        self.assertIn('handoff="$private_root/render-handoff"', self.text)
+        self.assertIn('service="$private_root/service"', self.text)
+        self.assertIn('diagnostics="$private_root/diagnostics"', self.text)
+        self.assertIn('test ! -e "$private_root" && test ! -L "$private_root"', self.text)
+        self.assertIn('mkdir "$private_root"', self.text)
+        self.assertIn('mkdir "$handoff" "$service" "$diagnostics"', self.text)
+        self.assertIn(
+            'chmod 700 "$private_root" "$handoff" "$service" "$diagnostics"',
+            self.text,
+        )
+        establish = self.text[
+            self.text.index("- name: Establish runner-local paths"):
+            self.text.index("- name: Prove macOS client runner architecture")
+        ]
+        self.assertNotIn('mkdir -p "$private_root"', establish)
+        self.assertNotIn('$RUNNER_TEMP/dobbyvpn-render-handoff', establish)
+        self.assertNotIn('$RUNNER_TEMP/dobbyvpn-service', establish)
+        self.assertNotIn('$RUNNER_TEMP/dobbyvpn-diagnostics', establish)
         self.assertNotIn('cat "$service_log"', self.text)
         self.assertNotIn('cat "$service_err"', self.text)
         self.assertNotIn('| tee "$SERVICE_DIR/preflight-control-status.raw.log"', self.text)
@@ -193,6 +247,9 @@ class FunctionalMacOSWorkflowPolicyTest(unittest.TestCase):
         self.assertIn('exit "$restore_status"', route)
         self.assertIn('emit_private_evidence macos-restore-default-route', route)
         self.assertIn('emit_private_evidence macos-service-death-probe', route)
+        self.assertIn('--service-identity-file "$SERVICE_IDENTITY_FILE"', route)
+        self.assertIn("identity_probe_remaining", self.text)
+        self.assertIn("fallback_remaining", self.text)
 
 
 if __name__ == "__main__":

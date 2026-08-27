@@ -121,6 +121,7 @@ jobs:
       PLATFORM: windows
       TORTURER_SHA: ${{ github.sha }}
       SERVER_IMAGE_DIGEST: ${{ vars.RENDER_IMAGE_DIGEST }}
+      SERVER_SINK_IMAGE_DIGEST: ${{ vars.RENDER_SINK_IMAGE_DIGEST }}
       SERVICE_CONTROL_ADDRESS: 127.0.0.1:50051
 
     steps:
@@ -128,9 +129,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          handoff="$RUNNER_TEMP/dobbyvpn-render-handoff"
-          service="$RUNNER_TEMP/dobbyvpn-service"
-          mkdir -p "$handoff" "$service"
+          umask 077
+          private_root="$RUNNER_TEMP/dobbyvpn-private"
+          handoff="$private_root/render-handoff"
+          service="$private_root/service"
+          test ! -e "$private_root" && test ! -L "$private_root"
+          mkdir "$private_root"
+          mkdir "$handoff" "$service"
+          chmod 700 "$private_root" "$handoff" "$service"
+          # Git Bash mode bits are not an ACL boundary on Windows.  Remove
+          # inherited access and grant the current runner SID only; resolve
+          # the SID directly so no account-name lookup can block the step.
+          powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; foreach ($path in $args) { $item=Get-Item -LiteralPath $path -Force -ErrorAction Stop; if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw "private path is a reparse point" }; $acl=Get-Acl -LiteralPath $path; $acl.SetAccessRuleProtection($true,$false); $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,"FullControl","ContainerInherit,ObjectInherit","None","Allow"); $acl.SetAccessRule($rule); Set-Acl -LiteralPath $path -AclObject $acl; $verified=Get-Acl -LiteralPath $path; if (-not ($verified.Access | Where-Object { $_.IdentityReference.Value -eq $sid -and $_.AccessControlType -eq "Allow" -and (($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -eq [System.Security.AccessControl.FileSystemRights]::FullControl) })) { throw "private ACL verification failed" }; Write-Output ("private_acl_path=" + $path + " sid=" + $sid) }' \
+            "$(cygpath -w "$private_root" | tr -d '\r')" \
+            "$(cygpath -w "$handoff" | tr -d '\r')" \
+            "$(cygpath -w "$service" | tr -d '\r')"
           printf 'HANDOFF_DIR=%s\nSERVICE_DIR=%s\nRESULT_PATH=%s\nLEASE_RUN_ID=unassigned\n' \
             "$handoff" "$service" "$handoff/functional-result.json" >> "$GITHUB_ENV"
 
@@ -153,8 +166,11 @@ jobs:
           [[ "$SERVER_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           image_digest="${SERVER_IMAGE_DIGEST#sha256:}"
           test -n "${image_digest//0/}"
-          printf 'source_repository=%s\nsource_sha=%s\nplatform=%s\ntorturer_sha=%s\nserver_image_digest=%s\n' \
-            "$SOURCE_REPOSITORY" "$SOURCE_SHA" "$PLATFORM" "$TORTURER_SHA" "$SERVER_IMAGE_DIGEST"
+          [[ "$SERVER_SINK_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          sink_image_digest="${SERVER_SINK_IMAGE_DIGEST#sha256:}"
+          test -n "${sink_image_digest//0/}"
+          printf 'source_repository=%s\nsource_sha=%s\nplatform=%s\ntorturer_sha=%s\nserver_image_digest=%s\nserver_sink_image_digest=%s\n' \
+            "$SOURCE_REPOSITORY" "$SOURCE_SHA" "$PLATFORM" "$TORTURER_SHA" "$SERVER_IMAGE_DIGEST" "$SERVER_SINK_IMAGE_DIGEST"
 
       - name: Check out exact trusted Torturer revision
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
@@ -182,6 +198,8 @@ jobs:
               raise SystemExit("workflow run start timestamp is missing")
           started = datetime.datetime.fromisoformat(value["run_started_at"].replace("Z", "+00:00"))
           deadline = int(started.timestamp()) + 30 * 60
+          if int(datetime.datetime.now(datetime.timezone.utc).timestamp()) >= deadline:
+              raise SystemExit("workflow already exceeded its hard thirty-minute deadline")
           with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as output:
               output.write(f"RUN_DEADLINE_EPOCH={deadline}\n")
           print(f"workflow_started_epoch={int(started.timestamp())}\nrun_deadline_epoch={deadline}")
@@ -370,51 +388,102 @@ jobs:
           network_probe_log=""
           status_log="$SERVICE_DIR/preflight-control-status.raw.log"
           preflight_pid_file="$HANDOFF_DIR/preflight-service.pid"
+          preflight_identity_file="$HANDOFF_DIR/preflight-service.identity"
           service_binary="$GITHUB_WORKSPACE/candidate/windows_grpcvpnserver.exe"
           service_binary_windows="$(cygpath -w "$service_binary" | tr -d '\r')"
           service_log_windows="$(cygpath -w "$service_log" | tr -d '\r')"
           service_err_windows="$(cygpath -w "$service_err" | tr -d '\r')"
           programdata_windows="$(cygpath -w "$programdata_path" | tr -d '\r')"
           preflight_pid_file_windows="$(cygpath -w "$preflight_pid_file" | tr -d '\r')"
+          preflight_identity_file_windows="$(cygpath -w "$preflight_identity_file" | tr -d '\r')"
+          : > "$service_log"
+          : > "$service_err"
+          : > "$launch_log"
+          : > "$preflight_pid_file"
+          : > "$preflight_identity_file"
+          chmod 600 "$service_log" "$service_err" "$launch_log" "$preflight_pid_file" "$preflight_identity_file"
           export DOBBYVPN_WINDOWS_SERVICE_BINARY="$service_binary_windows"
           export DOBBYVPN_WINDOWS_SERVICE_LOG="$service_log_windows"
           export DOBBYVPN_WINDOWS_SERVICE_ERR="$service_err_windows"
           export DOBBYVPN_WINDOWS_PROGRAMDATA="$programdata_windows"
           export DOBBYVPN_WINDOWS_SERVICE_PID_FILE="$preflight_pid_file_windows"
+          export DOBBYVPN_WINDOWS_SERVICE_IDENTITY_FILE="$preflight_identity_file_windows"
           # Publish the cleanup path before launch.  The PowerShell launcher
-          # records the PID before returning it, so a launch timeout after
-          # Start-Process cannot strand the candidate without a cleanup handle.
-          printf 'PREFLIGHT_SERVICE_PID_FILE=%s\nPREFLIGHT_SERVICE_LOG=%s\n' \
-            "$preflight_pid_file" "$service_log" >> "$GITHUB_ENV"
-          # shellcheck disable=SC2016
+          # records PID and creation identity without CRLF before returning.
+          # Publish all cleanup paths before launch so a failed launch still
+          # has an exact-candidate discovery/cleanup route.
+          printf 'PREFLIGHT_SERVICE_PID_FILE=%s\nPREFLIGHT_SERVICE_IDENTITY_FILE=%s\nPREFLIGHT_SERVICE_BINARY=%s\nPREFLIGHT_SERVICE_LOG=%s\n' \
+            "$preflight_pid_file" "$preflight_identity_file" "$service_binary" "$service_log" >> "$GITHUB_ENV"
           # Do not resolve WindowsIdentity.Name here.  On a hosted runner that
-          # account-name lookup can block before Start-Process returns, while
-          # the Bash command substitution waits indefinitely.  USERDOMAIN and
+          # account-name lookup can block before Start-Process returns.  USERDOMAIN and
           # USERNAME are already supplied by the runner and are the account
-          # identity consumed by the product's LookupSID call.  Keep explicit
-          # phase diagnostics on stderr so they remain visible even though the
-          # PID itself is captured from stdout.
+          # identity consumed by the product's LookupSID call.  PowerShell
+          # launches the service directly and writes launch diagnostics to a
+          # regular file; Bash consumes only the exit status and handoff files,
+          # never a native child's stdout pipe.  The GNU timeout is an outer
+          # watchdog with a small grace interval beyond the expected launch.
           launch_remaining=$((preflight_deadline_epoch - $(date +%s)))
           if [ "$launch_remaining" -le 0 ]; then
             printf 'preflight launch reached its bounded deadline\n' >&2
             exit 1
           fi
           launch_timeout="$PREFLIGHT_PROBE_TIMEOUT_SECONDS"
-          if [ "$launch_timeout" -gt "$launch_remaining" ]; then launch_timeout="$launch_remaining"; fi
+          if [ "$launch_remaining" -le 3 ]; then
+            printf 'preflight launch cannot preserve watchdog grace before deadline: remaining=%s\n' "$launch_remaining" >&2
+            exit 1
+          fi
+          if [ "$launch_timeout" -gt "$((launch_remaining - 3))" ]; then launch_timeout="$((launch_remaining - 3))"; fi
           printf 'preflight_probe_start label=service-launch timeout_seconds=%s remaining_seconds=%s\n' \
             "$launch_timeout" "$launch_remaining"
           launch_status=0
-          service_pid="$(timeout --foreground --signal=TERM --kill-after=1s "${launch_timeout}s" \
-            powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; [Console]::Error.WriteLine("windows_launch_phase=environment"); $env:ProgramData=$env:DOBBYVPN_WINDOWS_PROGRAMDATA; if ([string]::IsNullOrWhiteSpace($env:USERNAME)) { throw "USERNAME is unavailable" }; $account=$env:USERNAME; if (-not [string]::IsNullOrWhiteSpace($env:USERDOMAIN)) { $account="$($env:USERDOMAIN)\$($env:USERNAME)" }; $env:DOBBYVPN_CONTROL_TOKEN_USER=$account; [Console]::Error.WriteLine("windows_launch_phase=account_ready"); $p=Start-Process -FilePath $env:DOBBYVPN_WINDOWS_SERVICE_BINARY -ArgumentList @("-port","50051") -RedirectStandardOutput $env:DOBBYVPN_WINDOWS_SERVICE_LOG -RedirectStandardError $env:DOBBYVPN_WINDOWS_SERVICE_ERR -PassThru; [System.IO.File]::WriteAllText($env:DOBBYVPN_WINDOWS_SERVICE_PID_FILE, ([string]$p.Id + [Environment]::NewLine)); [Console]::Error.WriteLine("windows_launch_phase=process_started"); [Console]::Error.WriteLine("windows_launch_phase=pid_recorded"); $p.Id' \
-            2> "$launch_log")" || launch_status=$?
+          launch_watchdog_timeout=$((launch_timeout + 3))
+          launch_started_epoch="$(date +%s)"
+          printf 'PREFLIGHT_SERVICE_LAUNCH_STARTED_EPOCH=%s\n' "$launch_started_epoch" >> "$GITHUB_ENV"
+          timeout --signal=TERM --kill-after=1s "${launch_watchdog_timeout}s" \
+            powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; Write-Output "windows_launch_phase=environment"; $env:ProgramData=$env:DOBBYVPN_WINDOWS_PROGRAMDATA; if ([string]::IsNullOrWhiteSpace($env:USERNAME)) { throw "USERNAME is unavailable" }; $account=$env:USERNAME; if (-not [string]::IsNullOrWhiteSpace($env:USERDOMAIN)) { $account="$($env:USERDOMAIN)\$($env:USERNAME)" }; $env:DOBBYVPN_CONTROL_TOKEN_USER=$account; Write-Output "windows_launch_phase=account_ready"; foreach ($path in @($env:DOBBYVPN_WINDOWS_SERVICE_LOG,$env:DOBBYVPN_WINDOWS_SERVICE_ERR,$env:DOBBYVPN_WINDOWS_SERVICE_PID_FILE,$env:DOBBYVPN_WINDOWS_SERVICE_IDENTITY_FILE)) { $item=Get-Item -LiteralPath $path -Force -ErrorAction Stop; if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or -not ($item.PSIsContainer -eq $false)) { throw "launch path is not a regular file" } }; $p=Start-Process -FilePath $env:DOBBYVPN_WINDOWS_SERVICE_BINARY -ArgumentList @("-port","50051") -RedirectStandardOutput $env:DOBBYVPN_WINDOWS_SERVICE_LOG -RedirectStandardError $env:DOBBYVPN_WINDOWS_SERVICE_ERR -PassThru; $info=Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $p.Id) -ErrorAction Stop; if ($null -eq $info -or $null -eq $info.CreationDate) { throw "started process identity unavailable" }; $ticks=$info.CreationDate.ToUniversalTime().Ticks; [System.IO.File]::WriteAllText($env:DOBBYVPN_WINDOWS_SERVICE_PID_FILE, [string]$p.Id, [System.Text.Encoding]::ASCII); [System.IO.File]::WriteAllText($env:DOBBYVPN_WINDOWS_SERVICE_IDENTITY_FILE, ([string]$p.Id + "|" + [string]$ticks), [System.Text.Encoding]::ASCII); Write-Output "windows_launch_phase=process_started"; Write-Output "windows_launch_phase=pid_recorded"; Write-Output ("windows_launch_identity=" + $p.Id + "|" + $ticks)' \
+            > "$launch_log" 2>&1 || launch_status=$?
           printf 'preflight_probe_result label=service-launch status=%s\n' "$launch_status"
           emit_private_evidence preflight-launch "$launch_log"
+          service_pid=""
+          if [ -f "$preflight_pid_file" ]; then
+            service_pid="$(tr -d '\r\n' < "$preflight_pid_file")"
+          fi
+          service_identity=""
+          if [ -f "$preflight_identity_file" ]; then
+            service_identity="$(tr -d '\r\n' < "$preflight_identity_file")"
+          fi
+          if ! [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\|[1-9][0-9]+$ ]] || [ "${service_identity%%|*}" != "$service_pid" ]; then
+            discovery_log="$SERVICE_DIR/preflight-candidate-discovery.raw.log"
+            : > "$discovery_log"
+            chmod 600 "$discovery_log"
+            discovery_status=1
+            for discovery_attempt in $(seq 1 3); do
+              printf 'preflight_candidate_discovery_attempt=%s\n' "$discovery_attempt" >> "$discovery_log"
+              discovery_remaining=$((preflight_deadline_epoch - $(date +%s) - 1))
+              if [ "$discovery_remaining" -le 0 ]; then
+                printf 'preflight candidate discovery reached bounded deadline: remaining=%s\n' "$discovery_remaining" >> "$discovery_log"
+                break
+              fi
+              discovery_timeout=5
+              if [ "$discovery_timeout" -gt "$discovery_remaining" ]; then discovery_timeout="$discovery_remaining"; fi
+              timeout --foreground --signal=TERM --kill-after=1s "${discovery_timeout}s" \
+                powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; $expected=[System.IO.Path]::GetFullPath($args[0]); $identityPath=$args[1]; $launchEpoch=[DateTimeOffset]::FromUnixTimeSeconds([int64]$args[2]).UtcDateTime.AddSeconds(-2); $matches=@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { if ([string]::IsNullOrWhiteSpace($_.ExecutablePath) -or $null -eq $_.CreationDate) { return $false }; $actual=[System.IO.Path]::GetFullPath([string]$_.ExecutablePath); $actual -ieq $expected -and $_.CreationDate.ToUniversalTime() -ge $launchEpoch }); if ($matches.Count -eq 0) { Write-Output "candidate_discovery=none"; exit 1 }; if ($matches.Count -ne 1) { Write-Output ("candidate_discovery=ambiguous count=" + $matches.Count); exit 2 }; $p=$matches[0]; $ticks=$p.CreationDate.ToUniversalTime().Ticks; [System.IO.File]::WriteAllText($identityPath, ([string]$p.ProcessId + "|" + [string]$ticks), [System.Text.Encoding]::ASCII); Write-Output ("candidate_discovery=selected " + $p.ProcessId + "|" + $ticks)' \
+                "$service_binary_windows" "$preflight_identity_file_windows" "$launch_started_epoch" >> "$discovery_log" 2>&1 || discovery_status=$?
+              service_identity=""
+              if [ -f "$preflight_identity_file" ]; then service_identity="$(tr -d '\r\n' < "$preflight_identity_file")"; fi
+              if [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\|[1-9][0-9]+$ ]]; then
+                service_pid="${service_identity%%|*}"
+                discovery_status=0
+                break
+              fi
+              sleep 1
+            done
+            emit_private_evidence preflight-candidate-discovery "$discovery_log"
+          fi
           if [ "$launch_status" -ne 0 ]; then
-            if [ -f "$preflight_pid_file" ]; then
-              IFS= read -r service_pid < "$preflight_pid_file" || true
-            fi
             emit_private_evidence preflight-service-log "$service_log"
             emit_private_evidence preflight-service-error "$service_err"
+            emit_private_evidence preflight-service-identity "$preflight_identity_file"
             emit_private_display preflight-launch "$launch_log"
             emit_private_display preflight-service-error "$service_err"
             emit_private_classification preflight-launch "$launch_log"
@@ -427,17 +496,29 @@ jobs:
             fi
             exit 1
           fi
-          unset DOBBYVPN_WINDOWS_SERVICE_BINARY DOBBYVPN_WINDOWS_SERVICE_LOG DOBBYVPN_WINDOWS_SERVICE_ERR DOBBYVPN_WINDOWS_PROGRAMDATA DOBBYVPN_WINDOWS_SERVICE_PID_FILE
+          if ! [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\|[1-9][0-9]+$ ]] || [ "${service_identity%%|*}" != "$service_pid" ]; then
+            emit_private_evidence preflight-service-log "$service_log"
+            emit_private_evidence preflight-service-error "$service_err"
+            emit_private_evidence preflight-service-identity "$preflight_identity_file"
+            printf 'preflight_service_launch=failed code=IDENTITY_UNAVAILABLE\n' >&2
+            exit 1
+          fi
+          printf '%s\n' "$service_pid" > "$preflight_pid_file"
+          unset DOBBYVPN_WINDOWS_SERVICE_BINARY DOBBYVPN_WINDOWS_SERVICE_LOG DOBBYVPN_WINDOWS_SERVICE_ERR DOBBYVPN_WINDOWS_PROGRAMDATA DOBBYVPN_WINDOWS_SERVICE_PID_FILE DOBBYVPN_WINDOWS_SERVICE_IDENTITY_FILE
           export PROGRAMDATA="$programdata_path"
           printf 'PROGRAMDATA=%s\n' "$PROGRAMDATA" >> "$GITHUB_ENV"
-          if [ -z "$service_pid" ] && [ -f "$preflight_pid_file" ]; then
-            IFS= read -r service_pid < "$preflight_pid_file" || true
-          fi
           case "$service_pid" in ""|*[!0-9]*) printf 'invalid preflight service pid=%s\n' "$service_pid" >&2; exit 1;; esac
           printf '%s\n' "$service_pid" > "$preflight_pid_file"
           printf 'PREFLIGHT_SERVICE_PID=%s\n' "$service_pid" >> "$GITHUB_ENV"
           ready=false
-          for attempt in $(seq 1 60); do
+          readiness_remaining=$((preflight_deadline_epoch - $(date +%s)))
+          if [ "$readiness_remaining" -le 0 ]; then
+            printf 'preflight readiness reached bounded startup deadline: remaining=%s\n' "$readiness_remaining" >&2
+            exit 1
+          fi
+          readiness_timeout=60
+          if [ "$readiness_timeout" -gt "$readiness_remaining" ]; then readiness_timeout="$readiness_remaining"; fi
+          for attempt in $(seq 1 "$readiness_timeout"); do
             printf 'preflight_service_readiness_attempt=%s\n' "$attempt"
             remaining=$((preflight_deadline_epoch - $(date +%s)))
             if [ "$remaining" -le 0 ]; then
@@ -645,37 +726,97 @@ jobs:
             fi
           }
           # No candidate process may remain while the Render handoff uses the GitHub credential.
-          service_pid="${PREFLIGHT_SERVICE_PID:-}"
-          if [ -f "${PREFLIGHT_SERVICE_PID_FILE:-}" ]; then service_pid="$(cat "$PREFLIGHT_SERVICE_PID_FILE")"; fi
-          case "$service_pid" in
-            "") printf 'preflight_service_stop_verified=true state=not-started\n'; exit 0;;
-            0|*[!0-9]*) printf 'invalid preflight cleanup pid=%s\n' "$service_pid" >&2; exit 1;;
-          esac
+          # Never trust a bare PID: verify the PID plus creation identity and
+          # executable path immediately before sending any termination signal.
+          service_identity_file="${PREFLIGHT_SERVICE_IDENTITY_FILE:-$HANDOFF_DIR/preflight-service.identity}"
+          service_pid_file="${PREFLIGHT_SERVICE_PID_FILE:-$HANDOFF_DIR/preflight-service.pid}"
+          service_binary="${PREFLIGHT_SERVICE_BINARY:-}"
+          launch_started_epoch="${PREFLIGHT_SERVICE_LAUNCH_STARTED_EPOCH:-}"
+          cleanup_deadline_epoch=$((RUN_DEADLINE_EPOCH - 60))
+          service_identity=""
+          if [ -f "$service_identity_file" ]; then service_identity="$(tr -d '\r\n' < "$service_identity_file")"; fi
+          if ! [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\|[1-9][0-9]+$ ]] && [ -n "$service_binary" ]; then
+            if ! [[ "$launch_started_epoch" =~ ^[0-9]+$ ]]; then
+              printf 'preflight cleanup cannot perform exact candidate discovery without launch identity\n' >&2
+              exit 1
+            fi
+            discovery_log="$SERVICE_DIR/preflight-cleanup-discovery.raw.log"
+            : > "$discovery_log"
+            chmod 600 "$discovery_log"
+            service_binary_windows="$(cygpath -w "$service_binary" | tr -d '\r')"
+            discovery_status=0
+            discovery_remaining=$((cleanup_deadline_epoch - $(date +%s) - 1))
+            if [ "$discovery_remaining" -le 0 ]; then
+              printf 'preflight cleanup discovery reached cleanup deadline: remaining=%s\n' "$discovery_remaining" >> "$discovery_log"
+              discovery_status=124
+            else
+              discovery_timeout=10
+              if [ "$discovery_timeout" -gt "$discovery_remaining" ]; then discovery_timeout="$discovery_remaining"; fi
+              timeout --foreground --signal=TERM --kill-after=1s "${discovery_timeout}s" \
+                powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; $expected=[System.IO.Path]::GetFullPath($args[0]); $identityPath=$args[1]; $launchEpoch=[DateTimeOffset]::FromUnixTimeSeconds([int64]$args[2]).UtcDateTime.AddSeconds(-2); $matches=@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { if ([string]::IsNullOrWhiteSpace($_.ExecutablePath) -or $null -eq $_.CreationDate) { return $false }; $actual=[System.IO.Path]::GetFullPath([string]$_.ExecutablePath); $actual -ieq $expected -and $_.CreationDate.ToUniversalTime() -ge $launchEpoch }); if ($matches.Count -eq 0) { Write-Output "cleanup_discovery=none"; exit 2 }; if ($matches.Count -ne 1) { Write-Output ("cleanup_discovery=ambiguous count=" + $matches.Count); exit 3 }; $p=$matches[0]; $ticks=$p.CreationDate.ToUniversalTime().Ticks; [System.IO.File]::WriteAllText($identityPath, ([string]$p.ProcessId + "|" + [string]$ticks), [System.Text.Encoding]::ASCII); Write-Output ("cleanup_discovery=selected " + $p.ProcessId + "|" + $ticks)' \
+              "$service_binary_windows" "$(cygpath -w "$service_identity_file" | tr -d '\r')" "$launch_started_epoch" > "$discovery_log" 2>&1 || discovery_status=$?
+            fi
+            emit_private_evidence preflight-cleanup-discovery "$discovery_log"
+            if [ "$discovery_status" -eq 0 ] && [ -f "$service_identity_file" ]; then service_identity="$(tr -d '\r\n' < "$service_identity_file")"; fi
+          fi
+          if ! [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\|[1-9][0-9]+$ ]]; then
+            if [ "${discovery_status:-1}" -eq 2 ]; then
+              printf 'preflight_service_stop_verified=true state=not-started\n'
+              exit 0
+            fi
+            if [ -z "$service_binary" ]; then
+              printf 'preflight_service_stop_verified=true state=not-started\n'
+              exit 0
+            fi
+            emit_private_evidence preflight-service-identity "$service_identity_file"
+            printf 'preflight_service_cleanup=failed code=IDENTITY_UNAVAILABLE\n' >&2
+            exit 1
+          fi
+          service_pid="${service_identity%%|*}"
+          service_binary_windows="$(cygpath -w "$service_binary" | tr -d '\r')"
+          verify_script=' $ErrorActionPreference="Stop"; $parts=$args[0] -split "\\|",2; $expected=[System.IO.Path]::GetFullPath($args[1]); $p=Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f ([int]$parts[0])) -ErrorAction Stop; if ($null -eq $p) { Write-Output "service_state=gone"; exit 2 }; $actual=[System.IO.Path]::GetFullPath([string]$p.ExecutablePath); $ticks=$p.CreationDate.ToUniversalTime().Ticks; if ($actual -ine $expected) { Write-Output ("service_state=path-mismatch actual=" + $actual); exit 3 }; if ([string]$parts[1] -ne [string]$ticks) { Write-Output ("service_state=identity-mismatch actual=" + $p.ProcessId + "|" + $ticks); exit 4 }; Write-Output ("service_state=running identity=" + $parts[0] + "|" + $ticks); exit 0'
           running=false
           cleanup_probe_log="$SERVICE_DIR/preflight-cleanup-probe-initial.raw.log"
           cleanup_probe_status=0
-          powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("preflight_service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid" > "$cleanup_probe_log" 2>&1 || cleanup_probe_status=$?
+          remaining=$((cleanup_deadline_epoch - $(date +%s)))
+          probe_timeout=10
+          if [ "$probe_timeout" -gt "$remaining" ]; then probe_timeout="$remaining"; fi
+          if [ "$probe_timeout" -le 0 ]; then printf 'preflight_service_cleanup=failed code=CLEANUP_DEADLINE\n' >&2; exit 1; fi
+          timeout --foreground --signal=TERM --kill-after=1s "${probe_timeout}s" \
+            powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$verify_script" "$service_identity" "$service_binary_windows" > "$cleanup_probe_log" 2>&1 || cleanup_probe_status=$?
           emit_private_evidence preflight-cleanup-probe "$cleanup_probe_log"
-          if [ "$cleanup_probe_status" -eq 0 ]; then
-            running=true
-            taskkill_log="$SERVICE_DIR/preflight-taskkill.raw.log"
-            taskkill_status=0
-            taskkill.exe /PID "$service_pid" /T /F > "$taskkill_log" 2>&1 || taskkill_status=$?
-            emit_private_evidence preflight-taskkill "$taskkill_log"
-            if [ "$taskkill_status" -ne 0 ]; then
-              printf 'preflight_service_cleanup=failed code=TASKKILL status=%s\n' "$taskkill_status" >&2
-              exit "$taskkill_status"
-            fi
-          fi
+          case "$cleanup_probe_status" in
+            0) running=true;;
+            2) running=false;;
+            *) printf 'preflight_service_cleanup=failed code=IDENTITY_PROBE status=%s\n' "$cleanup_probe_status" >&2; exit 1;;
+          esac
           stopped=false
           if [ "$running" = true ]; then
+            taskkill_log="$SERVICE_DIR/preflight-taskkill.raw.log"
+            taskkill_status=0
+            remaining=$((cleanup_deadline_epoch - $(date +%s)))
+            kill_timeout=30
+            if [ "$kill_timeout" -gt "$remaining" ]; then kill_timeout="$remaining"; fi
+            if [ "$kill_timeout" -le 0 ]; then printf 'preflight_service_cleanup=failed code=CLEANUP_DEADLINE\n' >&2; exit 1; fi
+            timeout --foreground --signal=TERM --kill-after=1s "${kill_timeout}s" \
+              taskkill.exe /PID "$service_pid" /T /F > "$taskkill_log" 2>&1 || taskkill_status=$?
+            emit_private_evidence preflight-taskkill "$taskkill_log"
+            if [ "$taskkill_status" -ne 0 ]; then
+              printf 'preflight_service_cleanup=taskkill status=%s; continuing identity verification\n' "$taskkill_status" >&2
+            fi
             for attempt in $(seq 1 30); do
               printf 'preflight_service_stop_attempt=%s\n' "$attempt"
+              remaining=$((cleanup_deadline_epoch - $(date +%s)))
+              if [ "$remaining" -le 0 ]; then break; fi
               cleanup_probe_log="$SERVICE_DIR/preflight-cleanup-probe-${attempt}.raw.log"
               cleanup_probe_status=0
-              powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("preflight_service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid" > "$cleanup_probe_log" 2>&1 || cleanup_probe_status=$?
+              probe_timeout=10
+              if [ "$probe_timeout" -gt "$remaining" ]; then probe_timeout="$remaining"; fi
+              timeout --foreground --signal=TERM --kill-after=1s "${probe_timeout}s" \
+                powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$verify_script" "$service_identity" "$service_binary_windows" > "$cleanup_probe_log" 2>&1 || cleanup_probe_status=$?
               emit_private_evidence preflight-cleanup-probe "$cleanup_probe_log"
-              if [ "$cleanup_probe_status" -ne 0 ]; then stopped=true; break; fi
+              if [ "$cleanup_probe_status" -eq 2 ]; then stopped=true; break; fi
+              if [ "$cleanup_probe_status" -ne 0 ]; then printf 'preflight_service_cleanup=failed code=IDENTITY_PROBE status=%s\n' "$cleanup_probe_status" >&2; exit 1; fi
               sleep 1
             done
           else
@@ -754,10 +895,17 @@ jobs:
           if value.get("repository", {}).get("full_name") != os.environ["GITHUB_REPOSITORY"]: raise SystemExit("lease workflow repository mismatch")
           print("lease_workflow_run=validated")
           PY
+              transfer_timeout=30
+              if [ "$transfer_timeout" -gt "$api_remaining" ]; then transfer_timeout="$api_remaining"; fi
+              if [ "$transfer_timeout" -le 0 ]; then
+                printf 'lease response transfer reached the cleanup reserve: remaining=%s\n' "$api_remaining" >&2
+                break
+              fi
               if PYTHONPATH="$GITHUB_WORKSPACE/torturer" python -m torturer_checks.hosted.artifacts \
                 --repository "$GITHUB_REPOSITORY" --artifact-name "$response_name" --run-id "$lease_workflow_run_id" \
                 --output-dir "$attempt_dir/unpacked" --metadata "$attempt_dir/artifacts.json" --archive "$attempt_dir/response.zip" \
-                --expect-file lease.json --expect-file profile.cms; then
+                --timeout-seconds "$transfer_timeout" \
+                --expect-file lease.json --expect-file profile.cms --expect-file upload.cms; then
                 printf 'LEASE_RESPONSE_DIR=%s\n' "$attempt_dir/unpacked" >> "$GITHUB_ENV"
                 found=true
                 break
@@ -775,24 +923,83 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -f "$LEASE_RESPONSE_DIR/lease.json" && test -f "$LEASE_RESPONSE_DIR/profile.cms"
+          test -f "$LEASE_RESPONSE_DIR/lease.json" && test -f "$LEASE_RESPONSE_DIR/profile.cms" && test -f "$LEASE_RESPONSE_DIR/upload.cms"
           python - "$LEASE_RESPONSE_DIR/lease.json" <<'PY'
-          import json, os, re, sys
+          import json
+          import os
+          import re
+          import sys
           from pathlib import Path
           value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          expected = {"schema": 1, "kind": "dobbyvpn.render-lease", "run_id": os.environ["LEASE_RUN_ID"], "platform": "windows", "source_sha": os.environ["SOURCE_SHA"], "image_digest": os.environ["SERVER_IMAGE_DIGEST"], "state": "issued"}
+          expected = {
+              "schema": 2,
+              "kind": "dobbyvpn.render-lease",
+              "run_id": os.environ["LEASE_RUN_ID"],
+              "platform": "windows",
+              "source_sha": os.environ["SOURCE_SHA"],
+              "state": "issued",
+          }
+          expected_keys = set(expected) | {"services"}
+          if set(value) != expected_keys:
+              raise SystemExit("Windows safe lease record has an unsafe shape")
           for key, wanted in expected.items():
               if value.get(key) != wanted: raise SystemExit(f"lease field {key} is invalid")
-          if not re.fullmatch(r"srv-[A-Za-z0-9][A-Za-z0-9_-]{1,99}", str(value.get("service_id"))): raise SystemExit("lease service id is invalid")
+          services = value.get("services")
+          if not isinstance(services, list) or len(services) != 2:
+              raise SystemExit("Windows lease service bundle is invalid")
+          roles = {service.get("role") for service in services if isinstance(service, dict)}
+          if roles != {"outline", "upload-sink"}:
+              raise SystemExit("Windows lease service roles are invalid")
+          service_ids = set()
+          services_by_role = {}
+          for service in services:
+              if not isinstance(service, dict) or set(service) != {"role", "service_id", "image_digest", "provider_generation"}:
+                  raise SystemExit("Windows lease service shape is invalid")
+              if not isinstance(service["role"], str) or service["role"] in services_by_role:
+                  raise SystemExit("Windows lease service roles are duplicated")
+              if not isinstance(service["service_id"], str) or not re.fullmatch(r"srv-[A-Za-z0-9][A-Za-z0-9_-]{1,99}", service["service_id"]):
+                  raise SystemExit("lease service id is invalid")
+              if service["service_id"] in service_ids:
+                  raise SystemExit("Windows lease service IDs are not distinct")
+              service_ids.add(service["service_id"])
+              if not isinstance(service["image_digest"], str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", service["image_digest"]):
+                  raise SystemExit("Windows lease image digest is invalid")
+              if not isinstance(service["provider_generation"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{1,99}", service["provider_generation"]):
+                  raise SystemExit("Windows lease provider generation is invalid")
+              services_by_role[service["role"]] = service
+          if services_by_role["outline"]["image_digest"] != os.environ["SERVER_IMAGE_DIGEST"]:
+              raise SystemExit("Windows Outline image identity is not bound")
+          if services_by_role["upload-sink"]["image_digest"] != os.environ["SERVER_SINK_IMAGE_DIGEST"]:
+              raise SystemExit("Windows upload-sink image identity is not bound")
+          if any(token in json.dumps(value).lower() for token in ("url", "path", "password", "secret")):
+              raise SystemExit("Windows safe lease record contains private handoff data")
           print("lease_record=validated")
           PY
-          openssl_timeout=$((RUN_DEADLINE_EPOCH - $(date +%s) - 1))
+          cleanup_reserve_seconds=120
+          openssl_timeout=$((RUN_DEADLINE_EPOCH - $(date +%s) - cleanup_reserve_seconds - 1))
           if [ "$openssl_timeout" -le 0 ]; then printf "%s\n" "profile decryption reached the hard workflow deadline" >&2; exit 1; fi
           if [ "$openssl_timeout" -gt 60 ]; then openssl_timeout=60; fi
           timeout --foreground --signal=TERM --kill-after=1s "${openssl_timeout}s" openssl cms -decrypt -binary -inform DER -in "$LEASE_RESPONSE_DIR/profile.cms" \
             -recip "$HANDOFF_DIR/recipient.crt" -inkey "$HANDOFF_DIR/recipient.key" -out "$HANDOFF_DIR/profile.toml"
           chmod 600 "$HANDOFF_DIR/profile.toml"
           test -s "$HANDOFF_DIR/profile.toml"
+          openssl_timeout=$((RUN_DEADLINE_EPOCH - $(date +%s) - cleanup_reserve_seconds - 1))
+          if [ "$openssl_timeout" -le 0 ]; then printf "%s\n" "upload URL decryption reached the hard workflow deadline" >&2; exit 1; fi
+          if [ "$openssl_timeout" -gt 60 ]; then openssl_timeout=60; fi
+          timeout --foreground --signal=TERM --kill-after=1s "${openssl_timeout}s" openssl cms -decrypt -binary -inform DER -in "$LEASE_RESPONSE_DIR/upload.cms" \
+            -recip "$HANDOFF_DIR/recipient.crt" -inkey "$HANDOFF_DIR/recipient.key" -out "$HANDOFF_DIR/upload-url.txt"
+          chmod 600 "$HANDOFF_DIR/upload-url.txt"
+          test -s "$HANDOFF_DIR/upload-url.txt"
+          python - "$HANDOFF_DIR/upload-url.txt" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          value = Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+          if not re.fullmatch(r"https://[A-Za-z0-9.-]{1,253}/upload/[0-9a-f]{32}", value):
+              raise SystemExit("encrypted upload URL is invalid")
+          print("upload_handoff=validated")
+          PY
 
       - name: Start exact Windows functional candidate
         shell: bash
@@ -880,34 +1087,131 @@ jobs:
           mkdir -p "$programdata_path/DobbyVPN"
           service_log="$SERVICE_DIR/service.raw.log"
           service_err="$SERVICE_DIR/service.stderr.raw.log"
+          launch_log="$SERVICE_DIR/launch.raw.log"
+          service_pid_file="$HANDOFF_DIR/service.pid"
+          service_identity_file="$HANDOFF_DIR/service.identity"
           service_binary="$GITHUB_WORKSPACE/candidate/windows_grpcvpnserver.exe"
           service_binary_windows="$(cygpath -w "$service_binary" | tr -d '\r')"
           service_log_windows="$(cygpath -w "$service_log" | tr -d '\r')"
           service_err_windows="$(cygpath -w "$service_err" | tr -d '\r')"
           programdata_windows="$(cygpath -w "$programdata_path" | tr -d '\r')"
+          service_identity_file_windows="$(cygpath -w "$service_identity_file" | tr -d '\r')"
+          : > "$service_log"
+          : > "$service_err"
+          : > "$launch_log"
+          : > "$service_pid_file"
+          : > "$service_identity_file"
+          chmod 600 "$service_log" "$service_err" "$launch_log" "$service_pid_file" "$service_identity_file"
           export DOBBYVPN_WINDOWS_SERVICE_BINARY="$service_binary_windows"
           export DOBBYVPN_WINDOWS_SERVICE_LOG="$service_log_windows"
           export DOBBYVPN_WINDOWS_SERVICE_ERR="$service_err_windows"
           export DOBBYVPN_WINDOWS_PROGRAMDATA="$programdata_windows"
-          # shellcheck disable=SC2016
-          # Keep this launch path identical to the preflight path.  The
-          # account is assembled from runner-provided environment values so a
-          # domain lookup cannot hold the command substitution indefinitely.
-          service_pid="$(powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; [Console]::Error.WriteLine("windows_launch_phase=environment"); $env:ProgramData=$env:DOBBYVPN_WINDOWS_PROGRAMDATA; if ([string]::IsNullOrWhiteSpace($env:USERNAME)) { throw "USERNAME is unavailable" }; $account=$env:USERNAME; if (-not [string]::IsNullOrWhiteSpace($env:USERDOMAIN)) { $account="$($env:USERDOMAIN)\$($env:USERNAME)" }; $env:DOBBYVPN_CONTROL_TOKEN_USER=$account; [Console]::Error.WriteLine("windows_launch_phase=account_ready"); $p=Start-Process -FilePath $env:DOBBYVPN_WINDOWS_SERVICE_BINARY -ArgumentList @("-port","50051") -RedirectStandardOutput $env:DOBBYVPN_WINDOWS_SERVICE_LOG -RedirectStandardError $env:DOBBYVPN_WINDOWS_SERVICE_ERR -PassThru; [Console]::Error.WriteLine("windows_launch_phase=process_started"); $p.Id')"
-          unset DOBBYVPN_WINDOWS_SERVICE_BINARY DOBBYVPN_WINDOWS_SERVICE_LOG DOBBYVPN_WINDOWS_SERVICE_ERR DOBBYVPN_WINDOWS_PROGRAMDATA
+          export DOBBYVPN_WINDOWS_SERVICE_PID_FILE="$(cygpath -w "$service_pid_file" | tr -d '\r')"
+          export DOBBYVPN_WINDOWS_SERVICE_IDENTITY_FILE="$service_identity_file_windows"
+          # Publish the cleanup path before launch.  The PID file is the only
+          # handoff; no native child stdout is captured by Bash.
+          printf 'SERVICE_PID_FILE=%s\nSERVICE_IDENTITY_FILE=%s\nSERVICE_BINARY=%s\nSERVICE_LOG=%s\n' "$service_pid_file" "$service_identity_file" "$service_binary" "$service_log" >> "$GITHUB_ENV"
+          launch_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 60))
+          if [ "$launch_remaining" -le 3 ]; then
+            printf 'service launch cannot preserve watchdog grace before deadline: remaining=%s\n' "$launch_remaining" >&2
+            exit 1
+          fi
+          launch_timeout=10
+          if [ "$launch_timeout" -gt "$((launch_remaining - 3))" ]; then launch_timeout="$((launch_remaining - 3))"; fi
+          launch_watchdog_timeout=$((launch_timeout + 3))
+          launch_started_epoch="$(date +%s)"
+          printf 'SERVICE_LAUNCH_STARTED_EPOCH=%s\n' "$launch_started_epoch" >> "$GITHUB_ENV"
+          launch_status=0
+          timeout --signal=TERM --kill-after=1s "${launch_watchdog_timeout}s" \
+            powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; Write-Output "windows_launch_phase=environment"; $env:ProgramData=$env:DOBBYVPN_WINDOWS_PROGRAMDATA; if ([string]::IsNullOrWhiteSpace($env:USERNAME)) { throw "USERNAME is unavailable" }; $account=$env:USERNAME; if (-not [string]::IsNullOrWhiteSpace($env:USERDOMAIN)) { $account="$($env:USERDOMAIN)\$($env:USERNAME)" }; $env:DOBBYVPN_CONTROL_TOKEN_USER=$account; Write-Output "windows_launch_phase=account_ready"; foreach ($path in @($env:DOBBYVPN_WINDOWS_SERVICE_LOG,$env:DOBBYVPN_WINDOWS_SERVICE_ERR,$env:DOBBYVPN_WINDOWS_SERVICE_PID_FILE,$env:DOBBYVPN_WINDOWS_SERVICE_IDENTITY_FILE)) { $item=Get-Item -LiteralPath $path -Force -ErrorAction Stop; if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or -not ($item.PSIsContainer -eq $false)) { throw "launch path is not a regular file" } }; $p=Start-Process -FilePath $env:DOBBYVPN_WINDOWS_SERVICE_BINARY -ArgumentList @("-port","50051") -RedirectStandardOutput $env:DOBBYVPN_WINDOWS_SERVICE_LOG -RedirectStandardError $env:DOBBYVPN_WINDOWS_SERVICE_ERR -PassThru; $info=Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $p.Id) -ErrorAction Stop; if ($null -eq $info -or $null -eq $info.CreationDate) { throw "started process identity unavailable" }; $ticks=$info.CreationDate.ToUniversalTime().Ticks; [System.IO.File]::WriteAllText($env:DOBBYVPN_WINDOWS_SERVICE_PID_FILE, [string]$p.Id, [System.Text.Encoding]::ASCII); [System.IO.File]::WriteAllText($env:DOBBYVPN_WINDOWS_SERVICE_IDENTITY_FILE, ([string]$p.Id + "|" + [string]$ticks), [System.Text.Encoding]::ASCII); Write-Output "windows_launch_phase=process_started"; Write-Output "windows_launch_phase=pid_recorded"; Write-Output ("windows_launch_identity=" + $p.Id + "|" + $ticks)' \
+            > "$launch_log" 2>&1 || launch_status=$?
+          printf 'service_launch_result status=%s\n' "$launch_status"
+          emit_private_evidence service-launch "$launch_log"
+          service_pid=""
+          if [ -f "$service_pid_file" ]; then
+            service_pid="$(tr -d '\r\n' < "$service_pid_file")"
+          fi
+          service_identity=""
+          if [ -f "$service_identity_file" ]; then
+            service_identity="$(tr -d '\r\n' < "$service_identity_file")"
+          fi
+          if ! [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\|[1-9][0-9]+$ ]] || [ "${service_identity%%|*}" != "$service_pid" ]; then
+            discovery_log="$SERVICE_DIR/candidate-discovery.raw.log"
+            : > "$discovery_log"
+            chmod 600 "$discovery_log"
+            discovery_status=1
+            for discovery_attempt in $(seq 1 3); do
+              printf 'candidate_discovery_attempt=%s\n' "$discovery_attempt" >> "$discovery_log"
+              discovery_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 60 - 1))
+              if [ "$discovery_remaining" -le 0 ]; then
+                printf 'candidate discovery reached cleanup reserve: remaining=%s\n' "$discovery_remaining" >> "$discovery_log"
+                break
+              fi
+              discovery_timeout=5
+              if [ "$discovery_timeout" -gt "$discovery_remaining" ]; then discovery_timeout="$discovery_remaining"; fi
+              timeout --foreground --signal=TERM --kill-after=1s "${discovery_timeout}s" \
+                powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; $expected=[System.IO.Path]::GetFullPath($args[0]); $identityPath=$args[1]; $launchEpoch=[DateTimeOffset]::FromUnixTimeSeconds([int64]$args[2]).UtcDateTime.AddSeconds(-2); $matches=@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { if ([string]::IsNullOrWhiteSpace($_.ExecutablePath) -or $null -eq $_.CreationDate) { return $false }; $actual=[System.IO.Path]::GetFullPath([string]$_.ExecutablePath); $actual -ieq $expected -and $_.CreationDate.ToUniversalTime() -ge $launchEpoch }); if ($matches.Count -eq 0) { Write-Output "candidate_discovery=none"; exit 1 }; if ($matches.Count -ne 1) { Write-Output ("candidate_discovery=ambiguous count=" + $matches.Count); exit 2 }; $p=$matches[0]; $ticks=$p.CreationDate.ToUniversalTime().Ticks; [System.IO.File]::WriteAllText($identityPath, ([string]$p.ProcessId + "|" + [string]$ticks), [System.Text.Encoding]::ASCII); Write-Output ("candidate_discovery=selected " + $p.ProcessId + "|" + $ticks)' \
+                "$service_binary_windows" "$service_identity_file_windows" "$launch_started_epoch" >> "$discovery_log" 2>&1 || discovery_status=$?
+              service_identity=""
+              if [ -f "$service_identity_file" ]; then service_identity="$(tr -d '\r\n' < "$service_identity_file")"; fi
+              if [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\|[1-9][0-9]+$ ]]; then
+                service_pid="${service_identity%%|*}"
+                discovery_status=0
+                break
+              fi
+              sleep 1
+            done
+            emit_private_evidence candidate-discovery "$discovery_log"
+          fi
+          if [ "$launch_status" -ne 0 ]; then
+            emit_private_evidence service-log "$service_log"
+            emit_private_evidence service-error "$service_err"
+            emit_private_evidence service-identity "$service_identity_file"
+            emit_private_display service-launch "$launch_log"
+            emit_private_display service-error "$service_err"
+            emit_private_classification service-launch "$launch_log"
+            emit_private_classification service-log "$service_log"
+            emit_private_classification service-error "$service_err"
+            if [ "$launch_status" -eq 124 ]; then
+              printf 'service_launch=failed code=LAUNCH_TIMEOUT status=%s\n' "$launch_status" >&2
+            else
+              printf 'service_launch=failed code=LAUNCH status=%s\n' "$launch_status" >&2
+            fi
+            exit 1
+          fi
+          if ! [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\|[1-9][0-9]+$ ]] || [ "${service_identity%%|*}" != "$service_pid" ]; then
+            emit_private_evidence service-log "$service_log"
+            emit_private_evidence service-error "$service_err"
+            emit_private_evidence service-identity "$service_identity_file"
+            printf 'service_launch=failed code=IDENTITY_UNAVAILABLE\n' >&2
+            exit 1
+          fi
+          printf '%s\n' "$service_pid" > "$service_pid_file"
+          unset DOBBYVPN_WINDOWS_SERVICE_BINARY DOBBYVPN_WINDOWS_SERVICE_LOG DOBBYVPN_WINDOWS_SERVICE_ERR DOBBYVPN_WINDOWS_PROGRAMDATA DOBBYVPN_WINDOWS_SERVICE_PID_FILE DOBBYVPN_WINDOWS_SERVICE_IDENTITY_FILE
           export PROGRAMDATA="$programdata_path"
           printf 'PROGRAMDATA=%s\n' "$PROGRAMDATA" >> "$GITHUB_ENV"
           case "$service_pid" in ""|*[!0-9]*) printf 'invalid service pid=%s\n' "$service_pid" >&2; exit 1;; esac
-          printf '%s\n' "$service_pid" > "$HANDOFF_DIR/service.pid"
-          printf 'SERVICE_PID=%s\nSERVICE_BINARY=%s\nSERVICE_PID_FILE=%s\nSERVICE_LOG=%s\n' "$service_pid" "$service_binary" "$HANDOFF_DIR/service.pid" "$service_log" >> "$GITHUB_ENV"
+          printf '%s\n' "$service_pid" > "$service_pid_file"
+          printf 'SERVICE_PID=%s\nSERVICE_BINARY=%s\n' "$service_pid" "$service_binary" >> "$GITHUB_ENV"
           ready=false
-          for attempt in $(seq 1 60); do
+          readiness_reserve_seconds=180
+          readiness_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - readiness_reserve_seconds))
+          if [ "$readiness_remaining" -le 0 ]; then
+            printf 'service readiness reached cleanup reserve: remaining=%s\n' "$readiness_remaining" >&2
+            exit 1
+          fi
+          readiness_timeout=60
+          if [ "$readiness_timeout" -gt "$readiness_remaining" ]; then readiness_timeout="$readiness_remaining"; fi
+          for attempt in $(seq 1 "$readiness_timeout"); do
             printf 'service_readiness_attempt=%s\n' "$attempt"
-            remaining=$((RUN_DEADLINE_EPOCH - $(date +%s)))
-            if [ "$remaining" -le 180 ]; then printf 'service readiness reached cleanup reserve: remaining=%s\n' "$remaining" >&2; exit 1; fi
+            remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - readiness_reserve_seconds - 1))
+            if [ "$remaining" -le 0 ]; then break; fi
             probe_log="$SERVICE_DIR/service-probe-${attempt}.raw.log"
             probe_status=0
-            powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid" > "$probe_log" 2>&1 || probe_status=$?
+            probe_timeout=10
+            if [ "$probe_timeout" -gt "$remaining" ]; then probe_timeout="$remaining"; fi
+            timeout --foreground --signal=TERM --kill-after=1s "${probe_timeout}s" \
+              powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid" > "$probe_log" 2>&1 || probe_status=$?
             if [ "$probe_status" -ne 0 ]; then
               emit_private_evidence service-probe "$probe_log"
               emit_private_evidence service-log "$service_log"
@@ -919,7 +1223,12 @@ jobs:
             fi
             network_probe_log="$SERVICE_DIR/network-probe-${attempt}.raw.log"
             network_probe_status=0
-            powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$c=Test-NetConnection -ComputerName 127.0.0.1 -Port 50051; Write-Output $c; if ($c.TcpTestSucceeded) { exit 0 }; exit 1' > "$network_probe_log" 2>&1 || network_probe_status=$?
+            network_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - readiness_reserve_seconds - 1))
+            if [ "$network_remaining" -le 0 ]; then break; fi
+            network_probe_timeout=10
+            if [ "$network_probe_timeout" -gt "$network_remaining" ]; then network_probe_timeout="$network_remaining"; fi
+            timeout --foreground --signal=TERM --kill-after=1s "${network_probe_timeout}s" \
+              powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$c=Test-NetConnection -ComputerName 127.0.0.1 -Port 50051; Write-Output $c; if ($c.TcpTestSucceeded) { exit 0 }; exit 1' > "$network_probe_log" 2>&1 || network_probe_status=$?
             if [ "$network_probe_status" -eq 0 ]; then ready=true; break; fi
             emit_private_evidence network-probe "$network_probe_log"
             sleep 1
@@ -940,7 +1249,15 @@ jobs:
           printf 'control_token_ready=1\n'
           status_log="$SERVICE_DIR/control-status.raw.log"
           status_code=0
-          "$GITHUB_WORKSPACE/candidate/dobby-cli.exe" status > "$status_log" 2>&1 || status_code=$?
+          status_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - readiness_reserve_seconds - 1))
+          status_timeout=30
+          if [ "$status_timeout" -gt "$status_remaining" ]; then status_timeout="$status_remaining"; fi
+          if [ "$status_timeout" -le 0 ]; then
+            printf 'control status reached cleanup reserve: remaining=%s\n' "$status_remaining" >&2
+            exit 1
+          fi
+          timeout --foreground --signal=TERM --kill-after=1s "${status_timeout}s" \
+            "$GITHUB_WORKSPACE/candidate/dobby-cli.exe" status > "$status_log" 2>&1 || status_code=$?
           emit_private_evidence control-status "$status_log"
           if [ "$status_code" -ne 0 ]; then
             printf 'control_status=failed code=CLI_STATUS status=%s\n' "$status_code" >&2
@@ -955,18 +1272,20 @@ jobs:
         run: |
           set -euo pipefail
           remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 120))
-          # Eight applicable scenarios plus ten resets require 938 seconds;
+          # Eight applicable scenarios plus ten resets require 950 seconds;
           # keep a deliberate 60-second scheduling margin inside the 1,200s cap.
-          if [ "$remaining" -lt 998 ]; then printf 'insufficient Windows canonical budget before cleanup reserve: seconds=%s required=998\n' "$remaining" >&2; exit 1; fi
+          if [ "$remaining" -lt 1010 ]; then printf 'insufficient Windows canonical budget before cleanup reserve: seconds=%s required=1010\n' "$remaining" >&2; exit 1; fi
           if [ "$remaining" -gt 1200 ]; then remaining=1200; fi
           printf 'canonical_lane_timeout_seconds=%s\n' "$remaining"
+          upload_url="$(cat "$HANDOFF_DIR/upload-url.txt")"
+          test -n "$upload_url"
           python -m torturer_checks.hosted.deadline --timeout-seconds "$remaining" --kill-grace-seconds 30 \
             python -m torturer_checks.hosted.run --platform windows --cli "$GITHUB_WORKSPACE/candidate/dobby-cli.exe" \
             --profile "$HANDOFF_DIR/profile.toml" --source-repository "$SOURCE_REPOSITORY" --source-sha "$SOURCE_SHA" \
             --platform-version "windows-2022" \
             --candidate-manifest "$GITHUB_WORKSPACE/candidate/manifest.json" --server-image-digest "$SERVER_IMAGE_DIGEST" --output "$RESULT_PATH" \
             --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" --download-url "https://proof.ovh.net/files/1Mb.dat" \
-            --upload-url "https://speed.cloudflare.com/__up" --service-pid "$SERVICE_PID" --service-binary "$SERVICE_BINARY" \
+            --upload-url "$upload_url" --service-pid "$SERVICE_PID" --service-binary "$SERVICE_BINARY" \
             --service-socket "$SERVICE_CONTROL_ADDRESS" --service-pid-file "$SERVICE_PID_FILE" \
             --expected-unavailable functional.network-transition=HOSTED_WINDOWS_UPLINK_TOGGLE_UNSUPPORTED \
             --expected-unavailable functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED
@@ -990,38 +1309,98 @@ jobs:
               printf 'diagnostic_evidence label=%s state=missing\n' "$label"
             fi
           }
-          # These single-quoted commands are interpreted by PowerShell, not Bash.
-          # shellcheck disable=SC2016
-          service_pid="${SERVICE_PID:-}"
-          if [ -f "${SERVICE_PID_FILE:-}" ]; then service_pid="$(cat "$SERVICE_PID_FILE")"; fi
-          case "$service_pid" in "") exit 0;; 0|*[!0-9]*) printf 'invalid cleanup pid=%s\n' "$service_pid" >&2; exit 1;; esac
+          # Never trust a bare PID: verify the PID plus creation identity and
+          # executable path immediately before sending any termination signal.
+          service_identity_file="${SERVICE_IDENTITY_FILE:-$HANDOFF_DIR/service.identity}"
+          service_binary="${SERVICE_BINARY:-}"
+          launch_started_epoch="${SERVICE_LAUNCH_STARTED_EPOCH:-}"
+          service_identity=""
+          discovery_status=2
+          if [ -f "$service_identity_file" ]; then service_identity="$(tr -d '\r\n' < "$service_identity_file")"; fi
+          if ! [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\|[1-9][0-9]+$ ]] && [ -n "$service_binary" ]; then
+            if ! [[ "$launch_started_epoch" =~ ^[0-9]+$ ]]; then
+              printf 'cleanup cannot perform exact candidate discovery without launch identity\n' >&2
+              exit 1
+            fi
+            discovery_log="$SERVICE_DIR/cleanup-discovery.raw.log"
+            : > "$discovery_log"
+            chmod 600 "$discovery_log"
+            service_binary_windows="$(cygpath -w "$service_binary" | tr -d '\r')"
+            discovery_status=0
+            discovery_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 60 - 1))
+            if [ "$discovery_remaining" -le 0 ]; then
+              printf 'cleanup discovery reached cleanup deadline: remaining=%s\n' "$discovery_remaining" >> "$discovery_log"
+              discovery_status=124
+            else
+              discovery_timeout=10
+              if [ "$discovery_timeout" -gt "$discovery_remaining" ]; then discovery_timeout="$discovery_remaining"; fi
+              timeout --foreground --signal=TERM --kill-after=1s "${discovery_timeout}s" \
+                powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; $expected=[System.IO.Path]::GetFullPath($args[0]); $identityPath=$args[1]; $launchEpoch=[DateTimeOffset]::FromUnixTimeSeconds([int64]$args[2]).UtcDateTime.AddSeconds(-2); $matches=@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { if ([string]::IsNullOrWhiteSpace($_.ExecutablePath) -or $null -eq $_.CreationDate) { return $false }; $actual=[System.IO.Path]::GetFullPath([string]$_.ExecutablePath); $actual -ieq $expected -and $_.CreationDate.ToUniversalTime() -ge $launchEpoch }); if ($matches.Count -eq 0) { Write-Output "cleanup_discovery=none"; exit 2 }; if ($matches.Count -ne 1) { Write-Output ("cleanup_discovery=ambiguous count=" + $matches.Count); exit 3 }; $p=$matches[0]; $ticks=$p.CreationDate.ToUniversalTime().Ticks; [System.IO.File]::WriteAllText($identityPath, ([string]$p.ProcessId + "|" + [string]$ticks), [System.Text.Encoding]::ASCII); Write-Output ("cleanup_discovery=selected " + $p.ProcessId + "|" + $ticks)' \
+              "$service_binary_windows" "$(cygpath -w "$service_identity_file" | tr -d '\r')" "$launch_started_epoch" > "$discovery_log" 2>&1 || discovery_status=$?
+            fi
+            emit_private_evidence cleanup-discovery "$discovery_log"
+            if [ "$discovery_status" -eq 0 ] && [ -f "$service_identity_file" ]; then service_identity="$(tr -d '\r\n' < "$service_identity_file")"; fi
+          fi
+          if ! [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\|[1-9][0-9]+$ ]]; then
+            if [ "${discovery_status:-2}" -eq 2 ]; then
+              printf 'candidate service was not running at cleanup\n'
+              exit 0
+            fi
+            emit_private_evidence service-identity "$service_identity_file"
+            printf 'service_cleanup=failed code=IDENTITY_UNAVAILABLE\n' >&2
+            exit 1
+          fi
+          service_pid="${service_identity%%|*}"
+          service_binary_windows="$(cygpath -w "$service_binary" | tr -d '\r')"
+          cleanup_deadline_epoch=$((RUN_DEADLINE_EPOCH - 60))
+          verify_script=' $ErrorActionPreference="Stop"; $parts=$args[0] -split "\\|",2; $expected=[System.IO.Path]::GetFullPath($args[1]); $p=Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f ([int]$parts[0])) -ErrorAction Stop; if ($null -eq $p) { Write-Output "service_state=gone"; exit 2 }; $actual=[System.IO.Path]::GetFullPath([string]$p.ExecutablePath); $ticks=$p.CreationDate.ToUniversalTime().Ticks; if ($actual -ine $expected) { Write-Output ("service_state=path-mismatch actual=" + $actual); exit 3 }; if ([string]$parts[1] -ne [string]$ticks) { Write-Output ("service_state=identity-mismatch actual=" + $p.ProcessId + "|" + $ticks); exit 4 }; Write-Output ("service_state=running identity=" + $parts[0] + "|" + $ticks); exit 0'
           cleanup_probe_log="$SERVICE_DIR/cleanup-probe-initial.raw.log"
           cleanup_probe_status=0
-          powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid" > "$cleanup_probe_log" 2>&1 || cleanup_probe_status=$?
+          remaining=$((cleanup_deadline_epoch - $(date +%s)))
+          probe_timeout=10
+          if [ "$probe_timeout" -gt "$remaining" ]; then probe_timeout="$remaining"; fi
+          if [ "$probe_timeout" -le 0 ]; then printf 'service_cleanup=failed code=CLEANUP_DEADLINE\n' >&2; exit 1; fi
+          timeout --foreground --signal=TERM --kill-after=1s "${probe_timeout}s" \
+            powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$verify_script" "$service_identity" "$service_binary_windows" > "$cleanup_probe_log" 2>&1 || cleanup_probe_status=$?
           emit_private_evidence cleanup-probe "$cleanup_probe_log"
-          if [ "$cleanup_probe_status" -eq 0 ]; then
+          case "$cleanup_probe_status" in
+            0) running=true;;
+            2) running=false;;
+            *) printf 'service_cleanup=failed code=IDENTITY_PROBE status=%s\n' "$cleanup_probe_status" >&2; exit 1;;
+          esac
+          stopped=false
+          if [ "$running" = true ]; then
             taskkill_log="$SERVICE_DIR/taskkill.raw.log"
             taskkill_status=0
-            taskkill.exe /PID "$service_pid" /T /F > "$taskkill_log" 2>&1 || taskkill_status=$?
+            remaining=$((cleanup_deadline_epoch - $(date +%s)))
+            kill_timeout=30
+            if [ "$kill_timeout" -gt "$remaining" ]; then kill_timeout="$remaining"; fi
+            if [ "$kill_timeout" -le 0 ]; then printf 'service_cleanup=failed code=CLEANUP_DEADLINE\n' >&2; exit 1; fi
+            timeout --foreground --signal=TERM --kill-after=1s "${kill_timeout}s" \
+              taskkill.exe /PID "$service_pid" /T /F > "$taskkill_log" 2>&1 || taskkill_status=$?
             emit_private_evidence taskkill "$taskkill_log"
             if [ "$taskkill_status" -ne 0 ]; then
-              printf 'service_cleanup=failed code=TASKKILL status=%s\n' "$taskkill_status" >&2
-              exit "$taskkill_status"
+              printf 'service_cleanup=taskkill status=%s; continuing identity verification\n' "$taskkill_status" >&2
             fi
-            stopped=false
             for attempt in $(seq 1 30); do
               printf 'service_cleanup_attempt=%s\n' "$attempt"
+              remaining=$((cleanup_deadline_epoch - $(date +%s)))
+              if [ "$remaining" -le 0 ]; then break; fi
               cleanup_probe_log="$SERVICE_DIR/cleanup-probe-${attempt}.raw.log"
               cleanup_probe_status=0
-              powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid" > "$cleanup_probe_log" 2>&1 || cleanup_probe_status=$?
+              probe_timeout=10
+              if [ "$probe_timeout" -gt "$remaining" ]; then probe_timeout="$remaining"; fi
+              timeout --foreground --signal=TERM --kill-after=1s "${probe_timeout}s" \
+                powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$verify_script" "$service_identity" "$service_binary_windows" > "$cleanup_probe_log" 2>&1 || cleanup_probe_status=$?
               emit_private_evidence cleanup-probe "$cleanup_probe_log"
-              if [ "$cleanup_probe_status" -ne 0 ]; then stopped=true; break; fi
+              if [ "$cleanup_probe_status" -eq 2 ]; then stopped=true; break; fi
+              if [ "$cleanup_probe_status" -ne 0 ]; then printf 'service_cleanup=failed code=IDENTITY_PROBE status=%s\n' "$cleanup_probe_status" >&2; exit 1; fi
               sleep 1
             done
-            test "$stopped" = true
           else
-            printf 'candidate service was not running at cleanup\n'
+            stopped=true
           fi
+          test "$stopped" = true
 
       - name: Upload safe Windows functional result
         if: always()
@@ -1056,7 +1435,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/recipient.key"
+          rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/upload-url.txt" "$HANDOFF_DIR/recipient.key"
 
   controller:
     name: Dispatch isolated Windows Render lease controller

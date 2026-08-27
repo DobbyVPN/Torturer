@@ -58,7 +58,11 @@ permissions:
   actions: write
 
 concurrency:
-  group: trusted-render-lease-${{ inputs.origin_run_id }}-${{ inputs.platform }}
+  # One two-service lease at a time protects the Render account-wide service
+  # cap.  The unattended functional controller must dispatch platforms
+  # sequentially and wait for verified cleanup; this is only an admission
+  # guard, not a matrix queue.
+  group: trusted-render-lease-account
   cancel-in-progress: false
 
 jobs:
@@ -84,6 +88,9 @@ jobs:
       RENDER_IMAGE_OWNER_ID: ${{ vars.RENDER_IMAGE_OWNER_ID }}
       RENDER_IMAGE_PATH: ${{ vars.RENDER_IMAGE_PATH }}
       RENDER_IMAGE_DIGEST: ${{ vars.RENDER_IMAGE_DIGEST }}
+      RENDER_SINK_IMAGE_OWNER_ID: ${{ vars.RENDER_SINK_IMAGE_OWNER_ID }}
+      RENDER_SINK_IMAGE_PATH: ${{ vars.RENDER_SINK_IMAGE_PATH }}
+      RENDER_SINK_IMAGE_DIGEST: ${{ vars.RENDER_SINK_IMAGE_DIGEST }}
       RENDER_REGION: ${{ vars.RENDER_REGION }}
       # The lease is dispatched asynchronously.  The branch may advance between
       # the client workflow and this controller, so trust only the exact
@@ -125,8 +132,26 @@ jobs:
               raise SystemExit("lease run identity mismatch")
           started = datetime.datetime.fromisoformat(run["run_started_at"].replace("Z", "+00:00"))
           deadline = int(started.timestamp()) + 30 * 60
-          reserve = 120
-          cleanup_command_seconds = 44
+          # RenderAPI uses a 20-second transport timeout, two retries, and
+          # 0.5s/1s backoff.  A stale journal can require an exact existence
+          # probe, delete, and final existence probe per service.  A
+          # journal-only namespace repair can additionally require one list,
+          # delete+verify for each unknown service, a second list, and the
+          # final absence list.  The one-known/one-unknown two-service case is
+          # the worst bounded path: eight API calls at 61.5 seconds each.
+          render_api_timeout_seconds = 20
+          render_api_retry_attempts = 2
+          render_api_backoff_seconds = 0.5 + 1.0
+          render_api_attempt_seconds = (
+              (render_api_retry_attempts + 1) * render_api_timeout_seconds
+              + render_api_backoff_seconds
+          )
+          cleanup_provider_api_calls = 8
+          cleanup_provider_worst_case_seconds = (
+              cleanup_provider_api_calls * render_api_attempt_seconds
+          )
+          cleanup_command_seconds = 600
+          reserve = 680
           cleanup_kill_grace_seconds = 1
           plaintext_cleanup_seconds = 4
           plaintext_kill_grace_seconds = 1
@@ -140,9 +165,13 @@ jobs:
               evidence_upload_seconds,
               finalization_overhead_seconds,
           )
+          if cleanup_provider_worst_case_seconds >= cleanup_command_seconds:
+              raise SystemExit(
+                  "cleanup command budget does not cover worst-case provider retries"
+              )
           if sum(finalization_components) > reserve:
               raise SystemExit(
-                  "finalization sub-budgets exceed the 120-second cleanup reserve"
+                  "finalization sub-budgets exceed the configured cleanup reserve"
               )
           if int(datetime.datetime.now(datetime.timezone.utc).timestamp()) >= deadline:
               raise SystemExit("lease workflow already exceeded its hard deadline")
@@ -150,6 +179,10 @@ jobs:
               output.write(f"LEASE_DEADLINE_EPOCH={deadline}\n")
               output.write(f"LEASE_CLEANUP_RESERVE_SECONDS={reserve}\n")
               output.write(f"LEASE_CLEANUP_COMMAND_SECONDS={cleanup_command_seconds}\n")
+              output.write(
+                  "LEASE_CLEANUP_PROVIDER_WORST_CASE_SECONDS="
+                  f"{int(cleanup_provider_worst_case_seconds)}\n"
+              )
               output.write(f"LEASE_CLEANUP_KILL_GRACE_SECONDS={cleanup_kill_grace_seconds}\n")
               output.write(f"LEASE_PLAINTEXT_CLEANUP_SECONDS={plaintext_cleanup_seconds}\n")
               output.write(f"LEASE_PLAINTEXT_KILL_GRACE_SECONDS={plaintext_kill_grace_seconds}\n")
@@ -158,6 +191,10 @@ jobs:
           print(f"lease_workflow_started_epoch={int(started.timestamp())}")
           print(f"lease_workflow_deadline_epoch={deadline}")
           print(f"lease_cleanup_reserve_seconds={reserve}")
+          print(
+              "lease_cleanup_provider_worst_case_seconds="
+              f"{int(cleanup_provider_worst_case_seconds)}"
+          )
           print(f"lease_finalization_sub_budget_sum={sum(finalization_components)}")
           PY
           unset GH_TOKEN
@@ -218,6 +255,16 @@ jobs:
               raise SystemExit("RENDER_IMAGE_PATH must end in the configured digest")
           if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{2,255}", image_path):
               raise SystemExit("RENDER_IMAGE_PATH is invalid")
+          sink_digest = os.environ["RENDER_SINK_IMAGE_DIGEST"]
+          sink_path = os.environ["RENDER_SINK_IMAGE_PATH"]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", sink_digest):
+              raise SystemExit("RENDER_SINK_IMAGE_DIGEST is not immutable")
+          if not sink_path.endswith("@" + sink_digest):
+              raise SystemExit("RENDER_SINK_IMAGE_PATH must end in the configured digest")
+          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{2,255}", sink_path):
+              raise SystemExit("RENDER_SINK_IMAGE_PATH is invalid")
+          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{1,99}", os.environ["RENDER_SINK_IMAGE_OWNER_ID"]):
+              raise SystemExit("RENDER_SINK_IMAGE_OWNER_ID is invalid")
           for name in ("RENDER_OWNER_ID", "RENDER_IMAGE_OWNER_ID"):
               if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{1,99}", os.environ[name]):
                   raise SystemExit(f"{name} is invalid")
@@ -249,6 +296,8 @@ jobs:
           value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           if value.get("id") != int(os.environ["ORIGIN_RUN_ID"]):
               raise SystemExit("origin run identity mismatch")
+          if value.get("run_attempt") != int(os.environ["ORIGIN_RUN_ATTEMPT"]):
+              raise SystemExit("origin run attempt mismatch")
           if value.get("repository", {}).get("full_name") != os.environ["GITHUB_REPOSITORY"]:
               raise SystemExit("origin run repository mismatch")
           if value.get("event") != "workflow_dispatch":
@@ -341,7 +390,7 @@ jobs:
           print("lease_request=validated")
           PY
 
-      - name: Acquire one disposable Render service and profile
+      - name: Acquire disposable Render service and upload sink
         env:
           RENDER_API_TOKEN: ${{ secrets.RENDER_API_TOKEN }}
         run: |
@@ -361,9 +410,7 @@ jobs:
             printf 'Render acquisition has no bounded readiness budget: seconds=%s\n' "$readiness_timeout" >&2
             exit 1
           fi
-          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.deadline \
-            --timeout-seconds "$command_timeout" --kill-grace-seconds 1 \
-            env PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_provider.lease_cli acquire \
+          acquire_args=(
             --request "$LEASE_DIR/request/unpacked/request.json" \
             --owner-id "$RENDER_OWNER_ID" \
             --image-owner-id "$RENDER_IMAGE_OWNER_ID" \
@@ -375,11 +422,75 @@ jobs:
             --region "$RENDER_REGION" \
             --timeout-seconds "$readiness_timeout" \
             --poll-seconds 5
+          )
+          acquire_args+=(
+            --sink-image-owner-id "$RENDER_SINK_IMAGE_OWNER_ID" \
+            --sink-image-path "$RENDER_SINK_IMAGE_PATH" \
+            --expected-sink-image-digest "$RENDER_SINK_IMAGE_DIGEST" \
+            --upload-url-output "$LEASE_DIR/upload-url.txt"
+          )
+          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.deadline \
+            --timeout-seconds "$command_timeout" --kill-grace-seconds 1 \
+            env PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_provider.lease_cli acquire "${acquire_args[@]}"
           test -f "$LEASE_DIR/profile.toml"
           test -f "$LEASE_DIR/lease.json"
           test -f "$LEASE_DIR/journal.json"
+          test -f "$LEASE_DIR/upload-url.txt"
+          python3 - "$LEASE_DIR/lease.json" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
 
-      - name: Encrypt and publish the profile handoff
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if not isinstance(value, dict):
+              raise SystemExit("lease bundle is not an object")
+          expected = {
+              "schema": 2,
+              "kind": "dobbyvpn.render-lease",
+              "run_id": os.environ["LEASE_RUN_ID"],
+              "platform": os.environ["PLATFORM"],
+              "source_sha": os.environ["ORIGIN_SOURCE_SHA"],
+              "state": "issued",
+          }
+          if set(value) != set(expected) | {"services"}:
+              raise SystemExit("lease bundle has an unsafe top-level shape")
+          for key, wanted in expected.items():
+              if value.get(key) != wanted:
+                  raise SystemExit(f"lease bundle field {key} is invalid")
+          services = value.get("services")
+          if not isinstance(services, list) or len(services) != 2:
+              raise SystemExit("lease must contain exactly two services")
+          expected_digests = {
+              "outline": os.environ["RENDER_IMAGE_DIGEST"],
+              "upload-sink": os.environ["RENDER_SINK_IMAGE_DIGEST"],
+          }
+          services_by_role = {}
+          for service in services:
+              if not isinstance(service, dict) or set(service) != {"role", "service_id", "image_digest", "provider_generation"}:
+                  raise SystemExit("lease service shape is invalid")
+              role = service["role"]
+              if role not in expected_digests or role in services_by_role:
+                  raise SystemExit("lease service roles are incomplete or duplicated")
+              services_by_role[role] = service
+              if not isinstance(service["service_id"], str) or not re.fullmatch(r"srv-[A-Za-z0-9][A-Za-z0-9_-]{1,99}", service["service_id"]):
+                  raise SystemExit("lease service ID is invalid")
+              if not isinstance(service["image_digest"], str) or service["image_digest"] != expected_digests[role]:
+                  raise SystemExit("lease service image identity is invalid")
+              if not isinstance(service["provider_generation"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{1,99}", service["provider_generation"]):
+                  raise SystemExit("lease provider generation is invalid")
+          if set(services_by_role) != set(expected_digests):
+              raise SystemExit("lease service roles are incomplete or duplicated")
+          service_ids = [service["service_id"] for service in services]
+          if len(set(service_ids)) != len(service_ids):
+              raise SystemExit("lease service IDs must be distinct")
+          if any(token in json.dumps(value).lower() for token in ("url", "path", "password", "secret")):
+              raise SystemExit("safe lease record contains private handoff data")
+          print("lease_identity=validated")
+          PY
+
+      - name: Encrypt and publish the profile and upload handoffs
         run: |
           set -euo pipefail
           umask 077
@@ -388,7 +499,14 @@ jobs:
             printf 'profile encryption reached the cleanup reserve: remaining=%s\n' "$remaining" >&2
             exit 1
           fi
-          encryption_timeout=$((remaining - 1))
+          # Encrypt two independent CMS handoffs.  Split the remaining
+          # budget so both bounded children and their one-second reaping tails
+          # stay inside the shared finalization reserve.
+          encryption_timeout=$(( (remaining - 3) / 2 ))
+          if [ "$encryption_timeout" -le 0 ]; then
+            printf 'insufficient aggregate CMS encryption budget: seconds=%s\n' "$remaining" >&2
+            exit 1
+          fi
           if [ "$encryption_timeout" -gt 60 ]; then encryption_timeout=60; fi
           printf 'profile_encryption_timeout_seconds=%s\n' "$encryption_timeout"
           PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.deadline \
@@ -400,6 +518,16 @@ jobs:
             "$LEASE_DIR/request/unpacked/recipient.crt"
           test -s "$LEASE_DIR/profile.cms"
           rm -f "$LEASE_DIR/profile.toml"
+          test -s "$LEASE_DIR/upload-url.txt"
+          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.deadline \
+            --timeout-seconds "$encryption_timeout" --kill-grace-seconds 1 \
+            openssl cms -encrypt -binary -aes-256-gcm \
+            -in "$LEASE_DIR/upload-url.txt" \
+            -out "$LEASE_DIR/upload.cms" \
+            -outform DER \
+            "$LEASE_DIR/request/unpacked/recipient.crt"
+          test -s "$LEASE_DIR/upload.cms"
+          rm -f "$LEASE_DIR/upload-url.txt"
 
       - name: Upload encrypted profile and safe lease record
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
@@ -409,6 +537,7 @@ jobs:
           path: |
             ${{ env.LEASE_DIR }}/profile.cms
             ${{ env.LEASE_DIR }}/lease.json
+            ${{ env.LEASE_DIR }}/upload.cms
           if-no-files-found: error
           retention-days: 1
 
@@ -534,7 +663,7 @@ jobs:
             command_timeout="$LEASE_PLAINTEXT_CLEANUP_SECONDS"
           fi
           timeout --foreground --signal=TERM --kill-after="${LEASE_PLAINTEXT_KILL_GRACE_SECONDS}s" "${command_timeout}s" \
-            rm -f "$lease_dir/profile.toml" "$lease_dir/request/unpacked/recipient.crt"
+            rm -f "$lease_dir/profile.toml" "$lease_dir/upload-url.txt" "$lease_dir/request/unpacked/recipient.crt"
 
       - name: Upload safe lease journal
         if: always()
