@@ -4,6 +4,7 @@ import copy
 import gc
 import hashlib
 import os
+import signal
 import socket
 from pathlib import Path
 import subprocess
@@ -23,10 +24,13 @@ from torturer_checks.hosted.cli import (
     _ProcessSnapshotProvider,
     _ProcessIdentity,
     _ProcessProbeError,
+    _direct_tree_status,
     _identity_live,
+    _linux_child_pids,
     _tree_status,
     _bounded_reap_process,
     _bounded_capture,
+    _consume_subreaper_status,
     _parse_macos_process_snapshot,
 )
 from torturer_checks.hosted.linux import (
@@ -99,6 +103,39 @@ class FakeRunner:
             self.connected = False
             return CommandResult(argv, 0, b"DISCONNECTED\n", b"")
         raise AssertionError(argv)
+
+
+class SequencedIdentityRunner(FakeRunner):
+    """Return exact external identities in order, then repeat the last one."""
+
+    def __init__(
+        self, identities: list[bytes], *, disconnected_status_delay: int = 0
+    ) -> None:
+        super().__init__()
+        if not identities:
+            raise ValueError("identity sequence must not be empty")
+        self.identities = identities
+        self.disconnected_status_delay = disconnected_status_delay
+
+    def run(self, command, *, timeout_seconds):
+        argv = tuple(command)
+        if (
+            len(argv) > 1
+            and argv[1] == "status"
+            and not self.connected
+            and self.disconnected_status_delay > 0
+        ):
+            self.calls.append(argv)
+            self.timeouts.append(float(timeout_seconds))
+            self.disconnected_status_delay -= 1
+            return CommandResult(argv, 0, b'{"code":2,"state":"Connected"}\n', b"")
+        if len(argv) > 1 and argv[1] == "external-ip":
+            self.calls.append(argv)
+            self.timeouts.append(float(timeout_seconds))
+            index = min(self.external_calls, len(self.identities) - 1)
+            self.external_calls += 1
+            return CommandResult(argv, 0, self.identities[index], b"")
+        return super().run(command, timeout_seconds=timeout_seconds)
 
 
 class HostedCLIAdapterTests(unittest.TestCase):
@@ -178,6 +215,72 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertEqual(runner.calls[0][0], "curl")
         self.assertIn("--show-error", runner.calls[0])
         self.assertNotIn("--silent", runner.calls[0])
+
+    def test_routing_identity_waits_for_convergence_without_classifying_baseline_as_tunnel(self) -> None:
+        baseline = b"198.51.100.10\n"
+        tunneled = b"203.0.113.10\n"
+        runner = SequencedIdentityRunner([baseline, baseline, tunneled])
+        adapter = HostedCLIAdapter(cli=self.cli, profile=self.profile, runner=runner)
+
+        adapter.execute(ScenarioStep(id="connect", operation="connect", timeout_seconds=5))
+        with mock.patch("torturer_checks.hosted.cli.time.sleep") as sleep:
+            result = adapter.execute(
+                ScenarioStep(
+                    id="routing",
+                    operation="observe_routing_identity",
+                    timeout_seconds=5,
+                )
+            )
+
+        self.assertEqual(result, {"routing_identity_changed": True})
+        self.assertEqual(adapter._tunneled_ips, {"203.0.113.10"})
+        self.assertEqual(runner.external_calls, 3)
+        sleep.assert_called_once()
+
+    def test_disconnect_waits_for_status_and_route_restoration(self) -> None:
+        baseline = b"198.51.100.10\n"
+        tunneled = b"203.0.113.10\n"
+        runner = SequencedIdentityRunner(
+            [baseline, tunneled, tunneled, baseline],
+            disconnected_status_delay=1,
+        )
+        adapter = HostedCLIAdapter(cli=self.cli, profile=self.profile, runner=runner)
+
+        adapter.execute(ScenarioStep(id="connect", operation="connect", timeout_seconds=5))
+        adapter.execute(
+            ScenarioStep(
+                id="routing",
+                operation="observe_routing_identity",
+                timeout_seconds=5,
+            )
+        )
+        with mock.patch("torturer_checks.hosted.cli.time.sleep") as sleep:
+            result = adapter.execute(
+                ScenarioStep(id="disconnect", operation="disconnect", timeout_seconds=5)
+            )
+
+        self.assertEqual(result, {"disconnect_clean": True})
+        self.assertEqual(runner.external_calls, 4)
+        self.assertEqual(sum(call[1] == "status" for call in runner.calls), 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_routing_convergence_returns_false_at_exact_deadline(self) -> None:
+        runner = SequencedIdentityRunner([b"198.51.100.10\n"])
+        adapter = HostedCLIAdapter(cli=self.cli, profile=self.profile, runner=runner)
+        adapter._baseline_ip = "198.51.100.10"
+
+        with (
+            mock.patch(
+                "torturer_checks.hosted.cli.time.monotonic",
+                side_effect=[100.0, 100.1, 105.0],
+            ),
+            mock.patch("torturer_checks.hosted.cli.time.sleep") as sleep,
+        ):
+            self.assertFalse(adapter._wait_for_routing_identity_changed(5.0))
+
+        self.assertEqual(adapter._tunneled_ips, set())
+        self.assertEqual(runner.external_calls, 1)
+        sleep.assert_not_called()
 
     def test_factory_derives_test_owned_endpoints_for_every_desktop(self) -> None:
         token = "a" * 32
@@ -282,9 +385,26 @@ class HostedCLIAdapterTests(unittest.TestCase):
     def test_disconnect_fails_when_status_is_clean_but_identity_is_not_restored(self) -> None:
         self.runner.restore_identity = False
         scenario = get_scenario("functional.disconnect-cleanup")
-        result = FunctionalEngine(scenario_set_digest="a" * 64).run(
-            scenario, self.adapter, _provenance(self.adapter)
-        )
+
+        class Clock:
+            now = 100.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+            def sleep(self, seconds: float) -> None:
+                self.now += seconds
+
+        clock = Clock()
+        with (
+            mock.patch(
+                "torturer_checks.hosted.cli.time.monotonic", side_effect=clock.monotonic
+            ),
+            mock.patch("torturer_checks.hosted.cli.time.sleep", side_effect=clock.sleep),
+        ):
+            result = FunctionalEngine(scenario_set_digest="a" * 64).run(
+                scenario, self.adapter, _provenance(self.adapter)
+            )
         self.assertEqual(result.outcome, "failed")
         self.assertEqual(result.reason_code, "ASSERTION_FAILED")
         self.assertFalse(
@@ -428,7 +548,9 @@ class HostedCLIAdapterTests(unittest.TestCase):
         metrics = {"latency_ms": 1.0, "download_mbps": 2.0, "upload_mbps": 3.0}
         with (
             mock.patch.object(adapter, "_connected", return_value=True),
-            mock.patch.object(adapter, "_routing_identity_changed", return_value=True),
+            mock.patch.object(
+                adapter, "_wait_for_routing_identity_changed", return_value=True
+            ),
             mock.patch.object(adapter, "_throughput", return_value=metrics) as throughput,
             mock.patch(
                 "torturer_checks.hosted.cli.time.monotonic",
@@ -461,7 +583,9 @@ class HostedCLIAdapterTests(unittest.TestCase):
         metrics = {"latency_ms": 1.0, "download_mbps": 2.0, "upload_mbps": 3.0}
         with (
             mock.patch.object(adapter, "_connected", return_value=True),
-            mock.patch.object(adapter, "_routing_identity_changed", return_value=True),
+            mock.patch.object(
+                adapter, "_wait_for_routing_identity_changed", return_value=True
+            ),
             mock.patch.object(
                 adapter,
                 "_throughput",
@@ -487,7 +611,9 @@ class HostedCLIAdapterTests(unittest.TestCase):
         )
         with (
             mock.patch.object(adapter, "_connected", return_value=True),
-            mock.patch.object(adapter, "_routing_identity_changed", return_value=True),
+            mock.patch.object(
+                adapter, "_wait_for_routing_identity_changed", return_value=True
+            ),
             mock.patch.object(
                 adapter,
                 "_throughput",
@@ -748,14 +874,20 @@ class HostedCLIAdapterTests(unittest.TestCase):
         adapter.service = service  # type: ignore[assignment]
         adapter._baseline_ip = "198.51.100.10"
         self.runner.external_calls = 1
-        with mock.patch(
-            "torturer_checks.hosted.linux.time.monotonic",
-            side_effect=[100.0, 101.0, 102.0, 103.0, 104.0],
+        with (
+            mock.patch(
+                "torturer_checks.hosted.linux.time.monotonic",
+                side_effect=[100.0, 101.0, 102.0, 103.0, 104.0],
+            ),
+            mock.patch.object(
+                adapter, "_wait_for_routing_identity_changed", return_value=True
+            ) as wait_for_routing,
         ):
             result = adapter._process_loss(10)
         self.assertEqual(result, {"process_loss_verified": True})
         self.assertEqual(service.timeouts, [9.0])
-        self.assertEqual(self.runner.timeouts, [8.0, 7.0, 6.0])
+        self.assertEqual(self.runner.timeouts, [8.0, 7.0])
+        wait_for_routing.assert_called_once_with(6.0)
 
     def test_linux_process_loss_rejects_expired_deadline_instead_of_using_minimum(self) -> None:
         class FakeService:
@@ -932,6 +1064,152 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertNotEqual(
             evidence[0]["evidence_sha256"], hashlib.sha256(retained_path.read_bytes()).hexdigest()
         )
+
+    @unittest.skipUnless(
+        os.name == "posix" and Path("/proc").is_dir(),
+        "Linux subreaper assertion requires procfs",
+    )
+    def test_subprocess_runner_preserves_stdin_and_nonzero_status(self) -> None:
+        raw = Path(self.directory.name) / "stdin-status-raw"
+        runner = SubprocessRunner(raw)
+        result = runner.run_with_input(
+            (
+                sys.executable,
+                "-c",
+                "import sys; data=sys.stdin.buffer.read(); sys.stdout.buffer.write(data); raise SystemExit(23)",
+            ),
+            timeout_seconds=5,
+            input_bytes=b"private-stdin-marker\n",
+        )
+        self.assertEqual(result.returncode, 23)
+        self.assertEqual(result.stdout, b"private-stdin-marker\n")
+        retained = next(raw.glob("command-001*.raw.log")).read_bytes()
+        self.assertIn(b"returncode=23", retained)
+        self.assertNotIn(b"linux_subreaper.py", retained)
+
+    @unittest.skipUnless(
+        os.name == "posix" and Path("/proc").is_dir(),
+        "Linux subreaper assertion requires procfs",
+    )
+    def test_subprocess_runner_preserves_sigkill_status(self) -> None:
+        raw = Path(self.directory.name) / "sigkill-status-raw"
+        runner = SubprocessRunner(raw)
+        result = runner.run(
+            (
+                sys.executable,
+                "-c",
+                "import os,signal; os.kill(os.getpid(), signal.SIGKILL)",
+            ),
+            timeout_seconds=5,
+        )
+        self.assertEqual(result.returncode, -signal.SIGKILL)
+        retained = next(raw.glob("command-001*.raw.log")).read_bytes()
+        self.assertIn(b"returncode=-9", retained)
+
+    @unittest.skipUnless(
+        os.name == "posix" and Path("/proc").is_dir(),
+        "Linux subreaper assertion requires procfs",
+    )
+    def test_subprocess_runner_missing_command_fails_closed_after_retention(self) -> None:
+        raw = Path(self.directory.name) / "missing-command-raw"
+        runner = SubprocessRunner(raw)
+        missing = "/dobbyvpn/synthetic-command-does-not-exist"
+        with self.assertRaisesRegex(HostedAdapterError, "COMMAND_UNAVAILABLE"):
+            runner.run((missing,), timeout_seconds=5)
+        retained = next(raw.glob("command-001*.raw.log")).read_bytes()
+        self.assertIn(f"argv={missing}".encode(), retained)
+        self.assertIn(b"DOBBYVPN_SUBREAPER_EXEC_FAILED", retained)
+        self.assertEqual(runner.safe_evidence()[0]["returncode"], 127)
+
+    def test_subprocess_runner_subreaper_control_failure_is_retained(self) -> None:
+        raw = Path(self.directory.name) / "subreaper-control-raw"
+        runner = SubprocessRunner(raw)
+        command = (sys.executable, "-c", "raise SystemExit(0)")
+
+        def failing_wrapper(_command, *, status_fd):
+            return (
+                sys.executable,
+                "-c",
+                "import os,sys; os.write(int(sys.argv[1]), b'SETUP_FAILED\\n')",
+                str(status_fd),
+            )
+
+        with (
+            mock.patch(
+                "torturer_checks.hosted.cli._linux_contained_argv",
+                side_effect=failing_wrapper,
+            ),
+            self.assertRaisesRegex(HostedAdapterError, "SUBREAPER_UNAVAILABLE"),
+        ):
+            runner.run(command, timeout_seconds=5)
+        retained = next(raw.glob("command-001*.raw.log")).read_bytes()
+        self.assertIn(b"SUBREAPER_STATUS_BEGIN\nSETUP_FAILED\n", retained)
+        self.assertIn(b"argv=" + " ".join(command).encode(), retained)
+
+    @unittest.skipUnless(
+        os.name == "posix" and Path("/proc").is_dir(),
+        "Linux subreaper assertion requires procfs",
+    )
+    def test_candidate_cannot_spoof_subreaper_failure_via_stderr(self) -> None:
+        raw = Path(self.directory.name) / "subreaper-spoof-raw"
+        runner = SubprocessRunner(raw)
+        result = runner.run(
+            (
+                sys.executable,
+                "-c",
+                "import sys; sys.stderr.write('DOBBYVPN_SUBREAPER_SETUP_FAILED\\n')",
+            ),
+            timeout_seconds=5,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(
+            result.stderr,
+            b"DOBBYVPN_SUBREAPER_SETUP_FAILED\n",
+        )
+        retained = next(raw.glob("command-001*.raw.log")).read_bytes()
+        self.assertIn(b"SUBREAPER_STATUS_BEGIN\nREADY\nCOMPLETE\n", retained)
+
+    def test_subprocess_runner_setup_failure_retains_original_command(self) -> None:
+        raw = Path(self.directory.name) / "subreaper-setup-raw"
+        runner = SubprocessRunner(raw)
+        command = ("synthetic-command", "synthetic-argument")
+        with (
+            mock.patch(
+                "torturer_checks.hosted.cli._linux_contained_argv",
+                side_effect=HostedAdapterError("SUBREAPER_UNAVAILABLE"),
+            ),
+            self.assertRaisesRegex(HostedAdapterError, "SUBREAPER_UNAVAILABLE"),
+        ):
+            runner.run(command, timeout_seconds=5)
+        retained = next(raw.glob("command-001*.runner-error.raw.log")).read_bytes()
+        self.assertEqual(
+            retained,
+            b"argv=synthetic-command synthetic-argument\n"
+            b"runner_error=SUBREAPER_UNAVAILABLE\n",
+        )
+        evidence = runner.safe_evidence()[0]
+        self.assertEqual(evidence["runner_error"], "SUBREAPER_UNAVAILABLE")
+        self.assertEqual(evidence["returncode"], None)
+
+    @unittest.skipUnless(os.name == "posix", "descriptor assertion requires POSIX")
+    def test_subreaper_status_read_cannot_cross_absolute_deadline(self) -> None:
+        reader, writer = os.pipe()
+        started = time.monotonic()
+        try:
+            diagnostics, failure = _consume_subreaper_status(
+                reader,
+                required=True,
+                deadline=started + 0.05,
+            )
+            reader = -1
+        finally:
+            if reader >= 0:
+                os.close(reader)
+            os.close(writer)
+        self.assertLess(time.monotonic() - started, 0.3)
+        self.assertEqual(failure, "SUBREAPER_UNAVAILABLE")
+        self.assertIn(b"SUBREAPER_STATUS_READ_TIMEOUT=1", diagnostics)
+        self.assertIn(b"EVIDENCE_INCOMPLETE=1", diagnostics)
 
     @unittest.skipUnless(os.name == "posix", "detached launcher assertion requires POSIX")
     def test_subprocess_runner_detached_launcher_allows_intended_child_and_retains_leader(self) -> None:
@@ -1215,6 +1493,61 @@ class HostedCLIAdapterTests(unittest.TestCase):
             )
         direct_probe.assert_called_once()
 
+    @unittest.skipUnless(os.name == "posix", "direct process probe is POSIX-only")
+    def test_direct_tree_proof_cannot_cross_its_absolute_deadline(self) -> None:
+        identity = (_ProcessIdentity(42, "start", 42),)
+
+        class Clock:
+            now = 0.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+        clock = Clock()
+
+        def late_identity(*_args, **_kwargs) -> bool:
+            clock.now = 2.0
+            return False
+
+        with (
+            mock.patch(
+                "torturer_checks.hosted.cli.time.monotonic",
+                side_effect=clock.monotonic,
+            ),
+            mock.patch(
+                "torturer_checks.hosted.cli._identity_live",
+                side_effect=late_identity,
+            ),
+            mock.patch("torturer_checks.hosted.cli.os.killpg") as killpg,
+        ):
+            self.assertEqual(
+                _direct_tree_status(42, identity, deadline=1.0), "unknown"
+            )
+        killpg.assert_not_called()
+
+        clock.now = 0.0
+
+        def late_group_probe(*_args, **_kwargs) -> None:
+            clock.now = 2.0
+            raise ProcessLookupError
+
+        with (
+            mock.patch(
+                "torturer_checks.hosted.cli.time.monotonic",
+                side_effect=clock.monotonic,
+            ),
+            mock.patch(
+                "torturer_checks.hosted.cli._identity_live", return_value=False
+            ),
+            mock.patch(
+                "torturer_checks.hosted.cli.os.killpg",
+                side_effect=late_group_probe,
+            ),
+        ):
+            self.assertEqual(
+                _direct_tree_status(42, identity, deadline=1.0), "unknown"
+            )
+
     @unittest.skipUnless(os.name == "posix", "process identity probe is POSIX-only")
     def test_posix_identity_probe_error_is_not_proven_gone(self) -> None:
         identity = _ProcessIdentity(42, "creation-time")
@@ -1223,6 +1556,30 @@ class HostedCLIAdapterTests(unittest.TestCase):
             side_effect=_ProcessProbeError("identity probe failed"),
         ):
             self.assertIsNone(_identity_live(identity))
+
+    @unittest.skipUnless(os.name == "posix", "procfs child traversal is POSIX-only")
+    def test_linux_child_walk_reads_every_task_and_fails_closed_on_malformed_state(self) -> None:
+        proc_root = Path(self.directory.name) / "proc"
+        task_root = proc_root / "42" / "task"
+        for task, children in (("42", "100 101\n"), ("43", "102\n")):
+            directory = task_root / task
+            directory.mkdir(parents=True)
+            (directory / "children").write_text(children, encoding="ascii")
+
+        real_path = Path
+
+        def mapped_path(value: str) -> Path:
+            if value == "/proc/42/task":
+                return task_root
+            return real_path(value)
+
+        with mock.patch("torturer_checks.hosted.cli.Path", side_effect=mapped_path):
+            self.assertEqual(_linux_child_pids(42), (100, 101, 102))
+            (task_root / "43" / "children").write_text(
+                "not-a-pid\n", encoding="ascii"
+            )
+            with self.assertRaises(_ProcessProbeError):
+                _linux_child_pids(42)
 
     def test_timeout_output_oserror_retains_partial_bytes_and_marks_incomplete(self) -> None:
         raw = Path(self.directory.name) / "timeout-oserror-raw"
@@ -1483,7 +1840,15 @@ class HostedCLIAdapterTests(unittest.TestCase):
             "child=subprocess.Popen([sys.executable, '-c', sys.argv[1]]); "
             "print(child.pid, flush=True); time.sleep(60)"
         )
-        with self.assertRaisesRegex(HostedAdapterError, "COMMAND_TIMEOUT"):
+        with (
+            mock.patch(
+                "torturer_checks.hosted.cli._process_snapshot",
+                side_effect=AssertionError(
+                    "Linux command monitoring must not scan unrelated host processes"
+                ),
+            ),
+            self.assertRaisesRegex(HostedAdapterError, "COMMAND_TIMEOUT"),
+        ):
             runner.run(
                 (sys.executable, "-c", parent_script, child_script),
                 timeout_seconds=0.6,
@@ -1507,21 +1872,42 @@ class HostedCLIAdapterTests(unittest.TestCase):
         )
         parent_script = (
             "import os,subprocess,sys; child=subprocess.Popen([sys.executable, '-c', sys.argv[1]]); "
-            "print(child.pid, flush=True); import time; time.sleep(0.15); os._exit(0)"
+            "print(child.pid, flush=True); os._exit(0)"
         )
-        with self.assertRaisesRegex(HostedAdapterError, "PROCESS_TREE_UNPROVEN"):
-            runner.run(
-                (sys.executable, "-c", parent_script, child_script),
-                timeout_seconds=2.0,
+        child_pid: int | None = None
+        try:
+            with self.assertRaisesRegex(HostedAdapterError, "COMMAND_TIMEOUT"):
+                runner.run(
+                    (sys.executable, "-c", parent_script, child_script),
+                    timeout_seconds=0.8,
+                )
+            retained = next(raw.glob("command-001*.raw.log"))
+            content = retained.read_bytes()
+            child_pid = int(
+                content.split(b"stdout-begin\n", 1)[1]
+                .split(b"\nstdout-end", 1)[0]
+                .strip()
             )
-        retained = next(raw.glob("command-001*.raw.log"))
-        content = retained.read_bytes()
-        self.assertIn(b"PROCESS_TREE_SURVIVOR_DETECTED=1", content)
-        # A census that reaches the absolute deadline is intentionally
-        # inconclusive; it must never be reported as gone.
-        self.assertRegex(content, rb"PROCESS_TREE_STATUS=(gone|unknown)")
-        self.assertIn(b"EVIDENCE_INCOMPLETE=1", content)
-        self.assertNotIn(b"ResourceWarning", content)
+            self.assertIn(b"PROCESS_TREE_STATUS=gone", content)
+            self.assertNotIn(b"EVIDENCE_INCOMPLETE=1", content)
+            self.assertNotIn(b"ResourceWarning", content)
+            for _ in range(40):
+                stat_path = Path(f"/proc/{child_pid}/stat")
+                try:
+                    state = stat_path.read_text(encoding="ascii").split(") ", 1)[1][0]
+                except FileNotFoundError:
+                    break
+                if state == "Z":
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail(f"detached child process {child_pid} survived cleanup")
+        finally:
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     @unittest.skipUnless(os.name == "posix", "process-tree drain assertion requires POSIX")
     def test_subprocess_runner_marks_evidence_incomplete_after_drain_timeout(self) -> None:

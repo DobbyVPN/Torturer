@@ -333,7 +333,9 @@ class LinuxHostedAdapter(HostedCLIAdapter):
                       self._remaining(deadline, "PROCESS_LOSS_TIMEOUT"), "PROCESS_LOSS_CONNECT_FAILED")
         if not self._connected(self._remaining(deadline, "PROCESS_LOSS_TIMEOUT")):
             raise ScenarioExecutionError("PROCESS_LOSS_NOT_RECOVERED")
-        if not self._routing_identity_changed(self._remaining(deadline, "PROCESS_LOSS_TIMEOUT")):
+        if not self._wait_for_routing_identity_changed(
+            self._remaining(deadline, "PROCESS_LOSS_TIMEOUT")
+        ):
             raise ScenarioExecutionError("PROCESS_LOSS_ROUTING_NOT_RECOVERED")
         return {"process_loss_verified": True}
 

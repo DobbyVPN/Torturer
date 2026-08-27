@@ -317,7 +317,7 @@ class MacOSHostedAdapter(HostedCLIAdapter):
         )
         if not self._connected(self._remaining(deadline, "PROCESS_LOSS_TIMEOUT")):
             raise ScenarioExecutionError("PROCESS_LOSS_NOT_RECOVERED")
-        if not self._routing_identity_changed(
+        if not self._wait_for_routing_identity_changed(
             self._remaining(deadline, "PROCESS_LOSS_TIMEOUT")
         ):
             raise ScenarioExecutionError("PROCESS_LOSS_ROUTING_NOT_RECOVERED")

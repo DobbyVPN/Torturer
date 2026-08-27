@@ -458,8 +458,10 @@ from that single handoff, so hosted qualification does not depend on unrelated
 public identity or transfer providers. The sink marks GET responses `no-store`;
 its identity response uses the client address supplied by Render's Cloudflare
 edge, while its download response is exactly one MiB. This keeps process-loss
-recovery and bounded endurance as real capabilities. Linux
-may advertise network-transition only when the workflow supplies an exact
+recovery and bounded endurance as real capabilities. Connected and disconnected
+route observations allow the identity to converge only within their existing
+scenario deadlines; every probe remains in the runner-local raw command record.
+Linux may advertise network-transition only when the workflow supplies an exact
 non-control interface; Windows and macOS report an explicit uplink-toggle
 limitation because interrupting the runner's control interface would destroy
 the job. Sleep/wake is not advertised on hosted runners because suspending the
