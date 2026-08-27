@@ -138,40 +138,122 @@ def _process_group_alive(process: subprocess.Popen[bytes]) -> bool:
     return True
 
 
-def _proc_descendants(root_pid: int) -> set[int]:
-    """Return recursive descendants using /proc or bounded macOS ``ps``."""
+def _proc_descendants(
+    root_pid: int,
+    *,
+    process: subprocess.Popen[bytes] | None = None,
+) -> set[int]:
+    """Return descendants and retain an unreliable census on ``process``."""
 
     parent_by_pid: dict[int, int] = {}
+    reliable = True
+    census_diagnostics = bytearray()
     proc_root = Path("/proc")
     if proc_root.is_dir():
-        for entry in proc_root.iterdir():
-            if not entry.name.isdigit():
-                continue
-            try:
-                stat_line = (entry / "stat").read_text(encoding="ascii")
-                close = stat_line.rfind(")")
-                fields = stat_line[close + 2 :].split()
-                parent_by_pid[int(entry.name)] = int(fields[1])
-            except (OSError, ValueError, IndexError):
-                continue
-    else:
         try:
-            listing = subprocess.run(
+            for entry in proc_root.iterdir():
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    stat_line = (entry / "stat").read_text(encoding="ascii")
+                    close = stat_line.rfind(")")
+                    fields = stat_line[close + 2 :].split()
+                    parent_by_pid[int(entry.name)] = int(fields[1])
+                except FileNotFoundError:
+                    # A process can disappear between directory enumeration
+                    # and reading /proc/<pid>; this is an expected race.
+                    continue
+                except (OSError, UnicodeError, ValueError, IndexError) as error:
+                    reliable = False
+                    census_diagnostics.extend(
+                        f"procfs-census-entry={entry.name} error={error!r}\n".encode(
+                            "utf-8", errors="replace"
+                        )
+                    )
+        except OSError as error:
+            reliable = False
+            census_diagnostics.extend(
+                f"procfs-census-iteration-error={error!r}\n".encode(
+                    "utf-8", errors="replace"
+                )
+            )
+    else:
+        listing_bytes = b""
+        ps_stderr = b""
+        ps_returncode: int | None = None
+        try:
+            completed = subprocess.run(
                 ["ps", "-axo", "pid=,ppid="],
                 check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=2,
-            ).stdout.decode("ascii", errors="ignore")
-        except (OSError, subprocess.TimeoutExpired):
-            raise IOSSimulatorAppContractError("could not inspect the iOS process tree")
+            )
+            listing_bytes = completed.stdout or b""
+            listing = listing_bytes.decode("ascii", errors="ignore")
+            ps_stderr = completed.stderr or b""
+            ps_returncode = completed.returncode
+            if ps_returncode != 0 or ps_stderr:
+                reliable = False
+                census_diagnostics.extend(
+                    b"ps-census-returncode="
+                    + str(ps_returncode).encode("ascii", errors="replace")
+                    + b"\nps-census-stdout-begin\n"
+                    + listing_bytes
+                    + b"\nps-census-stdout-end\nps-census-stderr-begin\n"
+                    + ps_stderr
+                    + b"\nps-census-stderr-end\n"
+                )
+        except subprocess.TimeoutExpired as error:
+            reliable = False
+            listing = ""
+            stdout = getattr(error, "stdout", None) or getattr(error, "output", None) or b""
+            stderr = getattr(error, "stderr", None) or b""
+            if not isinstance(stdout, bytes):
+                stdout = str(stdout).encode("utf-8", errors="replace")
+            if not isinstance(stderr, bytes):
+                stderr = str(stderr).encode("utf-8", errors="replace")
+            census_diagnostics.extend(
+                b"ps-census-timeout\nstdout-begin\n"
+                + stdout
+                + b"\nstdout-end\nstderr-begin\n"
+                + stderr
+                + b"\nstderr-end\n"
+            )
+        except OSError as error:
+            reliable = False
+            listing = ""
+            census_diagnostics.extend(
+                f"ps-census-launch-error={error!r}\n".encode(
+                    "utf-8", errors="replace"
+                )
+            )
         for line in listing.splitlines():
             fields = line.split()
             if len(fields) == 2:
                 try:
                     parent_by_pid[int(fields[0])] = int(fields[1])
                 except ValueError:
-                    continue
+                    reliable = False
+                    census_diagnostics.extend(
+                        f"ps-census-malformed-line={line!r}\n".encode(
+                            "utf-8", errors="replace"
+                        )
+                    )
+            elif line.strip():
+                reliable = False
+                census_diagnostics.extend(
+                    f"ps-census-malformed-line={line!r}\n".encode(
+                        "utf-8", errors="replace"
+                    )
+                )
+    if process is not None:
+        process._ios_tree_census_observed = reliable  # type: ignore[attr-defined]
+        if census_diagnostics:
+            prior = getattr(process, "_ios_tree_census_diagnostics", b"")
+            process._ios_tree_census_diagnostics = (  # type: ignore[attr-defined]
+                prior + bytes(census_diagnostics)
+            )
     descendants: set[int] = set()
     frontier = [root_pid]
     while frontier:
@@ -205,7 +287,9 @@ def _wait_for_process_tree(
 ) -> bool:
     deadline = time.monotonic() + max(0.0, timeout_seconds)
     while True:
-        tracked.update(_proc_descendants(process.pid))
+        tracked.update(_proc_descendants(process.pid, process=process))
+        if not getattr(process, "_ios_tree_census_observed", True):
+            return False
         if (
             process.poll() is not None
             and not _process_group_alive(process)
@@ -229,7 +313,7 @@ def _terminate_process_tree(
     description: str,
 ) -> set[int]:
     tracked = tracked if tracked is not None else set()
-    tracked.update({process.pid} | _proc_descendants(process.pid))
+    tracked.update({process.pid} | _proc_descendants(process.pid, process=process))
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -247,7 +331,7 @@ def _terminate_process_tree(
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    tracked.update(_proc_descendants(process.pid))
+    tracked.update(_proc_descendants(process.pid, process=process))
     for pid in tracked:
         if pid != process.pid:
             try:
@@ -281,14 +365,32 @@ class SubprocessCommandRunner:
         timeout = timeout_seconds if timeout_seconds is not None else DEFAULT_COMMAND_TIMEOUT_SECONDS
         if timeout <= 0:
             raise IOSSimulatorAppContractError("iOS command timeout must be positive")
-        process = subprocess.Popen(
-            list(command),
-            cwd=cwd,
-            stdin=None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+        try:
+            process = subprocess.Popen(
+                list(command),
+                cwd=cwd,
+                stdin=None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except OSError as error:
+            self._sequence += 1
+            raw_output = (
+                b"--- command-launch-error ---\n"
+                + repr(error).encode("utf-8", errors="replace")
+                + b"\n"
+            )
+            raw_path = self.raw_directory / f"command-{secrets.token_hex(16)}.raw.log"
+            with raw_path.open("xb") as raw_handle:
+                raw_handle.write(raw_output)
+                raw_handle.flush()
+                os.fsync(raw_handle.fileno())
+            os.chmod(raw_path, 0o600)
+            emit_evidence("ios-command", status="failed", payloads={"combined": raw_output})
+            raise IOSSimulatorAppContractError(
+                f"iOS command could not start ({type(error).__name__}); complete diagnostics retained privately"
+            ) from error
         tracked = {process.pid}
         try:
             raw_output, _ = process.communicate(timeout=timeout)
@@ -323,6 +425,9 @@ class SubprocessCommandRunner:
                     )
             except IOSSimulatorAppContractError as cleanup_error:
                 termination_error = termination_error or cleanup_error
+            tree_diagnostics = getattr(process, "_ios_tree_census_diagnostics", b"")
+            if tree_diagnostics:
+                raw_output += b"\n--- ios-process-tree-census-diagnostics ---\n" + tree_diagnostics
             self._sequence += 1
             raw_path = self.raw_directory / f"command-{secrets.token_hex(16)}.raw.log"
             with raw_path.open("xb") as raw_handle:
@@ -336,6 +441,9 @@ class SubprocessCommandRunner:
                 f"iOS command timed out after {timeout:g}s{detail}; complete diagnostics retained privately"
             )
         raw_output = raw_output or b""
+        tree_diagnostics = getattr(process, "_ios_tree_census_diagnostics", b"")
+        if tree_diagnostics:
+            raw_output += b"\n--- ios-process-tree-census-diagnostics ---\n" + tree_diagnostics
         self._sequence += 1
         raw_path = self.raw_directory / f"command-{secrets.token_hex(16)}.raw.log"
         with raw_path.open("xb") as raw_handle:

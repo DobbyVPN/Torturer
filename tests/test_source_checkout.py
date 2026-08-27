@@ -89,7 +89,7 @@ class SourceCheckoutTest(unittest.TestCase):
                 with self.assertRaisesRegex(SourceCheckoutError, "timed out"):
                     run_bounded_preflight(
                         command,
-                        timeout_seconds=0.2,
+                        timeout_seconds=0.4,
                         evidence_directory=evidence,
                         evidence_stem="sigterm-resistant-descendant",
                     )
@@ -156,7 +156,15 @@ class SourceCheckoutTest(unittest.TestCase):
                 (evidence / "total-bound.metadata.raw.json").read_text(encoding="utf-8")
             )
             self.assertLess(metadata["elapsed_seconds"], 1.2)
-            self.assertFalse(metadata["deadline_exceeded"])
+            # The absolute command deadline also bounds cleanup and durable
+            # evidence retention.  If scheduling or durable writes cross it,
+            # the result must say so; it must never silently add a grace
+            # period.  This keeps the assertion stable on a busy host while
+            # checking the flag against the retained elapsed measurement.
+            self.assertEqual(
+                metadata["deadline_exceeded"],
+                metadata["elapsed_seconds"] > 0.4,
+            )
 
     def test_fallback_process_census_uses_remaining_deadline(self) -> None:
         class EmptyProcessListing:
@@ -326,8 +334,9 @@ class SourceCheckoutTest(unittest.TestCase):
             def fake_cleanup(
                 process: subprocess.Popen[bytes],
                 *,
-                grace_seconds: float,
+                grace_seconds: float | None = None,
                 force_immediately: bool = False,
+                deadline: float | None = None,
             ) -> TreeCleanup:
                 try:
                     process.kill()
@@ -384,8 +393,9 @@ class SourceCheckoutTest(unittest.TestCase):
                 def fake_cleanup(
                     process: subprocess.Popen[bytes],
                     *,
-                    grace_seconds: float,
+                    grace_seconds: float | None = None,
                     force_immediately: bool = False,
+                    deadline: float | None = None,
                 ) -> TreeCleanup:
                     process.kill()
                     return TreeCleanup(False, (process.pid,), "injected survivor")

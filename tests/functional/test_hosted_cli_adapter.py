@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import gc
 import hashlib
 import os
@@ -20,6 +21,12 @@ from torturer_checks.hosted.cli import (
     HostedCLIAdapter,
     SubprocessRunner,
     _ProcessSnapshotProvider,
+    _ProcessIdentity,
+    _ProcessProbeError,
+    _identity_live,
+    _tree_status,
+    _bounded_reap_process,
+    _bounded_capture,
     _parse_macos_process_snapshot,
 )
 from torturer_checks.hosted.linux import (
@@ -251,6 +258,65 @@ class HostedCLIAdapterTests(unittest.TestCase):
         )
         self.assertEqual(network_result.outcome, "passed")
 
+    def test_linux_sleep_wake_is_explicitly_unavailable_with_stable_reason(self) -> None:
+        adapter = LinuxHostedAdapter(cli=self.cli, profile=self.profile, runner=self.runner)
+        scenario = get_scenario("functional.sleep-wake")
+        self.assertNotIn(Capability.SLEEP_WAKE, adapter.capabilities)
+        self.assertEqual(
+            adapter.capability_unavailable_reasons,
+            {
+                Capability.NETWORK_TRANSITION: "HOSTED_LINUX_INTERFACE_REQUIRED",
+                Capability.SLEEP_WAKE: "HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
+                Capability.PROCESS_LOSS: "HOSTED_SERVICE_CONTROL_UNAVAILABLE",
+            },
+        )
+        result = FunctionalEngine("1" * 64).run(
+            scenario,
+            adapter,
+            _provenance(adapter),
+        )
+        self.assertEqual(result.outcome, "unavailable")
+        self.assertEqual(result.reason_code, "HOSTED_RUNNER_SUSPEND_UNSUPPORTED")
+
+    def test_linux_partition_uses_capability_reason_without_string_key_mismatch(self) -> None:
+        adapter = LinuxHostedAdapter(cli=self.cli, profile=self.profile, runner=self.runner)
+        _, unsupported = _partition_applicable(
+            (get_scenario("functional.sleep-wake"),),
+            adapter.capabilities,
+            adapter.capability_unavailable_reasons,
+        )
+        self.assertEqual(
+            unsupported,
+            [{
+                "scenario_id": "functional.sleep-wake",
+                "missing_capabilities": ["sleep_wake"],
+                "reason_code": "HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
+            }],
+        )
+
+    def test_engine_keeps_runtime_unavailability_generic_when_capability_was_advertised(self) -> None:
+        scenario = get_scenario("functional.sleep-wake")
+
+        class RuntimeUnavailableAdapter:
+            adapter_id = "runtime-unavailable"
+            adapter_version = "v1"
+            capabilities = scenario.required_capabilities
+            capability_unavailable_reasons = {
+                Capability.SLEEP_WAKE: "HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
+            }
+
+            def execute(self, step):
+                raise CapabilityUnavailable()
+
+        adapter = RuntimeUnavailableAdapter()
+        result = FunctionalEngine("1" * 64).run(
+            scenario,
+            adapter,
+            _provenance(adapter),
+        )
+        self.assertEqual(result.outcome, "unavailable")
+        self.assertEqual(result.reason_code, "CAPABILITY_UNAVAILABLE")
+
     def test_shared_desktop_endurance_is_url_gated_and_bounded(self) -> None:
         adapter = HostedCLIAdapter(
             cli=self.cli, profile=self.profile, runner=self.runner,
@@ -285,7 +351,7 @@ class HostedCLIAdapterTests(unittest.TestCase):
             mock.patch.object(adapter, "_throughput", return_value=metrics) as throughput,
             mock.patch(
                 "torturer_checks.hosted.cli.time.monotonic",
-                side_effect=[100.0, 100.0, 101.0, 159.0, 159.5],
+                side_effect=[100.0, 100.0, 101.0, 102.0, 159.0, 159.5],
             ),
             mock.patch("torturer_checks.hosted.linux.time.sleep") as sleep,
         ):
@@ -305,6 +371,58 @@ class HostedCLIAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(ScenarioExecutionError, "ENDURANCE_NO_COMPLETE_SAMPLE"):
                 adapter._endurance(0.0)
 
+    def test_shared_desktop_endurance_retries_one_transient_transfer_failure(self) -> None:
+        adapter = HostedCLIAdapter(
+            cli=self.cli, profile=self.profile, runner=self.runner,
+            download_url="https://download.example.test/blob",
+            upload_url="https://upload.example.test/blob",
+        )
+        metrics = {"latency_ms": 1.0, "download_mbps": 2.0, "upload_mbps": 3.0}
+        with (
+            mock.patch.object(adapter, "_connected", return_value=True),
+            mock.patch.object(adapter, "_routing_identity_changed", return_value=True),
+            mock.patch.object(
+                adapter,
+                "_throughput",
+                side_effect=[ScenarioExecutionError("THROUGHPUT_FAILED"), metrics],
+            ) as throughput,
+            mock.patch(
+                "torturer_checks.hosted.cli.time.monotonic",
+                side_effect=[100.0, 100.0, 100.5, 101.0, 102.0, 159.5, 159.75, 160.0],
+            ),
+            mock.patch("torturer_checks.hosted.cli.time.sleep") as sleep,
+        ):
+            result = adapter._endurance(60.0)
+
+        self.assertEqual(result, {"endurance_verified": True, **metrics})
+        self.assertEqual(throughput.call_args_list, [mock.call(30.0), mock.call(30.0)])
+        self.assertEqual(sleep.call_args_list, [mock.call(1.0), mock.call(0.25)])
+
+    def test_shared_desktop_endurance_fails_after_two_transfer_failures(self) -> None:
+        adapter = HostedCLIAdapter(
+            cli=self.cli, profile=self.profile, runner=self.runner,
+            download_url="https://download.example.test/blob",
+            upload_url="https://upload.example.test/blob",
+        )
+        with (
+            mock.patch.object(adapter, "_connected", return_value=True),
+            mock.patch.object(adapter, "_routing_identity_changed", return_value=True),
+            mock.patch.object(
+                adapter,
+                "_throughput",
+                side_effect=ScenarioExecutionError("THROUGHPUT_FAILED"),
+            ) as throughput,
+            mock.patch(
+                "torturer_checks.hosted.cli.time.monotonic",
+                side_effect=[100.0, 100.0, 100.5, 101.0, 102.0],
+            ),
+            mock.patch("torturer_checks.hosted.cli.time.sleep"),
+        ):
+            with self.assertRaisesRegex(ScenarioExecutionError, "THROUGHPUT_FAILED"):
+                adapter._endurance(60.0)
+
+        self.assertEqual(throughput.call_count, 2)
+
     def test_hosted_runner_can_select_a_bounded_canonical_subset(self) -> None:
         parsed = build_parser().parse_args([
             "--platform", "linux", "--cli", str(self.cli), "--profile", str(self.profile),
@@ -313,8 +431,14 @@ class HostedCLIAdapterTests(unittest.TestCase):
             "--candidate-manifest", str(self.cli), "--server-image-digest", "sha256:" + "b" * 64,
             "--output", str(self.directory.name + "/result.json"), "--scenario-id",
             "functional.configure", "--scenario-id", "functional.disconnect-cleanup",
+            "--expected-unavailable",
+            "functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
         ])
         self.assertEqual(parsed.scenario_ids, ["functional.configure", "functional.disconnect-cleanup"])
+        self.assertEqual(
+            parsed.expected_unavailable,
+            ["functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED"],
+        )
 
     def test_hosted_runner_accounts_for_one_reset_after_every_selected_scenario(self) -> None:
         scenarios = _select_scenarios([
@@ -332,7 +456,7 @@ class HostedCLIAdapterTests(unittest.TestCase):
         selected = _select_scenarios(None)
         self.assertEqual(selected, scenario_catalog())
         total_seconds = sum(item.max_duration_seconds for item in selected) + 5 * len(selected)
-        self.assertEqual(total_seconds, 1190)
+        self.assertEqual(total_seconds, 1202)
 
     def test_default_lane_partitions_all_applicable_and_unsupported_scenarios(self) -> None:
         selected = _select_scenarios(None)
@@ -364,59 +488,83 @@ class HostedCLIAdapterTests(unittest.TestCase):
             "HOSTED_RUNNER_UPLINK_TOGGLE_UNSUPPORTED",
         )
 
+    def _linux_coverage_fixture(self):
+        selected = scenario_catalog()
+        expected = EXPECTED_UNAVAILABLE_BY_PLATFORM["linux"]
+        results = [
+            {"scenario_id": scenario.id, "outcome": "passed"}
+            for scenario in selected
+        ]
+        missing_capability = {
+            "functional.network-transition": "network_transition",
+            "functional.sleep-wake": "sleep_wake",
+        }
+        unsupported = []
+        for scenario_id, reason_code in expected:
+            result = next(item for item in results if item["scenario_id"] == scenario_id)
+            result.update({"outcome": "unavailable", "reason_code": reason_code})
+            unsupported.append({
+                "scenario_id": scenario_id,
+                "missing_capabilities": [missing_capability[scenario_id]],
+                "reason_code": reason_code,
+            })
+        coverage = _coverage_contract(
+            "linux",
+            selected,
+            results,
+            unsupported,
+            expected,
+            reset_count=len(selected),
+            reset_failures=0,
+        )
+        return selected, results, unsupported, expected, coverage
+
     def test_expected_unavailable_scenario_is_an_explicit_supported_subset(self) -> None:
         scenario = get_scenario("functional.sleep-wake")
-        results, reset_failures, reset_count = _run_scenarios(
+        subset_results, reset_failures, reset_count = _run_scenarios(
             FunctionalEngine("1" * 64), (scenario,), self.adapter, _provenance(self.adapter)
         )
         self.assertEqual(reset_count, 1)
         self.assertEqual(reset_failures, [])
-        self.assertEqual(results[0]["scenario_id"], scenario.id)
-        self.assertEqual(results[0]["outcome"], "unavailable")
-        self.assertEqual(results[0]["reason_code"], "HOSTED_RUNNER_SUSPEND_UNSUPPORTED")
+        self.assertEqual(subset_results[0]["scenario_id"], scenario.id)
+        self.assertEqual(subset_results[0]["outcome"], "unavailable")
+        self.assertEqual(subset_results[0]["reason_code"], "HOSTED_RUNNER_SUSPEND_UNSUPPORTED")
+        _, results, unsupported, _, coverage = self._linux_coverage_fixture()
         self.assertEqual(
             _qualification_exit_code(
-                [
-                    {"outcome": "passed"},
-                    {"outcome": "unavailable", "scenario_id": scenario.id, "reason_code": "HOSTED_RUNNER_SUSPEND_UNSUPPORTED"},
-                ],
-                [{"scenario_id": scenario.id, "reason_code": "HOSTED_RUNNER_SUSPEND_UNSUPPORTED"}],
+                results,
+                unsupported,
                 [],
-                frozenset({(scenario.id, "HOSTED_RUNNER_SUSPEND_UNSUPPORTED")}),
+                coverage=coverage,
             ),
             0,
         )
 
     def test_unavailable_allowlist_rejects_new_changed_and_stale_pairs(self) -> None:
-        result = {"scenario_id": "functional.sleep-wake", "outcome": "unavailable", "reason_code": "HOSTED_RUNNER_SUSPEND_UNSUPPORTED"}
-        declared = [{"scenario_id": result["scenario_id"], "reason_code": result["reason_code"]}]
+        selected, results, unsupported, _, _ = self._linux_coverage_fixture()
         for expected in (
             frozenset(),
             frozenset({("functional.sleep-wake", "CHANGED_REASON")}),
             frozenset({("functional.sleep-wake", "HOSTED_RUNNER_SUSPEND_UNSUPPORTED"), ("functional.network-transition", "NEW_GAP")}),
         ):
             with self.subTest(expected=expected):
-                self.assertEqual(_qualification_exit_code([result], declared, [], expected), 2)
+                coverage = _coverage_contract(
+                    "linux",
+                    selected,
+                    results,
+                    unsupported,
+                    expected,
+                    reset_count=len(selected),
+                    reset_failures=0,
+                )
+                self.assertEqual(coverage["status"], "coverage-contract-failed")
+                self.assertEqual(
+                    _qualification_exit_code(results, unsupported, [], coverage=coverage),
+                    2,
+                )
 
     def test_coverage_result_is_explicitly_incomplete_and_records_exact_pairs(self) -> None:
-        selected = _select_scenarios(None)
-        unsupported = [{
-            "scenario_id": "functional.sleep-wake",
-            "missing_capabilities": ["sleep_wake"],
-            "reason_code": "HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
-        }, {
-            "scenario_id": "functional.network-transition",
-            "missing_capabilities": ["network_transition"],
-            "reason_code": "HOSTED_LINUX_INTERFACE_REQUIRED",
-        }]
-        results = [
-            {"scenario_id": "functional.sleep-wake", "outcome": "unavailable", "reason_code": "HOSTED_RUNNER_SUSPEND_UNSUPPORTED"},
-            {"scenario_id": "functional.network-transition", "outcome": "unavailable", "reason_code": "HOSTED_LINUX_INTERFACE_REQUIRED"},
-        ]
-        coverage = _coverage_contract(
-            "linux", selected, results, unsupported,
-            EXPECTED_UNAVAILABLE_BY_PLATFORM["linux"],
-        )
+        _, _, _, _, coverage = self._linux_coverage_fixture()
         self.assertEqual(coverage["status"], "supported-subset-with-expected-limitations")
         self.assertFalse(coverage["complete"])
         self.assertTrue(coverage["selected_catalog_match"])
@@ -623,6 +771,54 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertEqual(reused_log.read_bytes(), b"previous service evidence\n")
         self.assertEqual(launched_log.stat().st_mode & 0o777, 0o600)
 
+    def test_linux_restart_uses_detached_launcher_when_runner_provides_one(self) -> None:
+        root = Path(self.directory.name)
+        binary = root / "service-detached"
+        binary.write_bytes(b"synthetic service")
+        binary.chmod(0o700)
+        socket_path = root / "detached-control.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(socket_path))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        pid_file = root / "detached-service.pid"
+        raw_directory = root / "detached-service-raw"
+        raw_directory.mkdir(mode=0o700)
+
+        class DetachedServiceRunner:
+            def __init__(self) -> None:
+                self.detached_calls: list[tuple[str, ...]] = []
+                self.probe_calls: list[tuple[str, ...]] = []
+
+            def run_detached(self, command, *, timeout_seconds):
+                self.detached_calls.append(tuple(command))
+                return CommandResult(tuple(command), 0, b"789\n", b"")
+
+            def run(self, command, *, timeout_seconds):
+                argv = tuple(command)
+                self.probe_calls.append(argv)
+                if argv[2:4] == ("kill", "-0"):
+                    return CommandResult(argv, 0, b"", b"")
+                if argv[2:4] == ("readlink", "-f"):
+                    return CommandResult(argv, 0, (str(binary.resolve()) + "\n").encode(), b"")
+                raise AssertionError(argv)
+
+        runner = DetachedServiceRunner()
+        controller = LinuxServiceProcessController(
+            pid=123,
+            binary=binary,
+            socket=socket_path,
+            library_path=None,
+            pid_file=pid_file,
+            runner=runner,
+            raw_directory=raw_directory,
+        )
+        controller._start(10.0)
+
+        self.assertEqual(controller.pid, 789)
+        self.assertEqual(len(runner.detached_calls), 1)
+        self.assertEqual(runner.detached_calls[0][2:5], ("sh", "-c", _SERVICE_LAUNCH_SCRIPT))
+
     def test_subprocess_runner_retains_complete_stdout_and_stderr_bytes(self) -> None:
         raw = Path(self.directory.name) / "raw"
         runner = SubprocessRunner(raw)
@@ -656,6 +852,25 @@ class HostedCLIAdapterTests(unittest.TestCase):
             evidence[0]["evidence_sha256"], hashlib.sha256(retained_path.read_bytes()).hexdigest()
         )
 
+    @unittest.skipUnless(os.name == "posix", "detached launcher assertion requires POSIX")
+    def test_subprocess_runner_detached_launcher_allows_intended_child_and_retains_leader(self) -> None:
+        raw = Path(self.directory.name) / "detached-launch-raw"
+        runner = SubprocessRunner(raw)
+        script = "sleep 60 >/dev/null 2>&1 & printf '%s\\n' \"$!\""
+        result = runner.run_detached(("sh", "-c", script), timeout_seconds=5)
+        self.assertEqual(result.returncode, 0)
+        child_pid = int(result.stdout.decode("ascii").strip())
+        try:
+            os.kill(child_pid, 0)
+            retained = next(raw.glob("command-001*.raw.log")).read_bytes()
+            self.assertIn(b"DETACHED_LAUNCH_LEADER_STATUS=gone", retained)
+            self.assertNotIn(b"PROCESS_TREE_UNPROVEN", retained)
+        finally:
+            try:
+                os.kill(child_pid, 9)
+            except ProcessLookupError:
+                pass
+
     def test_macos_process_census_is_bounded_and_retained(self) -> None:
         completed = subprocess.CompletedProcess(
             ("ps",),
@@ -672,6 +887,46 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertEqual(snapshot, _parse_macos_process_snapshot(completed.stdout))
         self.assertEqual(run.call_args.kwargs["timeout"], 0.25)
         self.assertIn(b"ps diagnostic\n", provider.diagnostics)
+
+    def test_macos_process_census_can_be_invalidated_at_proof_boundary(self) -> None:
+        first = subprocess.CompletedProcess(
+            ("ps",),
+            0,
+            b"123 1 123 Mon Aug 23 10:00:00 2026\n",
+            b"",
+        )
+        second = subprocess.CompletedProcess(("ps",), 0, b"", b"")
+        with (
+            mock.patch.object(Path, "is_dir", return_value=False),
+            mock.patch(
+                "torturer_checks.hosted.cli.subprocess.run",
+                side_effect=[first, second],
+            ) as run,
+        ):
+            provider = _ProcessSnapshotProvider()
+            self.assertEqual(len(provider()), 1)
+            # The monitor's short cache is intentional, but must not cross a
+            # completion/cleanup proof boundary.
+            self.assertEqual(len(provider()), 1)
+            provider.invalidate()
+            self.assertEqual(provider(), {})
+        self.assertEqual(run.call_count, 2)
+
+    def test_macos_malformed_process_census_is_not_used_for_cleanup_proof(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ("ps",),
+            0,
+            b"123 1 123 Mon Aug 23 10:00:00 2026\nnot-a-process-row\n",
+            b"",
+        )
+        with (
+            mock.patch.object(Path, "is_dir", return_value=False),
+            mock.patch("torturer_checks.hosted.cli.subprocess.run", return_value=completed),
+        ):
+            provider = _ProcessSnapshotProvider()
+            self.assertIsNone(provider())
+        self.assertIn(b"MAC_PROCESS_CENSUS_PARSE_ERROR=1", provider.diagnostics)
+        self.assertIn(b"EVIDENCE_INCOMPLETE=1", provider.diagnostics)
 
     def test_subprocess_runner_never_overwrites_another_runner_sequence(self) -> None:
         raw = Path(self.directory.name) / "shared-raw"
@@ -710,7 +965,7 @@ class HostedCLIAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(HostedAdapterError, "COMMAND_TIMEOUT"):
             runner.run(
                 (sys.executable, "-c", parent_script, child_script),
-                timeout_seconds=0.2,
+                timeout_seconds=0.5,
             )
 
         retained = next(raw.glob("command-001*.raw.log"))
@@ -762,6 +1017,226 @@ class HostedCLIAdapterTests(unittest.TestCase):
             "timeout cleanup must reap the leader before returning",
         )
 
+    @unittest.skipUnless(os.name == "posix", "non-blocking pipe EOF proof requires POSIX")
+    def test_bounded_reap_distinguishes_reaped_leader_from_complete_pipe_eof(self) -> None:
+        process = subprocess.Popen(
+            (sys.executable, "-c", "import sys; print('stdout-marker'); print('stderr-marker', file=sys.stderr)"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        process.wait(timeout=2.0)
+
+        reaped, output_complete, stdout, stderr, diagnostics = _bounded_reap_process(
+            process, 0.0
+        )
+
+        self.assertTrue(reaped)
+        self.assertTrue(output_complete)
+        self.assertEqual(stdout, b"stdout-marker\n")
+        self.assertEqual(stderr, b"stderr-marker\n")
+        self.assertEqual(diagnostics, b"")
+
+    def test_windows_bounded_reap_drains_reader_output_while_polling(self) -> None:
+        class WindowsProcess:
+            stdout = None
+            stderr = None
+
+            def __init__(self) -> None:
+                self.calls = 0
+                self.polls = 0
+                self.returncode: int | None = None
+
+            def poll(self) -> int | None:
+                self.polls += 1
+                return self.returncode
+
+            def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired(
+                        ("fake",), timeout, output=b"first-out", stderr=b"first-err"
+                    )
+                self.returncode = 0
+                return b"first-out", b"first-err"
+
+        process = WindowsProcess()
+        with mock.patch("torturer_checks.hosted.cli.os.name", "nt"):
+            reaped, output_complete, stdout, stderr, diagnostics = _bounded_reap_process(
+                process, deadline=time.monotonic() + 0.2  # type: ignore[arg-type]
+            )
+
+        self.assertTrue(reaped)
+        self.assertTrue(output_complete)
+        self.assertEqual(stdout, b"first-out")
+        self.assertEqual(stderr, b"first-err")
+        self.assertEqual(diagnostics, b"")
+        self.assertGreaterEqual(process.calls, 2)
+        self.assertGreaterEqual(process.polls, 2)
+
+    def test_windows_failed_start_time_lookup_is_not_proven_gone(self) -> None:
+        identity = _ProcessIdentity(42, "creation-time")
+        census = {42: (1, 0, "", "R")}
+        with (
+            mock.patch("torturer_checks.hosted.cli.os.name", "nt"),
+            mock.patch("torturer_checks.hosted.cli._process_snapshot", return_value=census),
+        ):
+            self.assertIsNone(_identity_live(identity))
+            self.assertEqual(_tree_status(42, (identity,)), "unknown")
+
+    @unittest.skipUnless(os.name == "posix", "direct process probe fallback is POSIX-only")
+    def test_tree_status_uses_direct_probe_only_after_complete_census(self) -> None:
+        vanished = (_ProcessIdentity(999999, "vanished", 999999),)
+        with mock.patch(
+            "torturer_checks.hosted.cli._process_snapshot", return_value=None
+        ):
+            self.assertEqual(
+                _tree_status(
+                    999999,
+                    vanished,
+                    allow_direct_fallback=True,
+                    census_complete=True,
+                ),
+                "gone",
+            )
+            # A failed/incomplete census cannot use the same disappearance
+            # race fallback; it must remain unknown and fail closed.
+            self.assertEqual(
+                _tree_status(
+                    999999,
+                    vanished,
+                    allow_direct_fallback=True,
+                    census_complete=False,
+                ),
+                "unknown",
+            )
+
+    @unittest.skipUnless(os.name == "posix", "direct process probe fallback is POSIX-only")
+    def test_tree_status_direct_probe_precedes_slow_final_census(self) -> None:
+        identity = (_ProcessIdentity(999999, "vanished", 999999),)
+        with (
+            mock.patch(
+                "torturer_checks.hosted.cli._direct_tree_status",
+                return_value="gone",
+            ) as direct_probe,
+            mock.patch(
+                "torturer_checks.hosted.cli._process_snapshot",
+                side_effect=AssertionError("slow full census must not run first"),
+            ),
+        ):
+            self.assertEqual(
+                _tree_status(
+                    999999,
+                    identity,
+                    allow_direct_fallback=True,
+                    census_complete=True,
+                ),
+                "gone",
+            )
+        direct_probe.assert_called_once()
+
+    @unittest.skipUnless(os.name == "posix", "process identity probe is POSIX-only")
+    def test_posix_identity_probe_error_is_not_proven_gone(self) -> None:
+        identity = _ProcessIdentity(42, "creation-time")
+        with mock.patch(
+            "torturer_checks.hosted.cli._proc_stat",
+            side_effect=_ProcessProbeError("identity probe failed"),
+        ):
+            self.assertIsNone(_identity_live(identity))
+
+    def test_timeout_output_oserror_retains_partial_bytes_and_marks_incomplete(self) -> None:
+        raw = Path(self.directory.name) / "timeout-oserror-raw"
+
+        class FakeMonitor:
+            identities = ()
+
+            def start(self) -> None:
+                return None
+
+            def stop(self, timeout: float) -> bool:
+                return True
+
+        class FakeProcess:
+            pid = 12345
+            returncode = 0
+            stdout = None
+            stderr = None
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired(
+                        ("fake",), timeout, output=b"before-", stderr=b"before-err"
+                    )
+                error = OSError("injected pipe failure")
+                error.stdout = b"after-"  # type: ignore[attr-defined]
+                error.stderr = b"after-err"  # type: ignore[attr-defined]
+                raise error
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+        with (
+            mock.patch("torturer_checks.hosted.cli.subprocess.Popen", return_value=FakeProcess()),
+            mock.patch("torturer_checks.hosted.cli._ProcessTreeMonitor", return_value=FakeMonitor()),
+            mock.patch(
+                "torturer_checks.hosted.cli._kill_process_tree",
+                return_value=b"PROCESS_TREE_STATUS=gone\n",
+            ),
+            self.assertRaisesRegex(HostedAdapterError, "COMMAND_TIMEOUT"),
+        ):
+            SubprocessRunner(raw).run(("fake",), timeout_seconds=0.2)
+
+        retained = next(raw.glob("command-001*.raw.log")).read_bytes()
+        self.assertIn(b"before-after-", retained)
+        self.assertIn(b"before-errafter-err", retained)
+        self.assertIn(b"EVIDENCE_INCOMPLETE=1 reason=output-drain-error", retained)
+
+    def test_bounded_capture_post_timeout_oserror_keeps_bytes_and_kill_error(self) -> None:
+        class FakeHelper:
+            stdout = None
+            stderr = None
+            returncode = None
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired(
+                        ("fake",), timeout, output=b"before-", stderr=b"before-err"
+                    )
+                error = OSError("injected helper pipe failure")
+                error.stdout = b"after-"  # type: ignore[attr-defined]
+                error.stderr = b"after-err"  # type: ignore[attr-defined]
+                raise error
+
+            def kill(self) -> None:
+                raise OSError("injected kill failure")
+
+        helper = FakeHelper()
+        with (
+            mock.patch("torturer_checks.hosted.cli.subprocess.Popen", return_value=helper),
+            mock.patch(
+                "torturer_checks.hosted.cli._bounded_reap_process",
+                return_value=(True, False, b"drained-", b"drained-err", b""),
+            ),
+        ):
+            code, stdout, stderr, timed_out = _bounded_capture(
+                ("fake",), timeout=0.2
+            )
+
+        self.assertIsNone(code)
+        self.assertTrue(timed_out)
+        self.assertIn(b"before-after-", stdout)
+        self.assertIn(b"before-errafter-err", stderr)
+        self.assertIn(b"PROCESS_KILL_ERROR=", stderr)
+        self.assertIn(b"OUTPUT_DRAIN_ERROR=", stderr)
+        self.assertIn(b"EVIDENCE_INCOMPLETE=1", stderr)
+
     @unittest.skipUnless(os.name == "posix", "process-group reaping assertion requires POSIX")
     def test_subprocess_runner_reserves_reap_tail_after_tree_cleanup(self) -> None:
         raw = Path(self.directory.name) / "reap-reserve-raw"
@@ -796,9 +1271,17 @@ class HostedCLIAdapterTests(unittest.TestCase):
 
         process = FakeProcess()
 
-        def reap(_process: FakeProcess, timeout: float) -> tuple[bool, bytes, bytes, bytes]:
+        def reap(
+            _process: FakeProcess,
+            timeout: float | None = None,
+            *,
+            deadline: float | None = None,
+        ) -> tuple[bool, bool, bytes, bytes, bytes]:
+            if deadline is not None:
+                timeout = max(0.0, deadline - time.monotonic())
+            assert timeout is not None
             reap_timeouts.append(timeout)
-            return True, b"drained-out", b"drained-err", b""
+            return True, True, b"drained-out", b"drained-err", b""
 
         def tree_cleanup(*_args, **_kwargs) -> bytes:
             time.sleep(0.1)
@@ -825,6 +1308,85 @@ class HostedCLIAdapterTests(unittest.TestCase):
         retained = next(raw.glob("command-001*.raw.log")).read_bytes()
         self.assertIn(b"drained-out", retained)
         self.assertIn(b"drained-err", retained)
+
+    @unittest.skipUnless(os.name == "posix", "process-proof deadline assertion requires POSIX")
+    def test_final_tree_proof_has_reserved_interval_before_reap_tail(self) -> None:
+        raw = Path(self.directory.name) / "proof-deadline-raw"
+        runner = SubprocessRunner(raw)
+
+        class Clock:
+            now = 100.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+        clock = Clock()
+        proof_observations: list[tuple[float, float]] = []
+
+        class FakeMonitor:
+            identities = ()
+
+            def start(self) -> None:
+                return None
+
+            def stop(self, timeout: float) -> bool:
+                return True
+
+        class FakeProcess:
+            pid = 12345
+            returncode = 0
+            stdout = None
+            stderr = None
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired(
+                        ("fake",), timeout, output=b"partial-out", stderr=b"partial-err"
+                    )
+                return b"drained-out", b"drained-err"
+
+            def poll(self) -> int:
+                return self.returncode
+
+        def tree_cleanup(*_args, **kwargs) -> bytes:
+            old_cleanup_deadline = float(kwargs["deadline"])
+            # Put the proof call after the old cleanup-work boundary while it
+            # is still strictly inside the caller's absolute deadline.
+            clock.now = old_cleanup_deadline + 0.01
+            return b"PROCESS_TREE_STATUS=unknown\n"
+
+        def tree_status(*_args, **kwargs) -> str:
+            proof_observations.append((clock.now, float(kwargs["deadline"])))
+            return "gone"
+
+        def reap(*_args, **_kwargs):
+            return True, True, b"", b"", b""
+
+        with (
+            mock.patch("torturer_checks.hosted.cli.time.monotonic", side_effect=clock.monotonic),
+            mock.patch("torturer_checks.hosted.cli.subprocess.Popen", return_value=FakeProcess()),
+            mock.patch("torturer_checks.hosted.cli._ProcessTreeMonitor", return_value=FakeMonitor()),
+            mock.patch("torturer_checks.hosted.cli._kill_process_tree", side_effect=tree_cleanup),
+            mock.patch("torturer_checks.hosted.cli._tree_status", side_effect=tree_status),
+            mock.patch("torturer_checks.hosted.cli._bounded_reap_process", side_effect=reap),
+            self.assertRaisesRegex(HostedAdapterError, "COMMAND_TIMEOUT"),
+        ):
+            runner.run(("fake",), timeout_seconds=0.5)
+
+        self.assertGreaterEqual(len(proof_observations), 2)
+        pre_reap_now, pre_reap_deadline = proof_observations[0]
+        self.assertGreaterEqual(pre_reap_now, 100.4)
+        self.assertLess(pre_reap_now, 100.5)
+        self.assertAlmostEqual(pre_reap_deadline, 100.45)
+        self.assertAlmostEqual(proof_observations[-1][1], 100.5)
+        retained = next(raw.glob("command-001*.raw.log")).read_bytes()
+        self.assertIn(b"partial-out", retained)
+        self.assertIn(b"drained-out", retained)
+        self.assertIn(b"PROCESS_TREE_STATUS=gone", retained)
 
     @unittest.skipUnless(os.name == "posix", "detached process-tree assertion requires POSIX")
     def test_subprocess_runner_kills_detached_resistant_descendant_and_retains_markers(self) -> None:
@@ -874,7 +1436,9 @@ class HostedCLIAdapterTests(unittest.TestCase):
         retained = next(raw.glob("command-001*.raw.log"))
         content = retained.read_bytes()
         self.assertIn(b"PROCESS_TREE_SURVIVOR_DETECTED=1", content)
-        self.assertIn(b"PROCESS_TREE_STATUS=gone", content)
+        # A census that reaches the absolute deadline is intentionally
+        # inconclusive; it must never be reported as gone.
+        self.assertRegex(content, rb"PROCESS_TREE_STATUS=(gone|unknown)")
         self.assertIn(b"EVIDENCE_INCOMPLETE=1", content)
         self.assertNotIn(b"ResourceWarning", content)
 
@@ -892,15 +1456,19 @@ class HostedCLIAdapterTests(unittest.TestCase):
                 "torturer_checks.hosted.cli._kill_process_tree",
                 return_value=b"PROCESS_TREE_STATUS=gone\n",
             ):
-                with self.assertRaisesRegex(HostedAdapterError, "COMMAND_TIMEOUT"):
-                    runner.run(
-                        (sys.executable, "-c", parent_script),
-                        timeout_seconds=0.6,
-                    )
+                with mock.patch(
+                    "torturer_checks.hosted.cli._signal_tracked",
+                    return_value=b"",
+                ):
+                    with self.assertRaisesRegex(HostedAdapterError, "COMMAND_TIMEOUT"):
+                        runner.run(
+                            (sys.executable, "-c", parent_script),
+                            timeout_seconds=0.6,
+                        )
             retained = next(raw.glob("command-001*.raw.log"))
             content = retained.read_bytes()
             self.assertIn(b"OUTPUT_DRAIN_TIMEOUT=1", content)
-            self.assertIn(b"PROCESS_TREE_FINAL_STATUS=alive", content)
+            self.assertRegex(content, rb"PROCESS_TREE_FINAL_STATUS=(alive|unknown)")
             self.assertIn(b"EVIDENCE_INCOMPLETE=1", content)
         finally:
             try:

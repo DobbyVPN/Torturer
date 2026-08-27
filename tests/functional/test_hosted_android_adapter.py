@@ -47,6 +47,12 @@ def _observation(error_code: str | None = None) -> bytes:
         "second_routing_identity_changed": True,
         "final_disconnect_clean": True,
         "cleanup_verified": True,
+        # The candidate emits these additive fields even though hosted
+        # Android currently advertises none of the corresponding external
+        # control capabilities.
+        "network_transition_verified": False,
+        "sleep_wake_verified": False,
+        "process_loss_verified": False,
     }
     if error_code is not None:
         value["error_code"] = error_code
@@ -124,6 +130,44 @@ class ExternalControlRunner(FakeAndroidRunner):
         return super().run(command, timeout_seconds=timeout_seconds)
 
 
+class InputAndroidRunner(FakeAndroidRunner):
+    """Synthetic runner that exercises the real stdin staging path."""
+
+    def run_with_input(self, command, *, timeout_seconds, input_bytes):
+        del input_bytes
+        return self.run(command, timeout_seconds=timeout_seconds)
+
+
+class PartialLogcatRunner(FakeAndroidRunner):
+    """Synthetic runner for a bounded, non-empty logcat timeout."""
+
+    def run(self, command, *, timeout_seconds):
+        result = super().run(command, timeout_seconds=timeout_seconds)
+        if tuple(command)[1:2] == ("logcat",):
+            return CommandResult(tuple(command), 124, b"partial logcat bytes\n", b"", timed_out=True)
+        return result
+
+
+class RaisingPartialLogcatRunner(FakeAndroidRunner):
+    """Synthetic runner that raises after retaining a late logcat stream."""
+
+    def __init__(self, raw_directory: Path, error_code: str) -> None:
+        super().__init__(raw_directory)
+        self.error_code = error_code
+
+    def run(self, command, *, timeout_seconds):
+        if tuple(command)[1:2] == ("logcat",):
+            path = self.raw_directory / "command-late-logcat.raw.log"
+            path.write_bytes(
+                b"argv=adb logcat -d -b all\n"
+                b"returncode=0\n"
+                b"stdout-begin\npartial logcat bytes\nstdout-end\n"
+                b"stderr-begin\n\nstderr-end\n"
+            )
+            raise HostedAdapterError(self.error_code)
+        return super().run(command, timeout_seconds=timeout_seconds)
+
+
 def _provenance(adapter: AndroidHostedAdapter) -> RunProvenance:
     return RunProvenance(
         source_repository="DobbyVPN/DobbyVPN",
@@ -191,7 +235,23 @@ class HostedAndroidAdapterTests(unittest.TestCase):
             _provenance(self.adapter),
         )
         self.assertEqual(result.outcome, "failed")
-        self.assertEqual(result.reason_code, "ANDROID_OBSERVATION_ERROR")
+        self.assertEqual(result.reason_code, "DRIVER_ERROR")
+        self.assertTrue(
+            any(
+                "am" in call and "force-stop" in call
+                for call in self.runner.calls
+            )
+        )
+
+    def test_invalid_product_error_code_fails_closed_and_still_cleans_up(self) -> None:
+        self.runner.observation = _observation("UNREVIEWED_CODE")
+        result = FunctionalEngine("e" * 64).run(
+            get_scenario("functional.core-connection"),
+            self.adapter,
+            _provenance(self.adapter),
+        )
+        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(result.reason_code, "ANDROID_OBSERVATION_INVALID")
         self.assertTrue(
             any(
                 "am" in call and "force-stop" in call
@@ -353,6 +413,79 @@ class HostedAndroidAdapterTests(unittest.TestCase):
         )
         self.assertIsInstance(adapter, AndroidHostedAdapter)
         self.assertEqual(adapter.capabilities, self.adapter.capabilities)
+
+    def test_binary_staging_disables_pty_allocation(self) -> None:
+        runner = InputAndroidRunner(Path(self.directory.name) / "input-raw")
+        adapter = AndroidHostedAdapter(
+            runner=runner,
+            profile=self.profile,
+            adb=self.adb,
+            source_sha=_SOURCE_SHA,
+            identity_url="https://identity.example.test/ip",
+            latency_url="https://latency.example.test/blob",
+            download_url="https://download.example.test/blob",
+            upload_url="https://upload.example.test/blob",
+        )
+        result = FunctionalEngine("e" * 64).run(
+            get_scenario("functional.configure"), adapter, _provenance(adapter)
+        )
+        self.assertEqual(result.outcome, "passed")
+        staged = [
+            call for call in runner.calls
+            if len(call) > 5 and call[1:4] == ("shell", "-T", "run-as")
+        ]
+        self.assertGreaterEqual(len(staged), 2)
+        self.assertTrue(all(call[2] == "-T" for call in staged))
+        self.assertIn("mkdir -p files && cat > files/", staged[0][-1])
+        # adb's shell transport joins argv elements before the remote shell
+        # parses them.  The complete ``sh -c`` payload must therefore be
+        # shell-quoted, otherwise ``sh -c`` receives only ``mkdir`` and the
+        # Android toybox command fails with a missing operand.
+        self.assertTrue(staged[0][-1].startswith("'"))
+        self.assertTrue(staged[0][-1].endswith("'"))
+
+    def test_nonempty_logcat_timeout_is_retained_without_masking_product_result(self) -> None:
+        runner = PartialLogcatRunner(Path(self.directory.name) / "partial-logcat-raw")
+        adapter = AndroidHostedAdapter(
+            runner=runner,
+            profile=self.profile,
+            adb=self.adb,
+            source_sha=_SOURCE_SHA,
+            identity_url="https://identity.example.test/ip",
+            latency_url="https://latency.example.test/blob",
+            download_url="https://download.example.test/blob",
+            upload_url="https://upload.example.test/blob",
+        )
+        result = FunctionalEngine("e" * 64).run(
+            get_scenario("functional.configure"), adapter, _provenance(adapter)
+        )
+        self.assertEqual(result.outcome, "passed")
+
+    def test_late_logcat_runner_error_is_rehydrated_without_masking_product_result(self) -> None:
+        for error_code in (
+            "COMMAND_TIMEOUT",
+            "COMMAND_DEADLINE_EXCEEDED",
+            "ADB_DEVICE_UNAVAILABLE",
+        ):
+            with self.subTest(error_code=error_code):
+                runner = RaisingPartialLogcatRunner(
+                    Path(self.directory.name) / f"late-logcat-{error_code.lower()}",
+                    error_code,
+                )
+                adapter = AndroidHostedAdapter(
+                    runner=runner,
+                    profile=self.profile,
+                    adb=self.adb,
+                    source_sha=_SOURCE_SHA,
+                    identity_url="https://identity.example.test/ip",
+                    latency_url="https://latency.example.test/blob",
+                    download_url="https://download.example.test/blob",
+                    upload_url="https://upload.example.test/blob",
+                )
+                result = FunctionalEngine("e" * 64).run(
+                    get_scenario("functional.configure"), adapter, _provenance(adapter)
+                )
+                self.assertEqual(result.outcome, "passed")
 
     def test_missing_or_non_executable_adb_fails_closed(self) -> None:
         with self.assertRaisesRegex(HostedAdapterError, "ANDROID_ADB_UNAVAILABLE"):

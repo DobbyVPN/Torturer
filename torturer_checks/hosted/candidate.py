@@ -191,9 +191,24 @@ def _regular(path: Path, description: str) -> os.stat_result:
     return details
 
 
-def _descriptor_identity(details: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
-    """Return the identity and mutation-sensitive metadata of an open file."""
+def _descriptor_identity(details: os.stat_result) -> tuple[int, ...]:
+    """Return portable identity and mutation metadata for an open file.
 
+    Windows exposes ``st_ctime`` as creation time (and deprecated that field
+    in Python 3.12), while the path and descriptor stat implementations can
+    report different creation-time values for the same NTFS file.  The
+    stable file identity, size, and last-write time are the useful checks on
+    that platform; POSIX keeps the stricter ownership, mode, and ctime checks.
+    """
+
+    common = (
+        details.st_dev,
+        details.st_ino,
+        details.st_size,
+        getattr(details, "st_mtime_ns", int(details.st_mtime * 1_000_000_000)),
+    )
+    if os.name == "nt":
+        return common
     return (
         details.st_dev,
         details.st_ino,
@@ -224,7 +239,16 @@ def _open_pinned(path: Path, description: str) -> tuple[int, os.stat_result]:
 
     path = Path(path)
     _reject_symlink_components(path.parent, description)
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    # Windows opens ordinary descriptors in text mode unless O_BINARY is set.
+    # Candidate members are opaque bytes (PE files, DLLs, APKs, and native
+    # libraries); text-mode translation would rewrite CR/LF bytes while staging
+    # and make the uploaded executable invalid.  O_BINARY is zero on POSIX.
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
@@ -314,7 +338,13 @@ def _copy_descriptor(
     description: str,
 ) -> None:
     _reject_symlink_components(destination.parent, "candidate output")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
         target = os.open(destination, flags, 0o600)
     except OSError as error:
@@ -335,7 +365,13 @@ def _copy_descriptor(
 
 def _write_manifest(path: Path, manifest: dict[str, object]) -> None:
     payload = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
         descriptor = os.open(path, flags, 0o600)
     except OSError as error:
@@ -527,7 +563,8 @@ def main(argv: list[str] | None = None) -> int:
             )
     except (CandidateClosureError, OSError, ValueError) as error:
         print(
-            f"candidate_closure status=failed code={type(error).__name__}",
+            f"candidate_closure status=failed code={type(error).__name__} "
+            f"reason={error}",
             file=sys.stderr,
         )
         return 1

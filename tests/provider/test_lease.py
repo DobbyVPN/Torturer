@@ -13,9 +13,11 @@ sys.path.insert(0, str(ROOT))
 
 from torturer_provider.lease import (  # noqa: E402
     LeaseCleanupError,
+    LeaseJournalRecord,
     LeaseState,
     LeaseStateError,
     RenderLease,
+    RenderLeaseBundle,
     RenderLeaseDescriptor,
     RenderLeaseJournal,
 )
@@ -76,6 +78,51 @@ class FakeLeaseAPI:
 
     def list_services(self, owner_id: str) -> tuple[RenderServiceRecord, ...]:
         return self.records
+
+
+class FakeBundleAPI:
+    def __init__(self, *, retain_sink: bool = False) -> None:
+        self.retain_sink = retain_sink
+        self.created: list[RenderServiceSpec] = []
+        self.active: set[str] = set()
+        self.delete_calls: list[str] = []
+
+    def create_service(self, spec: RenderServiceSpec) -> RenderServiceHandle:
+        self.created.append(spec)
+        service_id = "srv-sink123" if spec.name.endswith("-upload-sink") else "srv-outline123"
+        self.active.add(service_id)
+        return RenderServiceHandle(service_id, "dep-" + service_id.removeprefix("srv-"), spec.image_digest)
+
+    def service(self, service_id: str) -> dict[str, object]:
+        if service_id not in self.active:
+            raise RenderAPIError("UNEXPECTED_STATUS", 404)
+        host = "sink.example.onrender.com" if service_id == "srv-sink123" else "outline.example.onrender.com"
+        return {"suspended": "not_suspended", "serviceDetails": {"numInstances": 1, "url": "https://" + host}}
+
+    def deploy(self, service_id: str, deploy_id: str) -> dict[str, object]:
+        return {"status": "live"}
+
+    def delete_service(self, service_id: str) -> bool:
+        self.delete_calls.append(service_id)
+        if not (self.retain_sink and service_id == "srv-sink123"):
+            self.active.discard(service_id)
+        return True
+
+    def exists(self, service_id: str) -> bool:
+        return service_id in self.active
+
+    def list_services(self, owner_id: str) -> tuple[RenderServiceRecord, ...]:
+        now = datetime.fromtimestamp(time.time() - 3600, timezone.utc).isoformat().replace("+00:00", "Z")
+        return tuple(
+            RenderServiceRecord(
+                service_id,
+                "dobby-torturer-" + RUN_ID + ("-upload-sink" if service_id == "srv-sink123" else "-linux"),
+                "tea-test123",
+                "web_service",
+                now,
+            )
+            for service_id in sorted(self.active)
+        )
 
 
 def make_lease(api: FakeLeaseAPI, temporary: tempfile.TemporaryDirectory) -> RenderLease:
@@ -300,6 +347,7 @@ class RenderLeaseTests(unittest.TestCase):
         api.records = (
             RenderServiceRecord("srv-old123", prefix + "linux", "tea-test123", "web_service", old),
             RenderServiceRecord("srv-active123", prefix + "android", "tea-test123", "web_service", old),
+            RenderServiceRecord("srv-active-sink123", prefix + "upload-sink", "tea-test123", "web_service", old),
             RenderServiceRecord("srv-recent1", prefix + "macos", "tea-test123", "web_service", recent),
             RenderServiceRecord("srv-other123", "unrelated-service", "tea-test123", "web_service", old),
         )
@@ -307,11 +355,279 @@ class RenderLeaseTests(unittest.TestCase):
             holder = tempfile.TemporaryDirectory(dir=directory)
             try:
                 lease = make_lease(api, holder)
-                deleted = lease.reap_orphans(active_service_ids=("srv-active123",), older_than_seconds=900)
+                deleted = lease.reap_orphans(
+                    active_service_ids=("srv-active123", "srv-active-sink123"),
+                    older_than_seconds=900,
+                )
                 self.assertEqual(deleted, ("srv-old123",))
                 self.assertEqual(api.delete_calls, ["srv-old123"])
             finally:
                 holder.cleanup()
+
+    def test_linux_bundle_binds_roles_and_digests_and_cleans_both_services(self) -> None:
+        api = FakeBundleAPI()
+        sink_digest = "sha256:" + "b" * 64
+        with tempfile.TemporaryDirectory(prefix="render-lease-bundle-test.") as directory:
+            journal = RenderLeaseJournal(Path(directory) / "journal.json", schema=2)
+            outline_descriptor = RenderLeaseDescriptor(
+                run_id=RUN_ID,
+                platform="linux",
+                service_name=f"dobby-torturer-{RUN_ID}-linux",
+                image_digest=IMAGE_DIGEST,
+            )
+            sink_descriptor = RenderLeaseDescriptor(
+                run_id=RUN_ID,
+                platform="linux",
+                service_name=f"dobby-torturer-{RUN_ID}-upload-sink",
+                image_digest=sink_digest,
+                role="upload-sink",
+            )
+            outline = RenderLease(
+                api,
+                RenderServiceSpec(
+                    owner_id="tea-test123",
+                    name=outline_descriptor.service_name,
+                    image_owner_id="tea-test123",
+                    image_path="ghcr.io/dobbyvpn/outline-ss-server@" + IMAGE_DIGEST,
+                    image_digest=IMAGE_DIGEST,
+                ),
+                outline_descriptor,
+                journal,
+            )
+            sink = RenderLease(
+                api,
+                RenderServiceSpec(
+                    owner_id="tea-test123",
+                    name=sink_descriptor.service_name,
+                    image_owner_id="tea-test123",
+                    image_path="ghcr.io/dobbyvpn/torturer-throughput-sink@" + sink_digest,
+                    image_digest=sink_digest,
+                    health_check_path="/healthz",
+                ),
+                sink_descriptor,
+                journal,
+            )
+            bundle = RenderLeaseBundle(outline, sink)
+            bundle.acquire(timeout_seconds=5, poll_seconds=1)
+            bundle.mark_issued()
+            bundle.begin_testing()
+            bundle.cleanup()
+            self.assertEqual(api.delete_calls, ["srv-sink123", "srv-outline123"])
+            records = journal.records()
+            self.assertEqual(journal.schema, 2)
+            self.assertEqual({record.role for record in records}, {"outline", "upload-sink"})
+            self.assertEqual(
+                {record.image_digest for record in records},
+                {IMAGE_DIGEST, sink_digest},
+            )
+            document = json.dumps([record.to_json_object(include_role=True) for record in records])
+            self.assertNotIn("onrender.com", document)
+
+    def test_schema2_bundle_accepts_all_hosted_platforms(self) -> None:
+        for platform in ("linux", "windows", "macos", "android"):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory(
+                prefix=f"render-lease-{platform}-bundle-shape-test."
+            ) as directory:
+                journal = RenderLeaseJournal(Path(directory) / "journal.json", schema=2)
+                sink_digest = "sha256:" + "b" * 64
+                outline_descriptor = RenderLeaseDescriptor(
+                    RUN_ID, platform, f"dobby-torturer-{RUN_ID}-{platform}", IMAGE_DIGEST
+                )
+                sink_descriptor = RenderLeaseDescriptor(
+                    RUN_ID, platform, f"dobby-torturer-{RUN_ID}-upload-sink",
+                    sink_digest, "upload-sink"
+                )
+                outline = RenderLease(
+                    FakeBundleAPI(),
+                    RenderServiceSpec(
+                        "tea-test123", outline_descriptor.service_name, "tea-test123",
+                        "ghcr.io/dobbyvpn/outline@" + IMAGE_DIGEST, IMAGE_DIGEST,
+                    ),
+                    outline_descriptor, journal,
+                )
+                sink = RenderLease(
+                    FakeBundleAPI(),
+                    RenderServiceSpec(
+                        "tea-test123", sink_descriptor.service_name, "tea-test123",
+                        "ghcr.io/dobbyvpn/sink@" + sink_digest, sink_digest,
+                    ),
+                    sink_descriptor, journal,
+                )
+                self.assertIsInstance(RenderLeaseBundle(outline, sink), RenderLeaseBundle)
+
+    def test_linux_bundle_uses_one_absolute_deadline_and_cleans_on_exhaustion(self) -> None:
+        class FakeClock:
+            def __init__(self) -> None:
+                self.value = 0.0
+
+            def __call__(self) -> float:
+                return self.value
+
+            def sleep(self, seconds: float) -> None:
+                self.value += seconds
+
+        class ExpiringAPI(FakeBundleAPI):
+            def __init__(self, clock: FakeClock) -> None:
+                super().__init__()
+                self.clock = clock
+
+            def create_service(self, spec: RenderServiceSpec) -> RenderServiceHandle:
+                handle = super().create_service(spec)
+                if spec.name.endswith("-upload-sink"):
+                    # The first service succeeded, but the second service's
+                    # control-plane call consumed the shared bundle budget.
+                    self.clock.value += 6
+                return handle
+
+        clock = FakeClock()
+        api = ExpiringAPI(clock)
+        sink_digest = "sha256:" + "b" * 64
+        with tempfile.TemporaryDirectory(prefix="render-lease-bundle-deadline-test.") as directory:
+            journal = RenderLeaseJournal(Path(directory) / "journal.json", schema=2)
+            outline_descriptor = RenderLeaseDescriptor(
+                RUN_ID, "linux", f"dobby-torturer-{RUN_ID}-linux", IMAGE_DIGEST
+            )
+            sink_descriptor = RenderLeaseDescriptor(
+                RUN_ID, "linux", f"dobby-torturer-{RUN_ID}-upload-sink", sink_digest, "upload-sink"
+            )
+            outline = RenderLease(
+                api,
+                RenderServiceSpec(
+                    "tea-test123", outline_descriptor.service_name, "tea-test123",
+                    "ghcr.io/dobbyvpn/outline@" + IMAGE_DIGEST, IMAGE_DIGEST,
+                ),
+                outline_descriptor,
+                journal,
+                monotonic_clock=clock,
+                sleeper=clock.sleep,
+            )
+            sink = RenderLease(
+                api,
+                RenderServiceSpec(
+                    "tea-test123", sink_descriptor.service_name, "tea-test123",
+                    "ghcr.io/dobbyvpn/sink@" + sink_digest, sink_digest,
+                ),
+                sink_descriptor,
+                journal,
+                monotonic_clock=clock,
+                sleeper=clock.sleep,
+            )
+            bundle = RenderLeaseBundle(outline, sink, monotonic_clock=clock)
+            with self.assertRaisesRegex(LeaseStateError, "deadline expired"):
+                bundle.acquire(timeout_seconds=5, poll_seconds=1)
+            self.assertEqual(api.delete_calls, ["srv-sink123", "srv-outline123"])
+            self.assertEqual(api.active, set())
+            latest = {record.role: record for record in journal.records()}
+            self.assertEqual(
+                {role: (record.state, record.cleanup_result) for role, record in latest.items()},
+                {
+                    "outline": (LeaseState.ABSENT, "verified"),
+                    "upload-sink": (LeaseState.ABSENT, "verified"),
+                },
+            )
+
+    def test_linux_bundle_failure_reaps_only_unknown_sink_and_then_outline(self) -> None:
+        class SinkCreateFailureAPI(FakeBundleAPI):
+            def create_service(self, spec: RenderServiceSpec) -> RenderServiceHandle:
+                if spec.name.endswith("-upload-sink"):
+                    self.active.add("srv-sink123")
+                    raise RenderAPIError("CREATE_FAILED")
+                return super().create_service(spec)
+
+        api = SinkCreateFailureAPI()
+        sink_digest = "sha256:" + "b" * 64
+        with tempfile.TemporaryDirectory(prefix="render-lease-bundle-failure-test.") as directory:
+            journal = RenderLeaseJournal(Path(directory) / "journal.json", schema=2)
+            outline_descriptor = RenderLeaseDescriptor(RUN_ID, "linux", f"dobby-torturer-{RUN_ID}-linux", IMAGE_DIGEST)
+            sink_descriptor = RenderLeaseDescriptor(RUN_ID, "linux", f"dobby-torturer-{RUN_ID}-upload-sink", sink_digest, "upload-sink")
+            outline = RenderLease(
+                api,
+                RenderServiceSpec("tea-test123", outline_descriptor.service_name, "tea-test123", "ghcr.io/dobbyvpn/outline@" + IMAGE_DIGEST, IMAGE_DIGEST),
+                outline_descriptor,
+                journal,
+            )
+            sink = RenderLease(
+                api,
+                RenderServiceSpec("tea-test123", sink_descriptor.service_name, "tea-test123", "ghcr.io/dobbyvpn/sink@" + sink_digest, sink_digest),
+                sink_descriptor,
+                journal,
+            )
+            bundle = RenderLeaseBundle(outline, sink)
+            with self.assertRaises(RenderAPIError):
+                bundle.acquire(timeout_seconds=5, poll_seconds=1)
+            self.assertEqual(api.delete_calls, ["srv-sink123", "srv-outline123"])
+            self.assertEqual(api.active, set())
+
+    def test_linux_bundle_rejects_duplicate_provider_service_id(self) -> None:
+        class DuplicateIDAPI(FakeBundleAPI):
+            def create_service(self, spec: RenderServiceSpec) -> RenderServiceHandle:
+                self.created.append(spec)
+                self.active.add("srv-outline123")
+                return RenderServiceHandle("srv-outline123", "dep-outline123", spec.image_digest)
+
+        api = DuplicateIDAPI()
+        sink_digest = "sha256:" + "b" * 64
+        with tempfile.TemporaryDirectory(prefix="render-lease-bundle-duplicate-id-test.") as directory:
+            journal = RenderLeaseJournal(Path(directory) / "journal.json", schema=2)
+            outline_descriptor = RenderLeaseDescriptor(RUN_ID, "linux", f"dobby-torturer-{RUN_ID}-linux", IMAGE_DIGEST)
+            sink_descriptor = RenderLeaseDescriptor(RUN_ID, "linux", f"dobby-torturer-{RUN_ID}-upload-sink", sink_digest, "upload-sink")
+            outline = RenderLease(
+                api,
+                RenderServiceSpec("tea-test123", outline_descriptor.service_name, "tea-test123", "ghcr.io/dobbyvpn/outline@" + IMAGE_DIGEST, IMAGE_DIGEST),
+                outline_descriptor,
+                journal,
+            )
+            sink = RenderLease(
+                api,
+                RenderServiceSpec("tea-test123", sink_descriptor.service_name, "tea-test123", "ghcr.io/dobbyvpn/sink@" + sink_digest, sink_digest),
+                sink_descriptor,
+                journal,
+            )
+            with self.assertRaises(LeaseStateError):
+                RenderLeaseBundle(outline, sink).acquire(timeout_seconds=5, poll_seconds=1)
+
+    def test_linux_bundle_fails_closed_when_sink_absence_is_unverified(self) -> None:
+        api = FakeBundleAPI(retain_sink=True)
+        sink_digest = "sha256:" + "b" * 64
+        with tempfile.TemporaryDirectory(prefix="render-lease-bundle-sticky-sink-test.") as directory:
+            journal = RenderLeaseJournal(Path(directory) / "journal.json", schema=2)
+            outline_descriptor = RenderLeaseDescriptor(RUN_ID, "linux", f"dobby-torturer-{RUN_ID}-linux", IMAGE_DIGEST)
+            sink_descriptor = RenderLeaseDescriptor(RUN_ID, "linux", f"dobby-torturer-{RUN_ID}-upload-sink", sink_digest, "upload-sink")
+            outline = RenderLease(
+                api,
+                RenderServiceSpec("tea-test123", outline_descriptor.service_name, "tea-test123", "ghcr.io/dobbyvpn/outline@" + IMAGE_DIGEST, IMAGE_DIGEST),
+                outline_descriptor,
+                journal,
+            )
+            sink = RenderLease(
+                api,
+                RenderServiceSpec("tea-test123", sink_descriptor.service_name, "tea-test123", "ghcr.io/dobbyvpn/sink@" + sink_digest, sink_digest),
+                sink_descriptor,
+                journal,
+            )
+            bundle = RenderLeaseBundle(outline, sink)
+            bundle.acquire(timeout_seconds=5, poll_seconds=1)
+            bundle.mark_issued()
+            with self.assertRaises(LeaseCleanupError):
+                bundle.cleanup()
+            self.assertEqual(api.delete_calls, ["srv-sink123", "srv-outline123"])
+            self.assertIn("srv-sink123", api.active)
+            self.assertNotIn("srv-outline123", api.active)
+
+    def test_legacy_journal_rejects_upload_sink_role(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="render-lease-legacy-role-test.") as directory:
+            journal = RenderLeaseJournal(Path(directory) / "journal.json")
+            with self.assertRaisesRegex(ValueError, "non-outline role"):
+                journal.append(
+                    LeaseJournalRecord(
+                        run_id=RUN_ID,
+                        service_id=None,
+                        image_digest=IMAGE_DIGEST,
+                        state=LeaseState.ABSENT,
+                        timestamp="2026-08-23T00:00:00Z",
+                        role="upload-sink",
+                    )
+                )
 
 
 if __name__ == "__main__":

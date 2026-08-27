@@ -41,6 +41,9 @@ class RenderReaperWorkflowPolicyTest(unittest.TestCase):
     def test_command_accepts_only_opaque_namespace_and_service_ids(self) -> None:
         self.assertIn('--name-prefix "$NAME_PREFIX"', self.text)
         self.assertIn('--active-service-id "$service_id"', self.text)
+        self.assertIn("IFS=',' read -r -a active_ids", self.text)
+        self.assertIn('active_args+=(--active-service-id "$service_id")', self.text)
+        self.assertIn("Outline/upload-sink pair", self.text)
         self.assertNotIn("--token", self.text)
         self.assertNotIn("--profile", self.text)
         self.assertNotIn("--endpoint", self.text)

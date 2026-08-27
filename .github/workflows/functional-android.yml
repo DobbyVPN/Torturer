@@ -30,6 +30,7 @@ jobs:
       SOURCE_REPOSITORY: ${{ inputs.source_repository }}
       SOURCE_SHA: ${{ inputs.commit_sha }}
       TORTURER_SHA: ${{ github.sha }}
+      WORKFLOW_RUN_STARTED_AT: ${{ github.run_started_at }}
 
     steps:
       - name: Validate exact public candidate identity
@@ -41,8 +42,87 @@ jobs:
           test "$SOURCE_SHA" != "0000000000000000000000000000000000000000"
           printf 'source_repository=%s\nsource_sha=%s\n' "$SOURCE_REPOSITORY" "$SOURCE_SHA"
 
+      - name: Establish build run-start deadline
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$WORKFLOW_RUN_STARTED_AT" <<'PY'
+          import datetime
+          import os
+          import sys
+          from pathlib import Path
+
+          started = datetime.datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
+          deadline = int(started.timestamp()) + 30 * 60
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as output:
+              output.write(f"RUN_DEADLINE_EPOCH={deadline}\nANDROID_CLEANUP_RESERVE_SECONDS=120\n")
+          print(f"run_deadline_epoch={deadline} cleanup_reserve_seconds=120")
+          PY
+          deadline_command="$RUNNER_TEMP/android-build-run-with-deadline.sh"
+          cat > "$deadline_command" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          reserve="${ANDROID_CLEANUP_RESERVE_SECONDS:?ANDROID_CLEANUP_RESERVE_SECONDS is missing}"
+          if [ "$#" -ge 2 ] && [ "$1" = '--reserve' ]; then
+            reserve="$2"
+            shift 2
+          fi
+          if ! [[ "$reserve" =~ ^[0-9][0-9]*$ ]]; then
+            printf '%s\n' 'android-build-run-with-deadline reserve is invalid' >&2
+            exit 2
+          fi
+          check_only=false
+          if [ "$#" -ge 1 ] && [ "$1" = '--check' ]; then
+            if [ "$#" -ne 2 ]; then
+              printf '%s\n' 'android-build-run-with-deadline check requires one configured timeout' >&2
+              exit 2
+            fi
+            configured="$2"
+            check_only=true
+          else
+            if [ "$#" -lt 2 ]; then
+              printf '%s\n' 'android-build-run-with-deadline requires a configured timeout and command' >&2
+              exit 2
+            fi
+            configured="$1"
+            shift
+          fi
+          if ! [[ "$configured" =~ ^[1-9][0-9]*$ ]]; then
+            printf '%s\n' 'android-build-run-with-deadline timeout is invalid' >&2
+            exit 2
+          fi
+          kill_grace=10
+          remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - reserve - kill_grace))
+          if [ "$remaining" -le 0 ]; then
+            printf 'android_build_deadline_child=exhausted remaining=%s reserve=%s\n' "$remaining" "$reserve" >&2
+            exit 124
+          fi
+          selected="$configured"
+          if [ "$selected" -gt "$remaining" ]; then selected="$remaining"; fi
+          printf 'android_build_deadline_child configured=%s selected=%s remaining=%s reserve=%s\n' \
+            "$configured" "$selected" "$remaining" "$reserve"
+          if [ "$check_only" = true ]; then
+            if [ "$selected" -lt "$configured" ]; then
+              printf 'android_build_deadline_check=insufficient configured=%s selected=%s\n' \
+                "$configured" "$selected" >&2
+              exit 124
+            fi
+            exit 0
+          fi
+          exec timeout --foreground --signal=TERM --kill-after="${kill_grace}s" "${selected}s" "$@"
+          SH
+          chmod 700 "$deadline_command"
+          printf 'DEADLINE_COMMAND=%s\n' "$deadline_command" >> "$GITHUB_ENV"
+
+      - name: Check Android candidate checkout deadline budget
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$DEADLINE_COMMAND" --check 300
+
       - name: Check out exact untrusted DobbyVPN candidate
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        timeout-minutes: 5
         with:
           repository: ${{ inputs.source_repository }}
           ref: ${{ inputs.commit_sha }}
@@ -50,8 +130,15 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
+      - name: Check Android trusted checkout deadline budget
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$DEADLINE_COMMAND" --check 300
+
       - name: Check out exact trusted Torturer revision
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        timeout-minutes: 5
         with:
           repository: DobbyVPN/Torturer
           ref: ${{ github.sha }}
@@ -66,14 +153,28 @@ jobs:
           git -C torturer status --porcelain=v1 --untracked-files=all
           test -z "$(git -C torturer status --porcelain=v1 --untracked-files=all)"
 
+      - name: Check Android build JDK setup deadline budget
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$DEADLINE_COMMAND" --check 180
+
       - name: Set up JDK 17
         uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95
+        timeout-minutes: 3
         with:
           distribution: temurin
           java-version: '17'
 
+      - name: Check Android build SDK setup deadline budget
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$DEADLINE_COMMAND" --check 180
+
       - name: Set up Android SDK
         uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699
+        timeout-minutes: 3
 
       - name: Install exact Android build toolchain
         shell: bash
@@ -93,7 +194,7 @@ jobs:
           }
           sdk_install_log="$toolchain_dir/sdkmanager-install.raw.log"
           sdk_install_status=0
-          timeout --foreground --signal=TERM --kill-after=10s 300s sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;36.0.0" > "$sdk_install_log" 2>&1 || sdk_install_status=$?
+          "$DEADLINE_COMMAND" 300 sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;36.0.0" "ndk;27.2.12479018" "cmake;3.22.1" > "$sdk_install_log" 2>&1 || sdk_install_status=$?
           emit_private_evidence android-build-sdkmanager-install "$sdk_install_log"
           if [ "$sdk_install_status" -ne 0 ]; then
             printf 'android_build_toolchain=failed code=SDKMANAGER_INSTALL status=%s\n' "$sdk_install_status" >&2
@@ -101,12 +202,51 @@ jobs:
           fi
           sdk_list_log="$toolchain_dir/sdkmanager-list.raw.log"
           sdk_list_status=0
-          timeout --foreground --signal=TERM --kill-after=10s 30s sdkmanager --list_installed > "$sdk_list_log" 2>&1 || sdk_list_status=$?
+          "$DEADLINE_COMMAND" 30 sdkmanager --list_installed > "$sdk_list_log" 2>&1 || sdk_list_status=$?
           emit_private_evidence android-build-sdkmanager-list "$sdk_list_log"
           if [ "$sdk_list_status" -ne 0 ]; then
             printf 'android_build_toolchain=failed code=SDKMANAGER_LIST status=%s\n' "$sdk_list_status" >&2
             exit "$sdk_list_status"
           fi
+          printf 'ANDROID_NDK_HOME=%s/ndk/27.2.12479018\n' "$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Download candidate Go modules
+        shell: bash
+        working-directory: candidate/go_module
+        run: |
+          set -euo pipefail
+          "$DEADLINE_COMMAND" 240 bash -c 'go mod download && go mod tidy'
+
+      - name: Install pinned gomobile toolchain
+        shell: bash
+        env:
+          CANDIDATE_DIR: ${{ github.workspace }}/candidate
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018
+        run: |
+          set -euo pipefail
+          mobile_version='v0.0.0-20260520154334-0e4426e1883d'
+          "$DEADLINE_COMMAND" 240 go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260520154334-0e4426e1883d
+          "$DEADLINE_COMMAND" 240 go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260520154334-0e4426e1883d
+          gopath="$(go env GOPATH)"
+          tool_dir="$gopath/bin"
+          mkdir -p "$gopath/pkg/gomobile"
+          export PATH="$tool_dir:$PATH"
+          echo "$tool_dir" >> "$GITHUB_PATH"
+          for tool in gomobile gobind; do
+            test -x "$tool_dir/$tool"
+            go version -m "$tool_dir/$tool" | \
+              grep -F 'golang.org/x/mobile' | \
+              grep -F "$mobile_version"
+          done
+          cd "$GITHUB_WORKSPACE/candidate/go_module"
+          mobile_module_version="$(go list -m -f '{{.Version}}' golang.org/x/mobile)"
+          "$DEADLINE_COMMAND" 120 go get "golang.org/x/mobile/bind@$mobile_module_version"
+          if ! git -C "$CANDIDATE_DIR" diff --no-ext-diff --exit-code --; then
+            echo "candidate source mutated during pinned mobile preparation" >&2
+            git -C "$CANDIDATE_DIR" diff --no-ext-diff -- >&2
+            exit 1
+          fi
+          test -z "$(git -C "$CANDIDATE_DIR" status --porcelain=v1 --untracked-files=all)"
 
       - name: Verify checkout and build Android candidate
         shell: bash
@@ -117,7 +257,7 @@ jobs:
           status="$(git status --porcelain=v1 --untracked-files=all)"
           printf "%s\n" "$status"
           test -z "$status"
-          timeout --foreground --signal=TERM --kill-after=10s 480s ./kmp_module/gradlew -p kmp_module --no-daemon --stacktrace \
+          "$DEADLINE_COMMAND" 480 ./kmp_module/gradlew -p kmp_module --no-daemon --stacktrace \
             :app:assembleDebug :app:assembleDebugAndroidTest \
             -PprojectRepositoryCommit="$SOURCE_SHA" \
             -PprojectRepositoryCommitLink="https://github.com/$SOURCE_REPOSITORY/tree/$SOURCE_SHA"
@@ -128,13 +268,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 torturer/torturer_checks/hosted/candidate.py stage \
+          "$DEADLINE_COMMAND" 60 python3 torturer/torturer_checks/hosted/candidate.py stage \
             --root "$GITHUB_WORKSPACE/candidate" \
             --output "$RUNNER_TEMP/candidate-android" \
             --platform android --architecture x86_64 --source-sha "$SOURCE_SHA"
 
+      - name: Check Android candidate artifact upload deadline budget
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$DEADLINE_COMMAND" --check 60
+
       - name: Upload isolated Android candidate runtime
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        timeout-minutes: 1
         with:
           name: candidate-android-${{ inputs.commit_sha }}
           path: ${{ runner.temp }}/candidate-android
@@ -146,7 +293,10 @@ jobs:
     needs: build
     name: Trusted functional Android
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # The build job is capped at ten minutes.  Keep this client at twenty so
+    # build plus client execution cannot exceed the workflow's thirty-minute
+    # run-start deadline.
+    timeout-minutes: 20
     permissions:
       contents: read
       actions: read
@@ -156,16 +306,34 @@ jobs:
       PLATFORM: android
       TORTURER_SHA: ${{ github.sha }}
       SERVER_IMAGE_DIGEST: ${{ vars.RENDER_IMAGE_DIGEST }}
+      SERVER_SINK_IMAGE_DIGEST: ${{ vars.RENDER_SINK_IMAGE_DIGEST }}
 
     steps:
       - name: Establish runner-local paths
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
           handoff="$RUNNER_TEMP/dobbyvpn-render-handoff"
           service="$RUNNER_TEMP/dobbyvpn-service"
+          for private_dir in "$handoff" "$service"; do
+            if [ -L "$private_dir" ] || { [ -e "$private_dir" ] && [ ! -d "$private_dir" ]; }; then
+              printf 'android_private_directory=unsafe path=%s\n' "$private_dir" >&2
+              exit 1
+            fi
+          done
           mkdir -p "$handoff" "$service"
-          printf 'HANDOFF_DIR=%s\nSERVICE_DIR=%s\nRESULT_PATH=%s\n' \
+          chmod 700 "$handoff" "$service"
+          for private_dir in "$handoff" "$service"; do
+            private_owner="$(stat -c '%u' "$private_dir")"
+            private_mode="$(stat -c '%a' "$private_dir")"
+            if [ "$private_owner" != "$(id -u)" ] || [ "$private_mode" != "700" ]; then
+              printf 'android_private_directory=unsafe owner=%s mode=%s path=%s\n' \
+                "$private_owner" "$private_mode" "$private_dir" >&2
+              exit 1
+            fi
+          done
+          printf 'HANDOFF_DIR=%s\nSERVICE_DIR=%s\nRESULT_PATH=%s\nLEASE_RUN_ID=unassigned\n' \
             "$handoff" "$service" "$handoff/functional-result.json" >> "$GITHUB_ENV"
 
       - name: Validate trusted functional inputs
@@ -178,17 +346,122 @@ jobs:
           [[ "$SERVER_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           image_digest="${SERVER_IMAGE_DIGEST#sha256:}"
           test -n "${image_digest//0/}"
-          printf 'source_repository=%s\nsource_sha=%s\nplatform=%s\ntorturer_sha=%s\nserver_image_digest=%s\n' \
-            "$SOURCE_REPOSITORY" "$SOURCE_SHA" "$PLATFORM" "$TORTURER_SHA" "$SERVER_IMAGE_DIGEST"
+          [[ "$SERVER_SINK_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          sink_image_digest="${SERVER_SINK_IMAGE_DIGEST#sha256:}"
+          test -n "${sink_image_digest//0/}"
+          printf 'source_repository=%s\nsource_sha=%s\nplatform=%s\ntorturer_sha=%s\nserver_image_digest=%s\nserver_sink_image_digest=%s\n' \
+            "$SOURCE_REPOSITORY" "$SOURCE_SHA" "$PLATFORM" "$TORTURER_SHA" "$SERVER_IMAGE_DIGEST" "$SERVER_SINK_IMAGE_DIGEST"
+
+      - name: Check out exact trusted Torturer revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        timeout-minutes: 5
+        with:
+          repository: DobbyVPN/Torturer
+          ref: ${{ github.sha }}
+          path: torturer
+          persist-credentials: false
+
+      - name: Establish hard thirty-minute workflow deadline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" 30 origin-run "$HANDOFF_DIR/origin-run.json" \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          python3 - "$HANDOFF_DIR/origin-run.json" <<'PY'
+          import datetime, json, os, sys
+          from pathlib import Path
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if value.get("id") != int(os.environ["GITHUB_RUN_ID"]):
+              raise SystemExit("workflow run identity mismatch")
+          if not isinstance(value.get("run_started_at"), str):
+              raise SystemExit("workflow run start timestamp is missing")
+          started = datetime.datetime.fromisoformat(value["run_started_at"].replace("Z", "+00:00"))
+          deadline = int(started.timestamp()) + 30 * 60
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as output:
+              output.write(f"RUN_DEADLINE_EPOCH={deadline}\nANDROID_CLEANUP_RESERVE_SECONDS=120\n")
+          print(f"run_deadline_epoch={deadline} cleanup_reserve_seconds=120")
+          PY
+          unset GH_TOKEN
+          deadline_command="$HANDOFF_DIR/run-with-deadline.sh"
+          cat > "$deadline_command" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          reserve="${ANDROID_CLEANUP_RESERVE_SECONDS:?ANDROID_CLEANUP_RESERVE_SECONDS is missing}"
+          if [ "$#" -ge 2 ] && [ "$1" = '--reserve' ]; then
+            reserve="$2"
+            shift 2
+          fi
+          if ! [[ "$reserve" =~ ^[0-9][0-9]*$ ]]; then
+            printf '%s\n' 'run-with-deadline reserve is invalid' >&2
+            exit 2
+          fi
+          check_only=false
+          if [ "$#" -ge 1 ] && [ "$1" = '--check' ]; then
+            if [ "$#" -ne 2 ]; then
+              printf '%s\n' 'run-with-deadline check requires one configured timeout' >&2
+              exit 2
+            fi
+            configured="$2"
+            check_only=true
+          else
+            if [ "$#" -lt 2 ]; then
+              printf '%s\n' 'run-with-deadline requires a configured timeout and command' >&2
+              exit 2
+            fi
+            configured="$1"
+            shift
+          fi
+          if ! [[ "$configured" =~ ^[1-9][0-9]*$ ]]; then
+            printf '%s\n' 'run-with-deadline timeout is invalid' >&2
+            exit 2
+          fi
+          kill_grace=10
+          remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - reserve - kill_grace))
+          if [ "$remaining" -le 0 ]; then
+            printf 'android_deadline_child=exhausted remaining=%s reserve=%s\n' "$remaining" "$reserve" >&2
+            exit 124
+          fi
+          selected="$configured"
+          if [ "$selected" -gt "$remaining" ]; then selected="$remaining"; fi
+          printf 'android_deadline_child configured=%s selected=%s remaining=%s reserve=%s\n' \
+            "$configured" "$selected" "$remaining" "$reserve"
+          if [ "$check_only" = true ]; then
+            if [ "$selected" -lt "$configured" ]; then
+              printf 'android_deadline_check=insufficient configured=%s selected=%s\n' \
+                "$configured" "$selected" >&2
+              exit 124
+            fi
+            exit 0
+          fi
+          exec timeout --foreground --signal=TERM --kill-after="${kill_grace}s" "${selected}s" "$@"
+          SH
+          chmod 700 "$deadline_command"
+          printf 'DEADLINE_COMMAND=%s\n' "$deadline_command" >> "$GITHUB_ENV"
+
+      - name: Check Android JDK setup deadline budget
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$DEADLINE_COMMAND" --check 180
 
       - name: Set up JDK 17 for Android client
         uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95
+        timeout-minutes: 3
         with:
           distribution: temurin
           java-version: '17'
 
+      - name: Check Android SDK setup deadline budget
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$DEADLINE_COMMAND" --check 180
+
       - name: Set up Android SDK for hosted client
         uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699
+        timeout-minutes: 3
 
       - name: Install Android emulator and prove KVM
         shell: bash
@@ -208,10 +481,10 @@ jobs:
               printf 'diagnostic_evidence label=%s state=missing\n' "$label"
             fi
           }
-          test -e /dev/kvm
+          test -c /dev/kvm
           kvm_chmod_log="$SERVICE_DIR/kvm-chmod.raw.log"
           kvm_chmod_status=0
-          timeout --foreground --signal=TERM --kill-after=10s 30s sudo chmod a+rw /dev/kvm > "$kvm_chmod_log" 2>&1 || kvm_chmod_status=$?
+          "$DEADLINE_COMMAND" 30 sudo chmod a+rw /dev/kvm > "$kvm_chmod_log" 2>&1 || kvm_chmod_status=$?
           emit_private_evidence android-kvm-chmod "$kvm_chmod_log"
           if [ "$kvm_chmod_status" -ne 0 ]; then
             printf 'android_kvm_setup=failed code=KVM_CHMOD status=%s\n' "$kvm_chmod_status" >&2
@@ -227,7 +500,7 @@ jobs:
           fi
           sdk_install_log="$SERVICE_DIR/sdkmanager-install.raw.log"
           sdk_install_status=0
-          timeout --foreground --signal=TERM --kill-after=10s 300s sdkmanager --install "platform-tools" "emulator" "platforms;android-35" "build-tools;36.0.0" "system-images;android-35;google_apis;x86_64" > "$sdk_install_log" 2>&1 || sdk_install_status=$?
+          "$DEADLINE_COMMAND" 300 sdkmanager --install "platform-tools" "emulator" "platforms;android-35" "build-tools;36.0.0" "system-images;android-35;google_apis;x86_64" > "$sdk_install_log" 2>&1 || sdk_install_status=$?
           emit_private_evidence android-sdkmanager-install "$sdk_install_log"
           if [ "$sdk_install_status" -ne 0 ]; then
             printf 'android_sdk_setup=failed code=SDKMANAGER_INSTALL status=%s\n' "$sdk_install_status" >&2
@@ -235,7 +508,7 @@ jobs:
           fi
           sdk_list_log="$SERVICE_DIR/sdkmanager-list.raw.log"
           sdk_list_status=0
-          timeout --foreground --signal=TERM --kill-after=10s 30s sdkmanager --list_installed > "$sdk_list_log" 2>&1 || sdk_list_status=$?
+          "$DEADLINE_COMMAND" 30 sdkmanager --list_installed > "$sdk_list_log" 2>&1 || sdk_list_status=$?
           emit_private_evidence android-sdkmanager-list "$sdk_list_log"
           if [ "$sdk_list_status" -ne 0 ]; then
             printf 'android_sdk_setup=failed code=SDKMANAGER_LIST status=%s\n' "$sdk_list_status" >&2
@@ -243,13 +516,13 @@ jobs:
           fi
           accel_check_log="$SERVICE_DIR/emulator-accel-check.raw.log"
           accel_status=0
-          timeout --foreground --signal=TERM --kill-after=10s 60s "$ANDROID_SDK_ROOT/emulator/emulator" -accel-check > "$accel_check_log" 2>&1 || accel_status=$?
+          "$DEADLINE_COMMAND" 60 "$ANDROID_SDK_ROOT/emulator/emulator" -accel-check > "$accel_check_log" 2>&1 || accel_status=$?
           if [ "$accel_status" -ne 0 ]; then
             emit_private_evidence android-kvm-accel-check "$accel_check_log"
             printf 'android_kvm_acceleration_check=failed status=%s\n' "$accel_status" >&2
             exit 1
           fi
-          if ! grep -Eiq 'KVM .*usable|KVM.*installed and usable' "$accel_check_log"; then
+          if ! grep -Eiq '^KVM( \([^)]*\))? is installed and usable\.?$' "$accel_check_log"; then
             emit_private_evidence android-kvm-accel-check "$accel_check_log"
             printf 'android_kvm_acceleration_check=not-usable\n' >&2
             exit 1
@@ -257,33 +530,12 @@ jobs:
           emit_private_evidence android-kvm-accel-check "$accel_check_log"
           printf 'android_kvm_acceleration_check=usable\n'
 
-      - name: Establish hard thirty-minute workflow deadline
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" 30 origin-run "$HANDOFF_DIR/origin-run.json" \
-            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          python3 - "$HANDOFF_DIR/origin-run.json" <<'PY'
-          import datetime, json, os, sys
-          from pathlib import Path
-          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          if value.get("id") != int(os.environ["GITHUB_RUN_ID"]):
-              raise SystemExit("workflow run identity mismatch")
-          started = datetime.datetime.fromisoformat(value["run_started_at"].replace("Z", "+00:00"))
-          deadline = int(started.timestamp()) + 30 * 60
-          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as output:
-              output.write(f"RUN_DEADLINE_EPOCH={deadline}\n")
-          print(f"run_deadline_epoch={deadline}")
-          PY
-
       - name: Create ephemeral recipient and opaque Render lease request
         shell: bash
         run: |
           set -euo pipefail
           umask 077
-          timeout --foreground --signal=TERM --kill-after=10s 60s openssl req -x509 -newkey rsa:3072 -nodes -days 1 \
+          "$DEADLINE_COMMAND" 60 openssl req -x509 -newkey rsa:3072 -nodes -days 1 \
             -subj "/CN=dobbyvpn-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             -keyout "$HANDOFF_DIR/recipient.key" -out "$HANDOFF_DIR/recipient.crt"
           lease_run_id="$(python3 -c 'import hashlib,os; print(hashlib.sha256(":".join(os.environ[name] for name in ("GITHUB_RUN_ID","GITHUB_RUN_ATTEMPT","PLATFORM","TORTURER_SHA","SOURCE_SHA")).encode()).hexdigest()[:32])')"
@@ -301,16 +553,15 @@ jobs:
           print(f"lease_run_id={run_id}\nrequest_artifact_name={name}")
           PY
 
-      - name: Check out exact trusted Torturer revision
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          repository: DobbyVPN/Torturer
-          ref: ${{ github.sha }}
-          path: torturer
-          persist-credentials: false
+      - name: Check Android candidate download deadline budget
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$DEADLINE_COMMAND" --check 120
 
       - name: Download and verify exact Android candidate closure
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        timeout-minutes: 2
         with:
           name: candidate-android-${{ inputs.commit_sha }}
           path: candidate
@@ -344,22 +595,164 @@ jobs:
             fi
           }
           avd_name=dobby-functional-api35
+          avd_home="$SERVICE_DIR/avd"
+          mkdir -p "$avd_home"
+          export ANDROID_AVD_HOME="$avd_home"
+          printf 'ANDROID_AVD_HOME=%s\n' "$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
           avd_log="$SERVICE_DIR/avdmanager-create.raw.log"
           avd_status=0
-          timeout --foreground --signal=TERM --kill-after=10s 120s avdmanager create avd --force --name "$avd_name" --package "system-images;android-35;google_apis;x86_64" --device pixel > "$avd_log" 2>&1 || avd_status=$?
+          printf 'no\n' | "$DEADLINE_COMMAND" 120 avdmanager create avd --force --name "$avd_name" --package "system-images;android-35;google_apis;x86_64" --device pixel > "$avd_log" 2>&1 || avd_status=$?
           emit_private_evidence android-avdmanager-create "$avd_log"
           if [ "$avd_status" -ne 0 ]; then
             printf 'android_avd_setup=failed code=AVDMANAGER_CREATE status=%s\n' "$avd_status" >&2
             exit "$avd_status"
           fi
+          avd_list_log="$SERVICE_DIR/avdmanager-list.raw.log"
+          avd_list_status=0
+          "$DEADLINE_COMMAND" 30 avdmanager list avd > "$avd_list_log" 2>&1 || avd_list_status=$?
+          emit_private_evidence android-avdmanager-list "$avd_list_log"
+          if [ "$avd_list_status" -ne 0 ]; then
+            printf 'android_avd_setup=failed code=AVDMANAGER_LIST status=%s\n' "$avd_list_status" >&2
+            exit "$avd_list_status"
+          fi
+          test -f "$avd_home/$avd_name.ini"
+          test -d "$avd_home/$avd_name.avd"
+          printf 'android_avd_ready=true name=%s home=%s\n' "$avd_name" "$ANDROID_AVD_HOME"
           emulator_log="$SERVICE_DIR/emulator.raw.log"
-          setsid timeout --foreground --signal=TERM --kill-after=10s 1500s "$ANDROID_SDK_ROOT/emulator/emulator" -avd "$avd_name" -port 5554 -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -accel on -no-snapshot -wipe-data > "$emulator_log" 2>&1 &
+          emulator_status_file="$HANDOFF_DIR/emulator-exit-status.raw.log"
+          emulator_launcher="$HANDOFF_DIR/emulator-launcher.sh"
+          cat > "$emulator_launcher" <<'SH'
+          #!/usr/bin/env bash
+          set -u
+          umask 077
+          record_emulator_status() {
+            status="$1"
+            temporary="${EMULATOR_EXIT_STATUS_FILE}.tmp.$$"
+            printf 'emulator_exit_status=%s\n' "$status" > "$temporary"
+            chmod 600 "$temporary"
+            mv -f -- "$temporary" "$EMULATOR_EXIT_STATUS_FILE"
+          }
+          trap 'record_emulator_status 143; exit 143' TERM INT
+          "$DEADLINE_COMMAND" 1500 "$ANDROID_SDK_ROOT/emulator/emulator" -avd "$EMULATOR_AVD_NAME" -port 5554 -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -accel on -no-snapshot -wipe-data > "$EMULATOR_LOG" 2>&1
+          emulator_status=$?
+          record_emulator_status "$emulator_status"
+          exit "$emulator_status"
+          SH
+          chmod 700 "$emulator_launcher"
+          export EMULATOR_EXIT_STATUS_FILE="$emulator_status_file"
+          export EMULATOR_AVD_NAME="$avd_name"
+          export EMULATOR_LOG="$emulator_log"
+          setsid "$emulator_launcher" &
           emulator_pid=$!
+          # Publish the cleanup handoff before any identity probe.  If the
+          # emulator exits while /proc is being sampled, the later cleanup
+          # step must still know which launcher was started.
           printf '%s\n' "$emulator_pid" > "$HANDOFF_DIR/emulator.pid"
-          printf 'EMULATOR_PID=%s\nADB_PATH=%s\nEMULATOR_LOG=%s\n' "$emulator_pid" "$ANDROID_SDK_ROOT/platform-tools/adb" "$emulator_log" >> "$GITHUB_ENV"
+          printf 'EMULATOR_PID=%s\nADB_PATH=%s\nEMULATOR_LOG=%s\nEMULATOR_EXIT_STATUS_FILE=%s\n' \
+            "$emulator_pid" "$ANDROID_SDK_ROOT/platform-tools/adb" "$emulator_log" "$emulator_status_file" >> "$GITHUB_ENV"
+          read_emulator_identity() {
+            identity_pid="$1"
+            identity_stat="/proc/$identity_pid/stat"
+            [ -r "$identity_stat" ] || return 1
+            if ! identity_line="$(<"$identity_stat")"; then
+              return 1
+            fi
+            identity_rest="${identity_line#*) }"
+            if ! read -r identity_state identity_ppid identity_pgrp identity_session identity_tty identity_tpgid \
+              identity_flags identity_minflt identity_cminflt identity_majflt identity_cmajflt \
+              identity_utime identity_stime identity_cutime identity_cstime identity_priority identity_nice \
+              identity_threads identity_itrealvalue identity_starttime identity_extra <<< "$identity_rest"; then
+              return 1
+            fi
+            case "$identity_state:$identity_pgrp:$identity_starttime" in
+              [A-Za-z]:[1-9][0-9]*:[1-9][0-9]*)
+                printf 'pid=%s state=%s start_time=%s process_group=%s\n' \
+                  "$identity_pid" "$identity_state" "$identity_starttime" "$identity_pgrp"
+                ;;
+              *) return 1;;
+            esac
+          }
+          emulator_identity_file="$HANDOFF_DIR/emulator.identity"
+          emulator_identity_data=""
+          for identity_attempt in $(seq 1 5); do
+            if emulator_identity_data="$(read_emulator_identity "$emulator_pid")"; then
+              break
+            fi
+            sleep 0.2
+          done
+          if [ -z "$emulator_identity_data" ]; then
+            printf 'pid=%s state=unavailable start_time=missing process_group=missing\n' "$emulator_pid" > "$emulator_identity_file"
+            chmod 600 "$emulator_identity_file"
+            emit_private_evidence android-emulator-identity "$emulator_identity_file"
+            printf 'android_emulator_identity=unavailable\n' >&2
+            exit 1
+          fi
+          printf '%s' "$emulator_identity_data" > "$emulator_identity_file"
+          chmod 600 "$emulator_identity_file"
+          emit_private_evidence android-emulator-identity "$emulator_identity_file"
+          printf 'EMULATOR_IDENTITY_FILE=%s\n' "$emulator_identity_file" >> "$GITHUB_ENV"
+          emulator_exit_diagnostic() {
+            emulator_wait_status=0
+            wait "$emulator_pid" || emulator_wait_status=$?
+            exit_log="$SERVICE_DIR/emulator-exit.raw.log"
+            exit_diagnostic_status=0
+            "$DEADLINE_COMMAND" 5 python3 - "$emulator_log" "$emulator_wait_status" <<'PY' > "$exit_log" 2>&1 || exit_diagnostic_status=$?
+          from hashlib import sha256
+          from pathlib import Path
+          import re
+          import sys
+
+          log_path = Path(sys.argv[1])
+          wait_status = sys.argv[2]
+          log_bytes = 0
+          log_digest = sha256()
+          reason_count = 0
+          first_reason = "none"
+          if log_path.is_file():
+              with log_path.open("rb") as stream:
+                  for raw_line in stream:
+                      log_bytes += len(raw_line)
+                      log_digest.update(raw_line)
+                      raw_text = raw_line.decode("utf-8", "replace").rstrip("\r\n")
+                      safe_line = re.sub(r"(?:[A-Za-z]:)?[\\/][^\s,;)]*", "<path>", raw_text)
+                      safe_line = re.sub(
+                          r"(?i)\b(?:token|key|secret|password|authorization)\b\s*[:=]\s*\S+",
+                          "<redacted>",
+                          safe_line,
+                      )
+                      safe_line = re.sub(r"(?i)\b[0-9a-f]{32,}\b", "<hex>", safe_line)
+                      safe_line = re.sub(r"\s+", " ", safe_line).strip()
+                      if re.search(r"(?i)\b(panic|error|fatal|failed|failure|abort)\b", safe_line):
+                          reason_count += 1
+                          if first_reason == "none":
+                              first_reason = safe_line[:240]
+          print(f"emulator_wait_status={wait_status}")
+          print(f"emulator_log_bytes={log_bytes}")
+          print(f"emulator_log_sha256={log_digest.hexdigest()}")
+          print(f"emulator_exit_reason_count={reason_count}")
+          print(f"emulator_exit_reason={first_reason}")
+          PY
+            if [ "$exit_diagnostic_status" -ne 0 ]; then
+              printf 'emulator_exit_diagnostic_status=%s\n' "$exit_diagnostic_status" >> "$exit_log"
+            fi
+            chmod 600 "$exit_log"
+            emit_private_evidence android-emulator-exit "$exit_log"
+            printf '%s\n' 'android_emulator_exit_diagnostic_begin'
+            sed -n '1,5p' "$exit_log"
+            printf '%s\n' 'android_emulator_exit_diagnostic_end'
+          }
           adb="$ANDROID_SDK_ROOT/platform-tools/adb"
           adb_bounded() {
-            timeout --foreground --signal=TERM --kill-after=10s 120s "$adb" "$@"
+            "$DEADLINE_COMMAND" 120 "$adb" "$@"
+          }
+          readiness_sleep() {
+            sleep_seconds="$1"
+            remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - ANDROID_CLEANUP_RESERVE_SECONDS - 10))
+            if [ "$remaining" -le "$sleep_seconds" ]; then
+              printf 'android_readiness_deadline=exhausted available=%s\n' "$remaining" >&2
+              return 1
+            fi
+            sleep "$sleep_seconds"
           }
           adb_start_log="$SERVICE_DIR/adb-start-server.raw.log"
           adb_start_status=0
@@ -372,6 +765,7 @@ jobs:
           device_ready=false
           for attempt in $(seq 1 90); do
             if ! kill -0 "$emulator_pid"; then
+              emulator_exit_diagnostic
               emit_private_evidence android-emulator-exited "$emulator_log"
               printf 'android_emulator_readiness=failed code=DEVICE_TIMEOUT\n' >&2
               exit 1
@@ -389,12 +783,13 @@ jobs:
               emit_private_evidence android-adb-devices-${attempt} "$devices_log"
               printf 'android_adb_device_probe=failed attempt=%s status=%s\n' "$attempt" "$devices_status" >&2
             fi
-            sleep 2
+            readiness_sleep 2
           done
           test "$device_ready" = true
           booted=false
           for attempt in $(seq 1 90); do
             if ! kill -0 "$emulator_pid"; then
+              emulator_exit_diagnostic
               emit_private_evidence android-emulator-boot-exited "$emulator_log"
               printf 'android_emulator_readiness=failed code=BOOT_TIMEOUT\n' >&2
               exit 1
@@ -411,7 +806,7 @@ jobs:
             boot_state="$(tr -d '\r' < "$boot_state_log")"
             printf 'android_boot_probe_attempt=%s state=%s\n' "$attempt" "$boot_state"
             if [ "$boot_state" = 1 ]; then booted=true; break; fi
-            sleep 2
+            readiness_sleep 2
           done
           test "$booted" = true
           adb_evidence() {
@@ -450,9 +845,135 @@ jobs:
           else
             printf 'android_test_pid_probe=failed status=%s\n' "$test_pid_status" >&2
           fi
+          adb_wrapper="$HANDOFF_DIR/adb-incremental-wrapper.py"
+          adb_cursor="$HANDOFF_DIR/adb-logcat.cursor"
+          cat > "$adb_wrapper" <<'PY'
+          #!/usr/bin/env python3
+          """Stream ADB commands while making logcat diagnostics incremental."""
+
+          from __future__ import annotations
+
+          import fcntl
+          import os
+          import re
+          import selectors
+          import subprocess
+          import sys
+          from pathlib import Path
+
+
+          REAL_ADB = os.environ["DOBBY_REAL_ADB"]
+          CURSOR = Path(os.environ["DOBBY_ADB_LOGCAT_CURSOR"])
+          EPOCH_LINE = re.compile(rb"^\s*\[?\s*(\d+\.\d+)")
+
+
+          def write_all(fd: int, payload: bytes) -> None:
+              view = memoryview(payload)
+              while view:
+                  written = os.write(fd, view)
+                  view = view[written:]
+
+
+          def read_cursor() -> str | None:
+              try:
+                  value = CURSOR.read_text(encoding="ascii").strip()
+              except FileNotFoundError:
+                  return None
+              return value or None
+
+
+          def write_cursor(value: str) -> None:
+              temporary = CURSOR.with_name(CURSOR.name + ".tmp")
+              temporary.write_text(value + "\n", encoding="ascii")
+              os.chmod(temporary, 0o600)
+              os.replace(temporary, CURSOR)
+
+
+          def logcat_command(arguments: list[str]) -> int:
+              CURSOR.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+              lock_path = CURSOR.with_name(CURSOR.name + ".lock")
+              with lock_path.open("a+", encoding="ascii") as lock:
+                  os.chmod(lock_path, 0o600)
+                  fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                  cursor = read_cursor()
+                  normalized: list[str] = []
+                  index = 0
+                  while index < len(arguments):
+                      if arguments[index] in {"-v", "--format"} and index + 1 < len(arguments):
+                          index += 2
+                          continue
+                      if arguments[index] == "-T" and index + 1 < len(arguments):
+                          index += 2
+                          continue
+                      normalized.append(arguments[index])
+                      index += 1
+                  normalized.extend(["-v", "epoch"])
+                  if cursor is not None:
+                      normalized.extend(["-T", cursor])
+                  process = subprocess.Popen(
+                      [REAL_ADB, *normalized],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      close_fds=True,
+                  )
+                  selector = selectors.DefaultSelector()
+                  assert process.stdout is not None
+                  assert process.stderr is not None
+                  selector.register(process.stdout, selectors.EVENT_READ, (1, bytearray()))
+                  selector.register(process.stderr, selectors.EVENT_READ, (2, None))
+                  line_buffer = bytearray()
+                  last_epoch: str | None = None
+                  while selector.get_map():
+                      for key, _ in selector.select():
+                          stream = key.fileobj
+                          chunk = stream.read1(65536)
+                          if not chunk:
+                              selector.unregister(stream)
+                              stream.close()
+                              continue
+                          fd, _ = key.data
+                          write_all(fd, chunk)
+                          if fd == 1:
+                              line_buffer.extend(chunk)
+                              while b"\n" in line_buffer:
+                                  line, _, remainder = line_buffer.partition(b"\n")
+                                  line_buffer = bytearray(remainder)
+                                  match = EPOCH_LINE.match(line)
+                                  if match:
+                                      last_epoch = match.group(1).decode("ascii")
+                  if line_buffer:
+                      match = EPOCH_LINE.match(line_buffer)
+                      if match:
+                          last_epoch = match.group(1).decode("ascii")
+                  returncode = process.wait()
+                  if returncode == 0 and last_epoch is not None:
+                      write_cursor(last_epoch)
+                  return returncode
+
+
+          def main() -> int:
+              arguments = sys.argv[1:]
+              if arguments and arguments[0] == "logcat" and "-d" in arguments:
+                  return logcat_command(arguments)
+              os.execv(REAL_ADB, [REAL_ADB, *arguments])
+              return 127
+
+
+          raise SystemExit(main())
+          PY
+          chmod 700 "$adb_wrapper"
+          printf 'ADB_PATH=%s\nDOBBY_REAL_ADB=%s\nDOBBY_ADB_LOGCAT_CURSOR=%s\n' \
+            "$adb_wrapper" "$adb" "$adb_cursor" >> "$GITHUB_ENV"
+
+      - name: Check Android request upload deadline budget
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$DEADLINE_COMMAND" --check 60
 
       - name: Upload public certificate and opaque request
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        timeout-minutes: 1
         with:
           name: ${{ env.REQUEST_ARTIFACT_NAME }}
           path: |
@@ -517,10 +1038,10 @@ jobs:
           if value.get("repository", {}).get("full_name") != os.environ["GITHUB_REPOSITORY"]: raise SystemExit("lease workflow repository mismatch")
           print("lease_workflow_run=validated")
           PY
-              if PYTHONPATH="$GITHUB_WORKSPACE/torturer" timeout --foreground --signal=TERM --kill-after=10s 120s python3 -m torturer_checks.hosted.artifacts \
+              if PYTHONPATH="$GITHUB_WORKSPACE/torturer" "$DEADLINE_COMMAND" 120 python3 -m torturer_checks.hosted.artifacts \
                 --repository "$GITHUB_REPOSITORY" --artifact-name "$response_name" --run-id "$lease_workflow_run_id" \
                 --output-dir "$attempt_dir/unpacked" --metadata "$attempt_dir/artifacts.json" --archive "$attempt_dir/response.zip" \
-                --expect-file lease.json --expect-file profile.cms; then
+                --expect-file lease.json --expect-file profile.cms --expect-file upload.cms; then
                 printf 'LEASE_RESPONSE_DIR=%s\n' "$attempt_dir/unpacked" >> "$GITHUB_ENV"
                 found=true
                 break
@@ -530,7 +1051,11 @@ jobs:
               test "$status" -eq 1
             fi
             printf 'lease_response_attempt=%s status=pending\n' "$attempt"
-            sleep 5
+            sleep_seconds=5
+            remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 180))
+            if [ "$remaining" -le 0 ]; then break; fi
+            if [ "$sleep_seconds" -gt "$remaining" ]; then sleep_seconds="$remaining"; fi
+            sleep "$sleep_seconds"
           done
           test "$found" = true
 
@@ -538,21 +1063,77 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -f "$LEASE_RESPONSE_DIR/lease.json" && test -f "$LEASE_RESPONSE_DIR/profile.cms"
+          test -f "$LEASE_RESPONSE_DIR/lease.json" && test -f "$LEASE_RESPONSE_DIR/profile.cms" && test -f "$LEASE_RESPONSE_DIR/upload.cms"
           python3 - "$LEASE_RESPONSE_DIR/lease.json" <<'PY'
-          import json, os, re, sys
+          import json
+          import os
+          import re
+          import sys
           from pathlib import Path
           value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          expected = {"schema": 1, "kind": "dobbyvpn.render-lease", "run_id": os.environ["LEASE_RUN_ID"], "platform": "android", "source_sha": os.environ["SOURCE_SHA"], "image_digest": os.environ["SERVER_IMAGE_DIGEST"], "state": "issued"}
+          if not isinstance(value, dict):
+              raise SystemExit("Android safe lease record is not an object")
+          expected = {
+              "schema": 2,
+              "kind": "dobbyvpn.render-lease",
+              "run_id": os.environ["LEASE_RUN_ID"],
+              "platform": "android",
+              "source_sha": os.environ["SOURCE_SHA"],
+              "state": "issued",
+          }
+          expected_keys = set(expected) | {"services"}
+          if set(value) != expected_keys:
+              raise SystemExit("Android safe lease record has an unsafe shape")
           for key, wanted in expected.items():
               if value.get(key) != wanted: raise SystemExit(f"lease field {key} is invalid")
-          if not re.fullmatch(r"srv-[A-Za-z0-9][A-Za-z0-9_-]{1,99}", str(value.get("service_id"))): raise SystemExit("lease service id is invalid")
+          services = value.get("services")
+          if not isinstance(services, list) or len(services) != 2:
+              raise SystemExit("Android lease service bundle is invalid")
+          expected_digests = {
+              "outline": os.environ["SERVER_IMAGE_DIGEST"],
+              "upload-sink": os.environ["SERVER_SINK_IMAGE_DIGEST"],
+          }
+          by_role = {}
+          for service in services:
+              if not isinstance(service, dict) or set(service) != {"role", "service_id", "image_digest", "provider_generation"}:
+                  raise SystemExit("Android lease service shape is invalid")
+              role = service["role"]
+              if role not in expected_digests or role in by_role:
+                  raise SystemExit("Android lease service roles are incomplete or duplicated")
+              by_role[role] = service
+              if not isinstance(service["service_id"], str) or not re.fullmatch(r"srv-[A-Za-z0-9][A-Za-z0-9_-]{1,99}", service["service_id"]):
+                  raise SystemExit("lease service id is invalid")
+              if not isinstance(service["image_digest"], str) or service["image_digest"] != expected_digests[role]:
+                  raise SystemExit("Android lease service image identity is invalid")
+              if not isinstance(service["provider_generation"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{1,99}", service["provider_generation"]):
+                  raise SystemExit("lease provider generation is invalid")
+          if set(by_role) != set(expected_digests):
+              raise SystemExit("Android lease service roles are incomplete or duplicated")
+          service_ids = [service["service_id"] for service in services]
+          if len(service_ids) != len(set(service_ids)):
+              raise SystemExit("Android lease service IDs must be distinct")
+          if any(token in json.dumps(value).lower() for token in ("url", "path", "password", "secret")):
+              raise SystemExit("Android safe lease record contains private handoff data")
           print("lease_record=validated")
           PY
-          timeout --foreground --signal=TERM --kill-after=10s 60s openssl cms -decrypt -binary -inform DER -in "$LEASE_RESPONSE_DIR/profile.cms" \
+          "$DEADLINE_COMMAND" 60 openssl cms -decrypt -binary -inform DER -in "$LEASE_RESPONSE_DIR/profile.cms" \
             -recip "$HANDOFF_DIR/recipient.crt" -inkey "$HANDOFF_DIR/recipient.key" -out "$HANDOFF_DIR/profile.toml"
           chmod 600 "$HANDOFF_DIR/profile.toml"
           test -s "$HANDOFF_DIR/profile.toml"
+          "$DEADLINE_COMMAND" 60 openssl cms -decrypt -binary -inform DER -in "$LEASE_RESPONSE_DIR/upload.cms" \
+            -recip "$HANDOFF_DIR/recipient.crt" -inkey "$HANDOFF_DIR/recipient.key" -out "$HANDOFF_DIR/upload-url.txt"
+          chmod 600 "$HANDOFF_DIR/upload-url.txt"
+          test -s "$HANDOFF_DIR/upload-url.txt"
+          python3 - "$HANDOFF_DIR/upload-url.txt" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          value = Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+          if not re.fullmatch(r"https://[A-Za-z0-9.-]{1,253}/upload/[0-9a-f]{32}", value):
+              raise SystemExit("encrypted upload URL is invalid")
+          print("upload_handoff=validated")
+          PY
 
       - name: Run canonical Android functional scenarios
         id: functional
@@ -561,11 +1142,13 @@ jobs:
         run: |
           set -euo pipefail
           remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 120))
-          # Eight applicable scenarios plus ten resets require 908 seconds;
+          # Eight applicable scenarios plus ten resets require 920 seconds;
           # keep a deliberate 60-second scheduling margin inside the 1,200s cap.
-          if [ "$remaining" -lt 968 ]; then printf 'insufficient Android canonical budget before cleanup reserve: seconds=%s required=968\n' "$remaining" >&2; exit 1; fi
+          if [ "$remaining" -lt 980 ]; then printf 'insufficient Android canonical budget before cleanup reserve: seconds=%s required=980\n' "$remaining" >&2; exit 1; fi
           if [ "$remaining" -gt 1200 ]; then remaining=1200; fi
           printf 'canonical_lane_timeout_seconds=%s\n' "$remaining"
+          upload_url="$(cat "$HANDOFF_DIR/upload-url.txt")"
+          test -n "$upload_url"
           python3 -m torturer_checks.hosted.deadline --timeout-seconds "$remaining" --kill-grace-seconds 30 \
             python3 -m torturer_checks.hosted.run --platform android \
             --profile "$HANDOFF_DIR/profile.toml" --source-repository "$SOURCE_REPOSITORY" --source-sha "$SOURCE_SHA" \
@@ -573,10 +1156,209 @@ jobs:
             --candidate-manifest "$GITHUB_WORKSPACE/candidate/manifest.json" --server-image-digest "$SERVER_IMAGE_DIGEST" --output "$RESULT_PATH" \
             --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" --identity-url "https://api.ipify.org" \
             --latency-url "https://proof.ovh.net/files/1Mb.dat" \
-            --download-url "https://proof.ovh.net/files/1Mb.dat" --upload-url "https://speed.cloudflare.com/__up" \
+            --download-url "https://proof.ovh.net/files/1Mb.dat" --upload-url "$upload_url" \
             --adb "$ADB_PATH" \
             --expected-unavailable functional.network-transition=ANDROID_UPLINK_TOGGLE_UNSUPPORTED \
             --expected-unavailable functional.bounded-endurance=ANDROID_ENDURANCE_SEAM_UNSUPPORTED
+
+      - name: Report safe Android command diagnostics
+        if: always()
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          diagnostic="$HANDOFF_DIR/android-command-diagnostic.txt"
+          transport_summary="$HANDOFF_DIR/android-transport-summary.txt"
+          : > "$diagnostic"
+          # Keep derived parsing bounded while retaining every raw command
+          # stream in the owner-only handoff directory.  Reserve the complete
+          # downstream emulator cleanup tail before starting this child.
+          "$DEADLINE_COMMAND" --reserve 70 10 python3 - "$HANDOFF_DIR/hosted-command-raw" "$diagnostic" "$transport_summary" <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          raw_dir = Path(sys.argv[1])
+          output = Path(sys.argv[2])
+          summary = Path(sys.argv[3])
+          files = sorted(raw_dir.glob("command-*.raw.log")) if raw_dir.is_dir() else []
+
+          def section(payload: bytes, name: str) -> bytes:
+              match = re.search(
+                  rb"(?ms)^" + name.encode("ascii") + rb"-begin\n(.*?)\n" +
+                  name.encode("ascii") + rb"-end\n",
+                  payload,
+              )
+              return match.group(1) if match else b""
+
+          def command_line(payload: bytes) -> str:
+              match = re.search(rb"^argv=(.*)$", payload, re.MULTILINE)
+              return match.group(1).decode("utf-8", errors="replace") if match else ""
+
+          def operation(argv: str) -> str:
+              lower = argv.lower()
+              if "run-as" in lower and "cat > files/" in lower:
+                  if ".profile" in lower:
+                      return "profile-stage"
+                  if ".command.json" in lower:
+                      return "command-stage"
+              if "run-as" in lower and "chmod" in lower:
+                  if ".profile" in lower:
+                      return "profile-chmod"
+                  if ".command.json" in lower:
+                      return "command-chmod"
+              if " am instrument " in f" {lower} ":
+                  return "instrumentation"
+              if " exec-out " in f" {lower} ":
+                  return "observation"
+              if " logcat " in f" {lower} ":
+                  return "logcat"
+              if " dumpsys " in f" {lower} ":
+                  return "dumpsys"
+              if " shell ps " in f" {lower} ":
+                  return "process-list"
+              if " shell pidof " in f" {lower} ":
+                  return "process-probe"
+              if " shell run-as " in f" {lower} " and " rm " in f" {lower} ":
+                  return "private-cleanup"
+              if " shell rm " in f" {lower} ":
+                  return "temporary-cleanup"
+              if " force-stop " in f" {lower} ":
+                  return "force-stop"
+              return "other"
+
+          def stderr_code(stderr: bytes) -> str:
+              lower = stderr.decode("utf-8", errors="replace").lower()
+              markers = (
+                  ("not debuggable", "NOT_DEBUGGABLE"),
+                  ("permission denied", "PERMISSION_DENIED"),
+                  ("access denied", "ACCESS_DENIED"),
+                  ("unknown package", "PACKAGE_UNKNOWN"),
+                  ("package not found", "PACKAGE_MISSING"),
+                  ("does not exist", "PATH_MISSING"),
+                  ("no such file", "PATH_MISSING"),
+                  ("cannot create", "CREATE_FAILED"),
+                  ("can't create", "CREATE_FAILED"),
+                  ("read-only file system", "READ_ONLY_FILESYSTEM"),
+                  ("closed", "CHANNEL_CLOSED"),
+                  ("broken pipe", "BROKEN_PIPE"),
+                  ("protocol fault", "PROTOCOL_FAULT"),
+              )
+              for marker, code in markers:
+                  if marker in lower:
+                      return code
+              return "NONEMPTY" if lower.strip() else "EMPTY"
+
+          def safe_stderr_display(stderr: bytes) -> str:
+              """Expose a bounded, secret-safe reason without replacing raw evidence."""
+              value = stderr.decode("utf-8", errors="replace").replace("\x00", " ")
+              value = re.sub(r"(?i)(?:[A-Za-z]:[\\/]|/)[^\r\n]*", "<path>", value)
+              value = re.sub(
+                  r"(?i)\b(?:token|key|secret|password|authorization)\b\s*[:=]\s*\S+",
+                  "<redacted>",
+                  value,
+              )
+              value = re.sub(r"(?i)\b[0-9a-f]{32,}\b", "<hex>", value)
+              value = " ".join(value.split())
+              return value[:240] if value else "<empty>"
+
+          def classify(argv: str, output: str, returncode: str, op: str) -> str:
+              lower = output.lower()
+              command_lower = argv.lower()
+              if "run-as" in command_lower and "not debuggable" in lower:
+                  return "RUN_AS_NOT_DEBUGGABLE"
+              if "run-as" in command_lower and any(
+                  marker in lower for marker in ("permission denied", "access denied", "denied")
+              ):
+                  return "RUN_AS_PERMISSION_DENIED"
+              if "run-as" in command_lower and any(
+                  marker in lower
+                  for marker in ("package not found", "unknown package", "does not exist")
+              ):
+                  return "RUN_AS_PACKAGE_MISSING"
+              if "run-as" in command_lower and "not found" in lower:
+                  return "RUN_AS_COMMAND_UNAVAILABLE"
+              if op in {"profile-stage", "command-stage"} and any(
+                  marker in lower for marker in ("broken pipe", "stdin", "standard input")
+              ):
+                  return "ADB_STDIN_FAILED"
+              if any(
+                  marker in lower
+                  for marker in ("device offline", "no devices", "device not found", "device unauthorized")
+              ):
+                  return "ADB_DEVICE_UNAVAILABLE"
+              if returncode == "0":
+                  return "OK"
+              if returncode != "unknown":
+                  return "COMMAND_FAILED"
+              return "RAW_FORMAT_INVALID"
+
+          output.write_text("schema=1\n", encoding="ascii")
+          records = []
+          with output.open("a", encoding="ascii") as stream:
+              for sequence, path in enumerate(files, start=1):
+                  payload = path.read_bytes()
+                  match = re.search(rb"^returncode=([^\n]*)$", payload, re.MULTILINE)
+                  returncode = match.group(1).decode("ascii", errors="replace") if match else "unknown"
+                  argv = command_line(payload)
+                  stdout = section(payload, "stdout")
+                  stderr = section(payload, "stderr")
+                  output = stdout + b"\n" + stderr
+                  op = operation(argv)
+                  code = classify(argv, output.decode("utf-8", errors="replace"), returncode, op)
+                  stderr_digest = hashlib.sha256(stderr).hexdigest()
+                  records.append((sequence, op, code, returncode, len(stdout)))
+                  stream.write(
+                      f"android_command_diagnostic sequence={sequence} operation={op} "
+                      f"code={code} returncode={returncode} stdout_bytes={len(stdout)} "
+                      f"stderr_bytes={len(stderr)} stderr_code={stderr_code(stderr)} "
+                      f"stderr_sha256={stderr_digest} "
+                      f"stderr_display={json.dumps(safe_stderr_display(stderr), ensure_ascii=True)} "
+                      f"raw_bytes={len(payload)}\n"
+                  )
+          logcat_records = [record for record in records if record[1] == "logcat"]
+          offline_records = [record for record in records if record[2] == "ADB_DEVICE_UNAVAILABLE"]
+          failed_logcat_records = [record for record in logcat_records if record[3] != "0"]
+          if offline_records:
+              transport_state = "ADB_DEVICE_OFFLINE"
+          elif failed_logcat_records:
+              transport_state = "ADB_LOGCAT_COMMAND_FAILED"
+          else:
+              transport_state = "ADB_TRANSPORT_NOT_FAILED"
+          summary.write_text(
+              "schema=1\n"
+              f"transport_state={transport_state}\n"
+              f"command_count={len(records)}\n"
+              f"logcat_command_count={len(logcat_records)}\n"
+              f"logcat_nonzero_count={len(failed_logcat_records)}\n"
+              f"logcat_stdout_bytes={sum(record[4] for record in logcat_records)}\n"
+              f"adb_device_unavailable_count={len(offline_records)}\n"
+              f"first_logcat_failure_sequence={failed_logcat_records[0][0] if failed_logcat_records else 'none'}\n"
+              f"first_device_unavailable_sequence={offline_records[0][0] if offline_records else 'none'}\n",
+              encoding="ascii",
+          )
+          PY
+          chmod 600 "$diagnostic"
+          chmod 600 "$transport_summary"
+          cat "$diagnostic"
+          cat "$transport_summary"
+
+      - name: Upload safe Android command diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        timeout-minutes: 1
+        with:
+          name: android-command-diagnostic-${{ env.LEASE_RUN_ID }}
+          path: |
+            ${{ env.HANDOFF_DIR }}/android-command-diagnostic.txt
+            ${{ env.HANDOFF_DIR }}/android-transport-summary.txt
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Stop Android emulator and verify cleanup
         if: always()
@@ -599,14 +1381,21 @@ jobs:
           }
           adb="${ADB_PATH:-${ANDROID_SDK_ROOT:-}/platform-tools/adb}"
           # Keep the complete cleanup phase inside the client’s 120-second
-          # finalization reserve.  Six adb operations are each capped at
+          # finalization reserve.  Seven adb operations are each capped at
           # 4s plus a 1s kill grace; host process-group proof is capped at
           # 15s TERM observation + 5s TERM grace + 5s KILL grace, and the
           # emulator log drain is capped at 5s.  The policy test proves this
-          # 60-second worst-case arithmetic, leaving time for artifact/key
+          # 65-second worst-case arithmetic, leaving time for artifact/key
           # finalization without relying on the outer job kill.
           adb_timeout_seconds=4
           adb_kill_grace_seconds=1
+          adb_transport_state=NOT_PROBED
+          adb_transport_probe_status=NOT_RUN
+          emulator_shutdown_request=NOT_ATTEMPTED
+          emulator_process_state=NOT_RECORDED
+          emulator_exit_status_state=MISSING
+          emulator_exit_status_value=NOT_CAPTURED
+          emulator_cleanup_failure=false
           adb_bounded() {
             timeout --foreground --signal=TERM --kill-after="${adb_kill_grace_seconds}s" "${adb_timeout_seconds}s" "$adb" "$@"
           }
@@ -620,57 +1409,367 @@ jobs:
             return "$cleanup_status"
           }
           if [ -x "$adb" ]; then
-            if ! adb_cleanup_evidence force-stop-app shell am force-stop com.dobby.vpn; then printf 'android_cleanup_force_stop_app=failed\n' >&2; fi
-            if ! adb_cleanup_evidence force-stop-test shell am force-stop com.dobby.vpn.test; then printf 'android_cleanup_force_stop_test=failed\n' >&2; fi
-            if adb_cleanup_evidence uninstall-test uninstall com.dobby.vpn.test; then printf 'android_test_package_removed=true\n'; else printf 'android_test_package_removal=not-installed-or-failed\n'; fi
-            if adb_cleanup_evidence uninstall-app uninstall com.dobby.vpn; then printf 'android_package_removed=true\n'; else printf 'android_package_removal=not-installed-or-failed\n'; fi
-            if adb_cleanup_evidence emulator-kill emu kill; then printf 'android_emulator_shutdown_requested=true\n'; else printf 'android_emulator_shutdown_request=failed-or-already-stopped\n'; fi
-            if ! adb_cleanup_evidence devices devices -l; then printf 'android_cleanup_devices_probe=failed\n' >&2; fi
+            if ! adb_cleanup_evidence force-stop-app shell am force-stop com.dobby.vpn; then
+              printf 'android_cleanup_force_stop_app=failed\n' >&2
+              emulator_cleanup_failure=true
+            fi
+            if ! adb_cleanup_evidence force-stop-test shell am force-stop com.dobby.vpn.test; then
+              printf 'android_cleanup_force_stop_test=failed\n' >&2
+              emulator_cleanup_failure=true
+            fi
+            uninstall_test_status=0
+            adb_cleanup_evidence uninstall-test uninstall com.dobby.vpn.test || uninstall_test_status=$?
+            if [ "$uninstall_test_status" -eq 0 ]; then
+              printf 'android_test_package_removed=true\n'
+            else
+              uninstall_test_output="$(<"$SERVICE_DIR/cleanup-uninstall-test.raw.log")"
+              case "$uninstall_test_output" in
+                *'Unknown package'*|*'unknown package'*|*'not installed'*)
+                  printf 'android_test_package_removal=not-installed\n'
+                  ;;
+                *)
+                  printf 'android_test_package_removal=failed status=%s\n' "$uninstall_test_status" >&2
+                  emulator_cleanup_failure=true
+                  ;;
+              esac
+            fi
+            uninstall_app_status=0
+            adb_cleanup_evidence uninstall-app uninstall com.dobby.vpn || uninstall_app_status=$?
+            if [ "$uninstall_app_status" -eq 0 ]; then
+              printf 'android_package_removed=true\n'
+            else
+              uninstall_app_output="$(<"$SERVICE_DIR/cleanup-uninstall-app.raw.log")"
+              case "$uninstall_app_output" in
+                *'Unknown package'*|*'unknown package'*|*'not installed'*)
+                  printf 'android_package_removal=not-installed\n'
+                  ;;
+                *)
+                  printf 'android_package_removal=failed status=%s\n' "$uninstall_app_status" >&2
+                  emulator_cleanup_failure=true
+                  ;;
+              esac
+            fi
+            transport_probe_log="$SERVICE_DIR/cleanup-transport-state.raw.log"
+            transport_probe_status=0
+            adb_bounded get-state > "$transport_probe_log" 2>&1 || transport_probe_status=$?
+            emit_private_evidence android-cleanup-transport-state "$transport_probe_log"
+            adb_transport_probe_status="$transport_probe_status"
+            if [ "$transport_probe_status" -eq 0 ]; then
+              transport_probe_value="$(tr -d '[:space:]' < "$transport_probe_log")"
+              case "$transport_probe_value" in
+                device) adb_transport_state=DEVICE_READY;;
+                offline) adb_transport_state=DEVICE_OFFLINE;;
+                unknown) adb_transport_state=DEVICE_UNKNOWN;;
+                *) adb_transport_state=STATE_UNEXPECTED;;
+              esac
+            else
+              adb_transport_state=COMMAND_FAILED
+              emulator_cleanup_failure=true
+            fi
+            if adb_cleanup_evidence emulator-kill emu kill; then
+              emulator_shutdown_request=REQUESTED
+              printf 'android_emulator_shutdown_requested=true\n'
+            else
+              emulator_shutdown_request=FAILED_OR_ALREADY_STOPPED
+              printf 'android_emulator_shutdown_request=failed-or-already-stopped\n'
+              emulator_cleanup_failure=true
+            fi
+            if ! adb_cleanup_evidence devices devices -l; then
+              printf 'android_cleanup_devices_probe=failed\n' >&2
+              emulator_cleanup_failure=true
+            fi
           else
+            adb_transport_state=ADB_UNAVAILABLE
             printf 'adb_missing_during_cleanup=true\n' >&2
+            emulator_cleanup_failure=true
           fi
           emulator_pid="${EMULATOR_PID:-}"
-          if [ -f "${HANDOFF_DIR:-}/emulator.pid" ]; then emulator_pid="$(cat "$HANDOFF_DIR/emulator.pid")"; fi
-          process_group_alive() {
-            kill -0 "$emulator_pid" || kill -0 -- "-$emulator_pid"
+          if [ -n "${HANDOFF_DIR:-}" ] && [ -f "$HANDOFF_DIR/emulator.pid" ]; then
+            emulator_pid="$(sed -n '1p' "$HANDOFF_DIR/emulator.pid")"
+          fi
+          emulator_identity_path=""
+          if [ -n "${EMULATOR_IDENTITY_FILE:-}" ]; then
+            emulator_identity_path="$EMULATOR_IDENTITY_FILE"
+          elif [ -n "${HANDOFF_DIR:-}" ]; then
+            emulator_identity_path="$HANDOFF_DIR/emulator.identity"
+          fi
+          identity_valid=false
+          expected_start_time=""
+          expected_pgrp=""
+          identity_pid=""
+          if [ -n "$emulator_identity_path" ] && [ -f "$emulator_identity_path" ]; then
+            emit_private_evidence android-emulator-identity "$emulator_identity_path"
+            identity_pid="$(sed -n 's/^pid=\([0-9][0-9]*\) .*$/\1/p' "$emulator_identity_path")"
+            expected_start_time="$(sed -n 's/.*start_time=\([0-9][0-9]*\).*/\1/p' "$emulator_identity_path")"
+            expected_pgrp="$(sed -n 's/.*process_group=\([0-9][0-9]*\).*/\1/p' "$emulator_identity_path")"
+            identity_state="$(sed -n 's/.*state=\([^ ]*\).*/\1/p' "$emulator_identity_path")"
+            if [ "$identity_pid" = "$emulator_pid" ] && \
+              [[ "$expected_start_time" =~ ^[1-9][0-9]*$ ]] && \
+              [[ "$expected_pgrp" =~ ^[1-9][0-9]*$ ]] && \
+              [ "$identity_state" != unavailable ]; then
+              identity_valid=true
+            else
+              printf 'android_emulator_identity=invalid pid=%s start_time=%s process_group=%s state=%s\n' \
+                "$identity_pid" "$expected_start_time" "$expected_pgrp" "$identity_state" >&2
+            fi
+          elif [ -n "$emulator_pid" ]; then
+            printf 'android_emulator_identity=missing pid=%s\n' "$emulator_pid" >&2
+          fi
+          read_emulator_identity() {
+            identity_pid_value="$1"
+            identity_stat="/proc/$identity_pid_value/stat"
+            [ -r "$identity_stat" ] || return 1
+            if ! identity_line="$(<"$identity_stat")"; then
+              return 1
+            fi
+            identity_rest="${identity_line#*) }"
+            if ! read -r identity_state_value identity_ppid_value identity_pgrp_value identity_session_value identity_tty_value identity_tpgid_value \
+              identity_flags_value identity_minflt_value identity_cminflt_value identity_majflt_value identity_cmajflt_value \
+              identity_utime_value identity_stime_value identity_cutime_value identity_cstime_value identity_priority_value identity_nice_value \
+              identity_threads_value identity_itrealvalue_value identity_starttime_value identity_extra_value <<< "$identity_rest"; then
+              return 1
+            fi
+            case "$identity_state_value:$identity_pgrp_value:$identity_starttime_value" in
+              [A-Za-z]:[1-9][0-9]*:[1-9][0-9]*)
+                printf 'pid=%s state=%s start_time=%s process_group=%s\n' \
+                  "$identity_pid_value" "$identity_state_value" "$identity_starttime_value" "$identity_pgrp_value"
+                ;;
+              *) return 1;;
+            esac
+          }
+          scan_process_group() {
+            process_group_scan_complete=true
+            process_group_has_member=false
+            process_group_has_running=false
+            for identity_stat_path in /proc/[0-9]*/stat; do
+              if [ ! -r "$identity_stat_path" ]; then
+                # A process may disappear between glob expansion and this
+                # probe.  That is not an unreadable record; an existing but
+                # unreadable record is an incomplete proof and must fail
+                # closed.
+                if [ -e "$identity_stat_path" ]; then
+                  process_group_scan_complete=false
+                fi
+                continue
+              fi
+              if ! identity_line="$(<"$identity_stat_path")"; then
+                if [ -e "$identity_stat_path" ]; then
+                  process_group_scan_complete=false
+                fi
+                continue
+              fi
+              identity_rest="${identity_line#*) }"
+              if ! read -r identity_state_value identity_ppid_value identity_pgrp_value identity_rest_value <<< "$identity_rest"; then
+                if [ -e "$identity_stat_path" ]; then
+                  process_group_scan_complete=false
+                fi
+                continue
+              fi
+              if ! [[ "$identity_state_value" =~ ^[A-Za-z]$ ]] || \
+                ! [[ "$identity_pgrp_value" =~ ^[1-9][0-9]*$ ]]; then
+                process_group_scan_complete=false
+                continue
+              fi
+              if [ "$identity_pgrp_value" = "$expected_pgrp" ]; then
+                process_group_has_member=true
+                case "$identity_state_value" in
+                  Z|X|x) ;;
+                  *) process_group_has_running=true;;
+                esac
+              fi
+            done
+          }
+          process_group_state() {
+            if [ "$identity_valid" != true ]; then
+              printf 'identity-missing\n'
+              return 0
+            fi
+            current_identity=""
+            if current_identity="$(read_emulator_identity "$emulator_pid")"; then
+              current_start_time="$(sed -n 's/.*start_time=\([0-9][0-9]*\).*/\1/p' <<< "$current_identity")"
+              current_pgrp="$(sed -n 's/.*process_group=\([0-9][0-9]*\).*/\1/p' <<< "$current_identity")"
+              current_state="$(sed -n 's/.*state=\([^ ]*\).*/\1/p' <<< "$current_identity")"
+              if [ "$current_start_time" != "$expected_start_time" ] || [ "$current_pgrp" != "$expected_pgrp" ]; then
+                printf 'identity-mismatch\n'
+                return 0
+              fi
+              scan_process_group
+              if [ "$process_group_scan_complete" != true ]; then
+                printf 'android_emulator_proc_scan=incomplete\n' >&2
+                printf 'scan-incomplete\n'
+              elif [ "$process_group_has_running" = true ]; then
+                printf 'alive\n'
+              elif [ "$process_group_has_member" = true ]; then
+                printf 'zombie-only\n'
+              else
+                printf 'gone\n'
+              fi
+              return 0
+            fi
+            scan_process_group
+            if [ "$process_group_scan_complete" != true ]; then
+              printf 'android_emulator_proc_scan=incomplete\n' >&2
+              printf 'scan-incomplete\n'
+            elif [ "$process_group_has_member" = true ]; then
+              printf 'identity-mismatch\n'
+            else
+              printf 'gone\n'
+            fi
           }
           case "$emulator_pid" in
             "") printf 'android_emulator_pid=not-recorded\n';;
-            0|*[!0-9]*) printf 'invalid emulator pid=%s\n' "$emulator_pid" >&2; exit 1;;
+            0|*[!0-9]*) printf 'invalid emulator pid=%s\n' "$emulator_pid" >&2; emulator_process_state=INVALID; emulator_cleanup_failure=true;;
             *)
               stopped=false
+              identity_abort=false
+              signal_failure=false
               for attempt in $(seq 1 15); do
-                if ! process_group_alive; then stopped=true; break; fi
-                printf 'android_emulator_cleanup_attempt=%s pid=%s\n' "$attempt" "$emulator_pid"
+                group_state="$(process_group_state)"
+                case "$group_state" in
+                  gone) stopped=true; emulator_process_state=STOPPED; break;;
+                  zombie-only) stopped=true; emulator_process_state=STOPPED_ZOMBIE; printf 'android_emulator_zombie_only=true\n'; break;;
+                  identity-missing|identity-mismatch|scan-incomplete)
+                    emulator_process_state=IDENTITY_MISMATCH
+                    emulator_cleanup_failure=true
+                    identity_abort=true
+                    printf 'android_emulator_cleanup=identity-mismatch state=%s\n' "$group_state" >&2
+                    break
+                    ;;
+                  alive)
+                    printf 'android_emulator_cleanup_attempt=%s pid=%s process_group=%s\n' "$attempt" "$emulator_pid" "$expected_pgrp"
+                    ;;
+                esac
                 sleep 1
               done
-              if [ "$stopped" != true ]; then
-                printf 'android_emulator_term_group=%s\n' "$emulator_pid"
-                kill -TERM -- "-$emulator_pid"
+              if [ "$identity_abort" != true ] && [ "$stopped" != true ]; then
+                printf 'android_emulator_term_group=%s\n' "$expected_pgrp"
+                if ! kill -TERM -- "-$expected_pgrp"; then
+                  signal_failure=true
+                  printf 'android_emulator_term_group=signal-failed\n' >&2
+                fi
                 for attempt in $(seq 1 5); do
-                  if ! process_group_alive; then stopped=true; break; fi
+                  group_state="$(process_group_state)"
+                  case "$group_state" in
+                    gone) stopped=true; emulator_process_state=STOPPED; signal_failure=false; break;;
+                    zombie-only) stopped=true; emulator_process_state=STOPPED_ZOMBIE; printf 'android_emulator_zombie_only=true\n'; break;;
+                    identity-missing|identity-mismatch|scan-incomplete)
+                      emulator_process_state=IDENTITY_MISMATCH
+                      emulator_cleanup_failure=true
+                      identity_abort=true
+                      printf 'android_emulator_cleanup=identity-mismatch state=%s\n' "$group_state" >&2
+                      break
+                      ;;
+                  esac
                   sleep 1
                 done
               fi
-              if [ "$stopped" != true ]; then
-                printf 'android_emulator_kill_group=%s\n' "$emulator_pid"
-                kill -KILL -- "-$emulator_pid"
+              if [ "$identity_abort" != true ] && [ "$stopped" != true ]; then
+                printf 'android_emulator_kill_group=%s\n' "$expected_pgrp"
+                if ! kill -KILL -- "-$expected_pgrp"; then
+                  signal_failure=true
+                  printf 'android_emulator_kill_group=signal-failed\n' >&2
+                fi
                 for attempt in $(seq 1 5); do
-                  if ! process_group_alive; then stopped=true; printf 'android_emulator_post_kill_verified=true\n'; break; fi
+                  group_state="$(process_group_state)"
+                  case "$group_state" in
+                    gone) stopped=true; emulator_process_state=STOPPED; signal_failure=false; printf 'android_emulator_post_kill_verified=true\n'; break;;
+                    zombie-only) stopped=true; emulator_process_state=STOPPED_ZOMBIE; printf 'android_emulator_post_kill_verified=true state=zombie-only\n'; break;;
+                    identity-missing|identity-mismatch|scan-incomplete)
+                      emulator_process_state=IDENTITY_MISMATCH
+                      emulator_cleanup_failure=true
+                      identity_abort=true
+                      printf 'android_emulator_cleanup=identity-mismatch state=%s\n' "$group_state" >&2
+                      break
+                      ;;
+                  esac
                   printf 'android_emulator_post_kill_check=%s\n' "$attempt"
                   sleep 1
                 done
               fi
-              test "$stopped" = true
-              if [ -f "${EMULATOR_LOG:-}" ]; then
-                emit_private_evidence android-emulator-log "$EMULATOR_LOG"
+              if [ "$stopped" != true ] && [ "$identity_abort" != true ]; then
+                emulator_process_state=SURVIVED
+                emulator_cleanup_failure=true
+              fi
+              if [ "$signal_failure" = true ]; then
+                printf 'android_emulator_cleanup=signal-failure-unproven\n' >&2
+                emulator_cleanup_failure=true
               fi
               ;;
           esac
+          if [ -n "${EMULATOR_LOG:-}" ] && [ -f "$EMULATOR_LOG" ]; then
+            emit_private_evidence android-emulator-log "$EMULATOR_LOG"
+            emulator_log_bytes="$(wc -c < "$EMULATOR_LOG" | tr -d '[:space:]')"
+            emulator_log_sha256="$(sha256sum "$EMULATOR_LOG" | awk '{print $1}')"
+          else
+            emulator_log_bytes=0
+            emulator_log_sha256=missing
+          fi
+          emulator_status_path=""
+          if [ -n "${EMULATOR_EXIT_STATUS_FILE:-}" ]; then
+            emulator_status_path="$EMULATOR_EXIT_STATUS_FILE"
+          elif [ -n "${HANDOFF_DIR:-}" ]; then
+            emulator_status_path="$HANDOFF_DIR/emulator-exit-status.raw.log"
+          fi
+          if [ -n "$emulator_status_path" ] && [ -f "$emulator_status_path" ]; then
+            emit_private_evidence android-emulator-exit-status "$emulator_status_path"
+            recorded_status="$(sed -n 's/^emulator_exit_status=\([0-9][0-9]*\)$/\1/p' "$emulator_status_path")"
+            if [ -n "$recorded_status" ]; then
+              emulator_exit_status_state=RECORDED
+              emulator_exit_status_value="$recorded_status"
+            else
+              emulator_exit_status_state=INVALID
+              emulator_exit_status_value=NOT_CAPTURED
+              emulator_cleanup_failure=true
+            fi
+          elif [ "$emulator_process_state" = STOPPED ]; then
+            emulator_exit_status_state=MISSING
+            emulator_exit_status_value=NOT_CAPTURED
+            emulator_cleanup_failure=true
+          else
+            emulator_exit_status_state=NOT_YET_RECORDED
+            emulator_exit_status_value=NOT_CAPTURED
+          fi
+          emulator_summary="$HANDOFF_DIR/android-emulator-exit-summary.txt"
+          {
+            printf 'schema=1\n'
+            printf 'transport_state=%s\n' "$adb_transport_state"
+            printf 'transport_probe_status=%s\n' "$adb_transport_probe_status"
+            printf 'emulator_shutdown_request=%s\n' "$emulator_shutdown_request"
+            printf 'emulator_process_state=%s\n' "$emulator_process_state"
+            printf 'emulator_exit_status_state=%s\n' "$emulator_exit_status_state"
+            printf 'emulator_exit_status=%s\n' "$emulator_exit_status_value"
+            printf 'emulator_log_bytes=%s\n' "${emulator_log_bytes:-0}"
+            printf 'emulator_log_sha256=%s\n' "${emulator_log_sha256:-missing}"
+          } > "$emulator_summary"
+          chmod 600 "$emulator_summary"
+          emit_private_evidence android-emulator-exit-summary "$emulator_summary"
+          cat "$emulator_summary"
+          if [ "$emulator_cleanup_failure" = true ]; then exit 1; fi
+
+      - name: Remove plaintext handoff material
+        if: always()
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/upload-url.txt" "$HANDOFF_DIR/recipient.key"
+
+      - name: Upload safe Android emulator and transport summary
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        timeout-minutes: 1
+        with:
+          name: android-emulator-summary-${{ env.LEASE_RUN_ID }}
+          path: |
+            ${{ env.HANDOFF_DIR }}/android-emulator-exit-summary.txt
+            ${{ env.HANDOFF_DIR }}/android-transport-summary.txt
+          if-no-files-found: warn
+          retention-days: 1
 
       - name: Upload safe Android functional result
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        timeout-minutes: 1
         with:
           name: functional-result-${{ env.LEASE_RUN_ID }}-android
           path: ${{ env.RESULT_PATH }}
@@ -690,18 +1789,12 @@ jobs:
       - name: Upload opaque Android completion marker
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        timeout-minutes: 1
         with:
           name: render-complete-${{ env.LEASE_RUN_ID }}-android
           path: ${{ env.HANDOFF_DIR }}/completion/completion.marker
           if-no-files-found: error
           retention-days: 1
-
-      - name: Remove plaintext handoff material
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/recipient.key"
 
   controller:
     name: Dispatch isolated Android Render lease controller
@@ -727,9 +1820,9 @@ jobs:
 
       - name: Validate controller inputs
         run: |
-         set -euo pipefail
+          set -euo pipefail
           [[ "$TORTURER_SHA" =~ ^[0-9a-f]{40}$ ]]
-         [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SERVER_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           printf 'controller_inputs=validated platform=%s\n' "$PLATFORM"
 
@@ -747,16 +1840,19 @@ jobs:
           mkdir -p "$RUNNER_TEMP/controller"
           "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" 30 controller-run "$RUNNER_TEMP/controller/controller-run.json" \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          python3 - "$RUNNER_TEMP/controller/controller-run.json" <<'PY'
+          controller_deadline_epoch="$(python3 - "$RUNNER_TEMP/controller/controller-run.json" <<'PY'
           import datetime, json, os, sys
           from pathlib import Path
           run = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           if run.get("id") != int(os.environ["GITHUB_RUN_ID"]): raise SystemExit("controller run identity mismatch")
           started = datetime.datetime.fromisoformat(run["run_started_at"].replace("Z", "+00:00"))
           deadline = int(started.timestamp()) + 30 * 60
-          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as env: env.write(f"CONTROLLER_DEADLINE_EPOCH={deadline}\n")
-          print(f"controller_deadline_epoch={deadline}")
+          print(deadline)
           PY
+          )"
+          export CONTROLLER_DEADLINE_EPOCH="$controller_deadline_epoch"
+          printf 'CONTROLLER_DEADLINE_EPOCH=%s\n' "$controller_deadline_epoch" >> "$GITHUB_ENV"
+          printf 'controller_deadline_epoch=%s\n' "$controller_deadline_epoch"
           found=false
           for attempt in $(seq 1 180); do
             remaining=$((CONTROLLER_DEADLINE_EPOCH - $(date +%s) - 120))

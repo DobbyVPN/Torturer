@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import threading
 import time
 from typing import Mapping
@@ -154,7 +155,7 @@ class AndroidHostedAdapter:
     """Run canonical scenarios through DobbyVPN Android instrumentation."""
 
     adapter_id = "hosted-android-app"
-    adapter_version = "v4"
+    adapter_version = "v5"
 
     def __init__(
         self,
@@ -249,14 +250,20 @@ class AndroidHostedAdapter:
         raise ScenarioExecutionError("ANDROID_BULK_SCENARIO_REQUIRED")
 
     def execute_scenario(self, scenario: ScenarioDefinition) -> Mapping[str, object]:
-        """Stage one opaque profile and ordered command, then parse safe facts."""
+        """Stage one opaque profile and ordered command, then parse safe facts.
+
+        Current Android emulator images do not consistently allow the app UID
+        selected by ``run-as`` to read ``/data/local/tmp``.  Stream both
+        payloads over the authenticated ``adb shell run-as`` stdin instead of
+        relying on a cross-domain temporary-file copy.  The payloads remain
+        input-only: the command vector and retained diagnostics never contain
+        profile bytes.
+        """
         if not self._ready:
             raise CapabilityUnavailable()
         if scenario.max_duration_seconds > _LANE_MAX_SECONDS:
             raise ScenarioExecutionError("SCENARIO_TIMEOUT_INVALID")
         command_file, profile_name, output_name = self._write_command(scenario)
-        staged_profile = f"/data/local/tmp/{profile_name}"
-        staged_command = f"/data/local/tmp/{command_file.name}"
         device_profile = f"files/{profile_name}"
         device_command = f"files/{command_file.name}"
         device_output = f"files/{output_name}"
@@ -265,31 +272,82 @@ class AndroidHostedAdapter:
             started, float(scenario.max_duration_seconds)
         )
         try:
-            self._adb(
-                ("push", str(self.profile), staged_profile),
-                _remaining(deadline, "ANDROID_PROFILE_STAGE_TIMEOUT"),
-                "ANDROID_PROFILE_STAGE_FAILED",
-            )
-            self._adb(
-                ("shell", "run-as", _PACKAGE_NAME, "cp", staged_profile, device_profile),
-                _remaining(deadline, "ANDROID_PROFILE_STAGE_TIMEOUT"),
-                "ANDROID_PROFILE_STAGE_FAILED",
-            )
+            stream_payloads = callable(getattr(self.runner, "run_with_input", None))
+            if stream_payloads:
+                try:
+                    profile_bytes = self.profile.read_bytes()
+                except OSError as error:
+                    raise ScenarioExecutionError("ANDROID_PROFILE_STAGE_FAILED") from error
+                self._adb(
+                    (
+                        "shell",
+                        "-T",
+                        "run-as",
+                        _PACKAGE_NAME,
+                        "sh",
+                        "-c",
+                        # ``adb shell`` joins its argument vector before it
+                        # sends it to the device shell.  Quote the complete
+                        # ``sh -c`` payload so the remote shell passes the
+                        # command as one argument; without this, ``sh -c``
+                        # receives only ``mkdir`` and toybox reports
+                        # ``mkdir: Needs 1 argument``.
+                        shlex.quote(f"mkdir -p files && cat > {device_profile}"),
+                    ),
+                    _remaining(deadline, "ANDROID_PROFILE_STAGE_TIMEOUT"),
+                    "ANDROID_PROFILE_STAGE_FAILED",
+                    input_bytes=profile_bytes,
+                )
+                del profile_bytes
+            else:
+                staged_profile = f"/data/local/tmp/{profile_name}"
+                self._adb(
+                    ("push", str(self.profile), staged_profile),
+                    _remaining(deadline, "ANDROID_PROFILE_STAGE_TIMEOUT"),
+                    "ANDROID_PROFILE_STAGE_FAILED",
+                )
+                self._adb(
+                    ("shell", "run-as", _PACKAGE_NAME, "cp", staged_profile, device_profile),
+                    _remaining(deadline, "ANDROID_PROFILE_STAGE_TIMEOUT"),
+                    "ANDROID_PROFILE_STAGE_FAILED",
+                )
             self._adb(
                 ("shell", "run-as", _PACKAGE_NAME, "chmod", "600", device_profile),
                 _remaining(deadline, "ANDROID_PROFILE_STAGE_TIMEOUT"),
                 "ANDROID_PROFILE_STAGE_FAILED",
             )
-            self._adb(
-                ("push", str(command_file), staged_command),
-                _remaining(deadline, "ANDROID_COMMAND_STAGE_TIMEOUT"),
-                "ANDROID_COMMAND_STAGE_FAILED",
-            )
-            self._adb(
-                ("shell", "run-as", _PACKAGE_NAME, "cp", staged_command, device_command),
-                _remaining(deadline, "ANDROID_COMMAND_STAGE_TIMEOUT"),
-                "ANDROID_COMMAND_STAGE_FAILED",
-            )
+            if stream_payloads:
+                try:
+                    command_bytes = command_file.read_bytes()
+                except OSError as error:
+                    raise ScenarioExecutionError("ANDROID_COMMAND_STAGE_FAILED") from error
+                self._adb(
+                    (
+                        "shell",
+                        "-T",
+                        "run-as",
+                        _PACKAGE_NAME,
+                        "sh",
+                        "-c",
+                        shlex.quote(f"mkdir -p files && cat > {device_command}"),
+                    ),
+                    _remaining(deadline, "ANDROID_COMMAND_STAGE_TIMEOUT"),
+                    "ANDROID_COMMAND_STAGE_FAILED",
+                    input_bytes=command_bytes,
+                )
+                del command_bytes
+            else:
+                staged_command = f"/data/local/tmp/{command_file.name}"
+                self._adb(
+                    ("push", str(command_file), staged_command),
+                    _remaining(deadline, "ANDROID_COMMAND_STAGE_TIMEOUT"),
+                    "ANDROID_COMMAND_STAGE_FAILED",
+                )
+                self._adb(
+                    ("shell", "run-as", _PACKAGE_NAME, "cp", staged_command, device_command),
+                    _remaining(deadline, "ANDROID_COMMAND_STAGE_TIMEOUT"),
+                    "ANDROID_COMMAND_STAGE_FAILED",
+                )
             self._adb(
                 ("shell", "run-as", _PACKAGE_NAME, "chmod", "600", device_command),
                 _remaining(deadline, "ANDROID_COMMAND_STAGE_TIMEOUT"),
@@ -314,6 +372,12 @@ class AndroidHostedAdapter:
                 raise ScenarioExecutionError("ANDROID_OBSERVATION_INVALID") from error
             if instrument.returncode != 0 or instrument.timed_out:
                 raise ScenarioExecutionError("ANDROID_INSTRUMENTATION_FAILED")
+            if observation.error_code is not None:
+                # The observation contract has already validated this as a
+                # bounded, non-sensitive stable code. Preserve it so a hosted
+                # failure identifies the product seam that failed instead of
+                # collapsing every product error to one generic adapter code.
+                raise ScenarioExecutionError(observation.error_code)
             try:
                 return observation.to_observations()
             except AndroidObservationError as error:
@@ -668,35 +732,113 @@ class AndroidHostedAdapter:
         failure_code: str,
         *,
         allow_nonzero: bool = False,
+        allow_partial_timeout: bool = False,
+        input_bytes: bytes | None = None,
     ) -> CommandResult:
         if self.adb is None:
             raise ScenarioExecutionError("ANDROID_ADB_UNAVAILABLE")
         try:
-            result = self.runner.run(
-                (str(self.adb), *arguments), timeout_seconds=timeout_seconds
-            )
+            command = (str(self.adb), *arguments)
+            if input_bytes is not None:
+                run_with_input = getattr(self.runner, "run_with_input", None)
+                if callable(run_with_input):
+                    result = run_with_input(
+                        command,
+                        timeout_seconds=timeout_seconds,
+                        input_bytes=input_bytes,
+                    )
+                else:
+                    # Small synthetic runners used by contract tests need not
+                    # model stdin; they still exercise the same command
+                    # vector and result handling.
+                    result = self.runner.run(
+                        command, timeout_seconds=timeout_seconds
+                    )
+            else:
+                result = self.runner.run(command, timeout_seconds=timeout_seconds)
         except HostedAdapterError as error:
+            # SubprocessRunner retains a complete raw record before raising
+            # COMMAND_TIMEOUT or COMMAND_DEADLINE_EXCEEDED. For the
+            # deliberately best-effort logcat diagnostic, recover that
+            # retained stream as a normal timed-out result so
+            # _capture_diagnostics can accept it when bytes were actually
+            # captured. This keeps the original bytes intact while avoiding
+            # a false finalization failure merely because Android's log
+            # buffer is larger than the short reserve.
+            if allow_partial_timeout and error.code in {
+                "COMMAND_TIMEOUT",
+                "COMMAND_DEADLINE_EXCEEDED",
+                "ADB_DEVICE_UNAVAILABLE",
+            }:
+                return self._partial_timeout_result(command)
             raise ScenarioExecutionError(error.code) from error
-        if result.timed_out:
+        if result.timed_out and not allow_partial_timeout:
             raise ScenarioExecutionError("ANDROID_COMMAND_TIMEOUT")
         if result.returncode != 0 and not allow_nonzero:
             raise ScenarioExecutionError(failure_code)
         return result
 
+    def _partial_timeout_result(self, command: tuple[str, ...]) -> CommandResult:
+        """Rehydrate a timed-out command from the runner's retained raw file."""
+
+        raw_directory = getattr(self.runner, "raw_directory", None)
+        if not isinstance(raw_directory, Path):
+            return CommandResult(command, 124, timed_out=True)
+        try:
+            candidates = list(raw_directory.glob("command-*.raw.log"))
+            if not candidates:
+                return CommandResult(command, 124, timed_out=True)
+            raw_path = max(candidates, key=lambda path: path.stat().st_mtime_ns)
+            payload = raw_path.read_bytes()
+        except OSError:
+            return CommandResult(command, 124, timed_out=True)
+
+        def section(name: str) -> bytes:
+            match = re.search(
+                rb"(?ms)^" + name.encode("ascii") + rb"-begin\n(.*?)\n"
+                + name.encode("ascii") + rb"-end\n",
+                payload,
+            )
+            return match.group(1) if match else b""
+
+        return CommandResult(
+            command,
+            124,
+            stdout=section("stdout"),
+            stderr=section("stderr"),
+            timed_out=True,
+        )
+
     def _capture_diagnostics(self, deadline: float) -> ScenarioExecutionError | None:
         error: ScenarioExecutionError | None = None
+        # Drain bounded structural diagnostics first.  A large Android log
+        # buffer may consume the remaining slice and is intentionally last;
+        # its partial bytes are still retained and accepted below.
         for command in (
-            ("logcat", "-d", "-b", "all"),
             ("shell", "dumpsys", "connectivity"),
             ("shell", "dumpsys", "package", _PACKAGE_NAME),
             ("shell", "ps", "-A"),
+            ("logcat", "-d", "-b", "all"),
         ):
             try:
-                self._adb(
+                result = self._adb(
                     command,
                     _finalization_timeout(deadline, "ANDROID_DIAGNOSTICS_TIMEOUT"),
                     "ANDROID_DIAGNOSTICS_FAILED",
+                    allow_nonzero=command[0] == "logcat",
+                    allow_partial_timeout=command[0] == "logcat",
                 )
+                # A full-buffer logcat dump can exceed the short per-scenario
+                # finalization slice.  The runner has already retained every
+                # byte received before the bounded timeout; accept that
+                # partial diagnostic only when it contains output, while
+                # preserving a failure for an empty or non-timeout command.
+                if command[0] == "logcat" and result.timed_out:
+                    if result.stdout:
+                        continue
+                    error = error or ScenarioExecutionError("ANDROID_DIAGNOSTICS_FAILED")
+                elif command[0] == "logcat" and result.returncode != 0:
+                    error = error or ScenarioExecutionError("ANDROID_DIAGNOSTICS_FAILED")
             except ScenarioExecutionError as failure:
                 error = error or failure
         return error

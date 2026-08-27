@@ -98,10 +98,15 @@ SCENARIO_CATALOG: tuple[ScenarioDefinition, ...] = (
     ScenarioDefinition(
         id="functional.configure",
         version=1,
-        steps=(_step("configure", "configure"),),
+        # A freshly installed Android instrumentation process can spend a
+        # few seconds in class loading and service startup before the actual
+        # configure operation begins. Keep that cold-start budget bounded,
+        # while leaving the short scenario materially tighter than the
+        # multi-step connection scenarios.
+        steps=(_step("configure", "configure", 20),),
         required_capabilities=frozenset({Capability.CONFIGURE}),
         assertion_ids=("configure.accepted",),
-        max_duration_seconds=8,
+        max_duration_seconds=20,
     ),
     ScenarioDefinition(
         id="functional.connect-route-identity",

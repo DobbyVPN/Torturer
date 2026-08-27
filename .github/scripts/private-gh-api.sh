@@ -49,9 +49,21 @@ for raw_path in sys.argv[1:]:
     descriptor = os.open(raw_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
         details = os.fstat(descriptor)
-        if not stat.S_ISREG(details.st_mode) or stat.S_IMODE(details.st_mode) != 0o600:
-            raise SystemExit("private-gh-api evidence inode is unsafe")
-        os.fsync(descriptor)
+        # Git Bash maps NTFS ACLs to synthetic POSIX mode bits, so a file
+        # created under ``umask 077`` can still report 0666 through fstat.
+        # The runner's private temp directory and inherited Windows ACL are
+        # the confidentiality boundary there; keep the strict mode check on
+        # POSIX while still requiring a regular file on every platform.
+        if not stat.S_ISREG(details.st_mode) or (
+            os.name != "nt" and stat.S_IMODE(details.st_mode) != 0o600
+        ):
+            raise SystemExit("private-gh-api evidence file is unsafe")
+        # Windows' FlushFileBuffers rejects a read-only CRT descriptor with
+        # EBADF; the producer already closed the redirected file before this
+        # verification opens it, so the read-only check does not need a flush
+        # on that platform.  POSIX keeps the explicit durability barrier.
+        if os.name != "nt":
+            os.fsync(descriptor)
     finally:
         os.close(descriptor)
 PY
@@ -62,4 +74,47 @@ stderr_sha256=$(sha256sum "$error_path" | awk '{print $1}')
 evidence_id=$(python3 -c 'import secrets; print("e" + secrets.token_hex(16)[:31])')
 printf 'github_api_evidence kind=%s status=%s id=%s stdout_bytes=%s stdout_sha256=%s stderr_bytes=%s stderr_sha256=%s\n' \
   "$label" "$status" "$evidence_id" "$stdout_bytes" "$stdout_sha256" "$stderr_bytes" "$stderr_sha256"
+if ((status != 0)); then
+  # Keep the complete stderr bytes in the owner-only file above, but publish a
+  # small safe classification so a failed API call is diagnosable from the
+  # hosted job log without exposing credentials, URLs, or private paths.
+  python3 - "$error_path" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+payload = Path(sys.argv[1]).read_bytes()
+reasons = []
+for raw_line in payload.decode("utf-8", "replace").splitlines():
+    safe_line = re.sub(r"https?://[^\s]+", "<url>", raw_line)
+    safe_line = re.sub(
+        r"(?i)\b(?:token|key|secret|password|authorization)\b\s*[:=]\s*\S+",
+        "<redacted>",
+        safe_line,
+    )
+    safe_line = re.sub(r"(?:[A-Za-z]:)?[\\/][^\s,;)]*", "<path>", safe_line)
+    safe_line = re.sub(r"(?i)\b[0-9a-f]{32,}\b", "<hex>", safe_line)
+    safe_line = re.sub(r"\s+", " ", safe_line).strip()
+    if re.search(
+        r"(?i)\b(?:gh:|http|error|failed|forbidden|unauthor|permission|rate limit|not found|bad gateway|timed out|timeout|connection|api)\b",
+        safe_line,
+    ):
+        reasons.append(safe_line[:240])
+if not reasons:
+    for raw_line in payload.decode("utf-8", "replace").splitlines():
+        safe_line = re.sub(r"https?://[^\s]+", "<url>", raw_line)
+        safe_line = re.sub(
+            r"(?i)\b(?:token|key|secret|password|authorization)\b\s*[:=]\s*\S+",
+            "<redacted>",
+            safe_line,
+        )
+        safe_line = re.sub(r"(?:[A-Za-z]:)?[\\/][^\s,;)]*", "<path>", safe_line)
+        safe_line = re.sub(r"(?i)\b[0-9a-f]{32,}\b", "<hex>", safe_line)
+        safe_line = re.sub(r"\s+", " ", safe_line).strip()
+        if safe_line:
+            reasons.append(safe_line[:240])
+            break
+print("github_api_error_reason=" + (" | ".join(reasons[:4]) if reasons else "unclassified"))
+PY
+fi
 exit "$status"

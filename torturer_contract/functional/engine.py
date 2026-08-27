@@ -40,16 +40,14 @@ class BulkScenarioAdapter(Protocol):
     def execute_scenario(self, scenario: ScenarioDefinition) -> Mapping[str, object]: ...
 
 
-def _unavailable_reason(adapter: ScenarioAdapter, missing: frozenset[Capability]) -> str:
-    """Return an adapter-owned reason for a proved hosted capability gap.
+EvidenceProvider = Callable[[], Sequence[EvidenceReference]]
 
-    The canonical engine still owns the unavailable outcome.  Adapters may
-    explain why a platform cannot perform one of the shared operations, but
-    they cannot turn that gap into a pass or remove the scenario from the
-    selected catalog.
-    """
 
-    reasons = getattr(adapter, "capability_unavailable_reasons", {})
+def capability_unavailable_reason(
+    missing: frozenset[Capability], reasons: object,
+) -> str:
+    """Return one stable adapter-owned reason for missing capabilities."""
+
     if isinstance(reasons, Mapping):
         for capability in sorted(missing, key=lambda value: value.value):
             reason = reasons.get(capability)
@@ -58,7 +56,13 @@ def _unavailable_reason(adapter: ScenarioAdapter, missing: frozenset[Capability]
     return "CAPABILITY_UNAVAILABLE"
 
 
-EvidenceProvider = Callable[[], Sequence[EvidenceReference]]
+def unavailable_reason(adapter: ScenarioAdapter, missing: frozenset[Capability]) -> str:
+    """Resolve an optional adapter explanation without changing the outcome."""
+
+    return capability_unavailable_reason(
+        missing,
+        getattr(adapter, "capability_unavailable_reasons", {}),
+    )
 
 
 @dataclass(frozen=True)
@@ -85,7 +89,7 @@ class FunctionalEngine:
                 scenario,
                 provenance,
                 outcome="unavailable",
-                reason_code=_unavailable_reason(adapter, missing),
+                reason_code=unavailable_reason(adapter, missing),
                 assertions=(),
                 cleanup={"required": False, "verified": True},
                 metrics={},
@@ -131,8 +135,9 @@ class FunctionalEngine:
                 scenario,
                 provenance,
                 outcome="unavailable",
-                reason_code=_unavailable_reason(
-                    adapter, scenario.required_capabilities - adapter.capabilities
+                reason_code=unavailable_reason(
+                    adapter,
+                    scenario.required_capabilities - adapter.capabilities,
                 ),
                 assertions=(),
                 cleanup={"required": False, "verified": True},
@@ -159,7 +164,10 @@ class FunctionalEngine:
         ended_ns = time.monotonic_ns()
         cleanup_required = "cleanup.restored" in scenario.assertion_ids
         cleanup_verified = observations.get("cleanup_verified") is True
-        metrics = self._metrics(observations)
+        metrics = self._metrics(
+            observations,
+            retain_zero="traffic.metrics_positive" in scenario.assertion_ids,
+        )
         if not all(assertion.passed for assertion in assertions):
             outcome = "failed"
             reason_code = "ASSERTION_FAILED"
@@ -206,7 +214,10 @@ class FunctionalEngine:
                 "required": "cleanup.restored" in scenario.assertion_ids,
                 "verified": observations.get("cleanup_verified") is True,
             },
-            metrics=self._metrics(observations),
+            metrics=self._metrics(
+                observations,
+                retain_zero="traffic.metrics_positive" in scenario.assertion_ids,
+            ),
             started_ns=started_ns,
             ended_ns=ended_ns,
             phase_durations_ms={
@@ -284,10 +295,20 @@ class FunctionalEngine:
         )
 
     @staticmethod
-    def _metrics(observations: Mapping[str, object]) -> dict[str, float | int]:
+    def _metrics(
+        observations: Mapping[str, object], *, retain_zero: bool
+    ) -> dict[str, float | int]:
         result: dict[str, float | int] = {}
         for key in ("latency_ms", "download_mbps", "upload_mbps"):
             value = observations.get(key)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
-                result[key] = value
+                # Non-throughput scenarios may receive zero-valued default
+                # telemetry from an adapter that did not measure traffic.
+                # Keep every supplied numeric value for throughput scenarios,
+                # including zero/invalid values, so failed results retain the
+                # diagnostic that caused the assertion to fail.  Invalid
+                # non-throughput values are likewise retained and fail closed
+                # in ScenarioResult validation rather than being hidden.
+                if retain_zero or value != 0:
+                    result[key] = value
         return result

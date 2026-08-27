@@ -5,6 +5,7 @@ meaning and assertions remain in :mod:`torturer_contract.functional`.
 """
 
 from .lease_request import LeaseRequestError, RenderLeaseRequest
+from .lease import RenderLeaseBundle
 from .render import (
     HTTPResponse,
     RenderAPI,
@@ -27,4 +28,5 @@ __all__ = [
     "RenderServiceSpec",
     "LeaseRequestError",
     "RenderLeaseRequest",
+    "RenderLeaseBundle",
 ]

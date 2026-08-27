@@ -1,9 +1,11 @@
 # Disposable profile handoff boundary
 
-The functional workflows use a short-lived encrypted transport artifact to
+The functional workflows use short-lived encrypted transport artifacts to
 move one disposable VPN profile from the trusted Render lease job to the
-trusted client job. This artifact is not a functional result, is not evidence,
-and must never be consumed by the canonical result contract.
+trusted client job. Every hosted platform additionally receives `upload.cms`,
+an encrypted handoff for its per-run upload-sink URL; it is not a functional
+result, is not evidence, and neither handoff is consumed by the canonical
+result contract.
 
 The allowed boundary is:
 
@@ -17,7 +19,10 @@ The allowed boundary is:
   and an opaque request cross into the lease workflow.
 - The lease job encrypts the profile with that certificate using CMS
   AES-256-GCM. The only profile-derived artifact permitted to cross the hosted
-  artifact boundary is the ciphertext, retained for one day. The request must
+  artifact boundary is the ciphertext, retained for one day. The separately
+  generated sink URL crosses on every hosted platform only as the equally
+  short-lived `upload.cms` ciphertext; its plaintext and random path never
+  enter the safe lease record. The request must
   carry the full, lowercase, non-zero 40-character DobbyVPN `source_sha`; the
   provider rejects omission, short/invalid/all-zero values, or a mismatch
   before any ciphertext is decrypted. The lease/artifact correlation ID is a

@@ -8,7 +8,38 @@ import re
 from typing import Mapping
 
 
-_ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_ERROR_CODES = frozenset({
+    "CLEANUP_FAILED",
+    "CLEANUP_INSPECTION_FAILED",
+    "CONFIGURE_REJECTED",
+    "CONNECT_FAILED",
+    "CONNECT_REJECTED",
+    "CONSENT_REJECTED",
+    "CONSENT_UNAVAILABLE",
+    "CONTROL_CLEANUP_FAILED",
+    "CONTROL_INPUT_INVALID",
+    "CONTROL_UNAVAILABLE",
+    "DISCONNECT_FAILED",
+    "DRIVER_ERROR",
+    "ENDURANCE_METRICS_INVALID",
+    "IDENTITY_BASELINE_MISSING",
+    "INPUT_INVALID",
+    "NETWORK_BODY_INVALID",
+    "NETWORK_STATUS",
+    "NETWORK_TRANSITION_UNVERIFIED",
+    "NETWORK_UNAVAILABLE",
+    "OPERATION_TIMEOUT",
+    "PROCESS_LOSS_RECOVERY_IDENTITY_UNVERIFIED",
+    "PROCESS_LOSS_RECOVERY_TUNNEL_UNVERIFIED",
+    "PROCESS_LOSS_UNVERIFIED",
+    "PROFILE_UNAVAILABLE",
+    "RECONNECT_PRECONDITION",
+    "ROUTING_IDENTITY_NOT_OBSERVED",
+    "SLEEP_WAKE_UNVERIFIED",
+    "STABILITY_UNVERIFIED",
+    "THROUGHPUT_TIMEOUT",
+    "TUNNEL_NOT_OBSERVED",
+})
 
 
 class AndroidObservationError(ValueError):
@@ -61,7 +92,7 @@ class AndroidProfileObservation:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise AndroidObservationError(f"{name} must be finite and non-negative")
-        if self.error_code is not None and _ERROR_CODE.fullmatch(self.error_code) is None:
+        if self.error_code is not None and self.error_code not in _ERROR_CODES:
             raise AndroidObservationError("error_code is invalid")
 
     @classmethod
