@@ -171,6 +171,7 @@ class FunctionalMacOSWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("SERVICE_CONTROL_SOCKET=%s", self.text)
         self.assertIn("emit_private_evidence", self.text)
         self.assertGreaterEqual(self.text.count("umask 077"), 4)
+        self.assertIn('chmod 700 "$handoff" "$service" "$diagnostics"', self.text)
         self.assertNotIn('cat "$service_log"', self.text)
         self.assertNotIn('cat "$service_err"', self.text)
         self.assertNotIn('| tee "$SERVICE_DIR/preflight-control-status.raw.log"', self.text)

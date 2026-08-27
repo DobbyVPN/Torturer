@@ -53,6 +53,10 @@ class AndroidObservationContractTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(AndroidObservationError, "reports an error"):
             observation.to_observations()
+        value = _valid()
+        value["error_code"] = "UNREVIEWED_CODE"
+        with self.assertRaisesRegex(AndroidObservationError, "error_code"):
+            AndroidProfileObservation.from_mapping(value, expected_source_sha="a" * 40)
 
     def test_rejects_profile_or_literal_identity_fields(self) -> None:
         value = _valid()

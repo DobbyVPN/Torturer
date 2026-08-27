@@ -127,10 +127,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
           handoff="$RUNNER_TEMP/dobbyvpn-render-handoff"
           service="$RUNNER_TEMP/dobbyvpn-service"
           diagnostics="$RUNNER_TEMP/dobbyvpn-diagnostics"
           mkdir -p "$handoff" "$service" "$diagnostics"
+          chmod 700 "$handoff" "$service" "$diagnostics"
           printf 'HANDOFF_DIR=%s\nSERVICE_DIR=%s\nDIAGNOSTIC_DIR=%s\nRESULT_PATH=%s\nLEASE_RUN_ID=unassigned\n' \
             "$handoff" "$service" "$diagnostics" "$handoff/functional-result.json" >> "$GITHUB_ENV"
 

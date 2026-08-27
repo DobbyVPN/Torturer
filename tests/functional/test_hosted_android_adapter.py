@@ -235,7 +235,23 @@ class HostedAndroidAdapterTests(unittest.TestCase):
             _provenance(self.adapter),
         )
         self.assertEqual(result.outcome, "failed")
-        self.assertEqual(result.reason_code, "ANDROID_OBSERVATION_ERROR")
+        self.assertEqual(result.reason_code, "DRIVER_ERROR")
+        self.assertTrue(
+            any(
+                "am" in call and "force-stop" in call
+                for call in self.runner.calls
+            )
+        )
+
+    def test_invalid_product_error_code_fails_closed_and_still_cleans_up(self) -> None:
+        self.runner.observation = _observation("UNREVIEWED_CODE")
+        result = FunctionalEngine("e" * 64).run(
+            get_scenario("functional.core-connection"),
+            self.adapter,
+            _provenance(self.adapter),
+        )
+        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(result.reason_code, "ANDROID_OBSERVATION_INVALID")
         self.assertTrue(
             any(
                 "am" in call and "force-stop" in call

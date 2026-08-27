@@ -372,6 +372,12 @@ class AndroidHostedAdapter:
                 raise ScenarioExecutionError("ANDROID_OBSERVATION_INVALID") from error
             if instrument.returncode != 0 or instrument.timed_out:
                 raise ScenarioExecutionError("ANDROID_INSTRUMENTATION_FAILED")
+            if observation.error_code is not None:
+                # The observation contract has already validated this as a
+                # bounded, non-sensitive stable code. Preserve it so a hosted
+                # failure identifies the product seam that failed instead of
+                # collapsing every product error to one generic adapter code.
+                raise ScenarioExecutionError(observation.error_code)
             try:
                 return observation.to_observations()
             except AndroidObservationError as error:
