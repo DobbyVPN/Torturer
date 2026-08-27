@@ -73,7 +73,7 @@ func TestLoadConfigReadsOwnerOnlyPathFile(t *testing.T) {
 	}
 }
 
-func TestLoadUploadPathFileRejectsSymlink(t *testing.T) {
+func TestLoadUploadPathFileAcceptsProviderManagedSymlinkToRegularFile(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "target")
 	path := filepath.Join(root, "upload-path")
@@ -83,8 +83,23 @@ func TestLoadUploadPathFileRejectsSymlink(t *testing.T) {
 	if err := os.Symlink(target, path); err != nil {
 		t.Fatal(err)
 	}
+	value, err := loadUploadPathFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value != testUploadPath {
+		t.Fatalf("upload path = %q, want %q", value, testUploadPath)
+	}
+}
+
+func TestLoadUploadPathFileRejectsSymlinkToNonRegularFile(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "upload-path")
+	if err := os.Symlink(root, path); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := loadUploadPathFile(path); err == nil {
-		t.Fatal("loadUploadPathFile unexpectedly followed a symlink")
+		t.Fatal("loadUploadPathFile unexpectedly accepted a directory target")
 	}
 }
 

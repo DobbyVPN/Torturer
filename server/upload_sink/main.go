@@ -83,16 +83,16 @@ func loadUploadPath(args []string) (string, error) {
 }
 
 func loadUploadPathFile(path string) (string, error) {
-	// Open without following a final symlink, then inspect the opened
-	// descriptor.  Keeping the validation on this descriptor avoids a
-	// time-of-check/time-of-use replacement between Lstat and Open.
-	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	// Render may expose a runtime secret through a provider-managed symlink.
+	// Open the fixed path, then validate and read only the opened descriptor;
+	// this permits that mount representation without a post-open path race.
+	file, err := os.Open(path)
 	if err != nil {
 		return "", errInvalidUploadPath
 	}
 	defer file.Close()
 	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > 256 {
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 256 {
 		return "", errInvalidUploadPath
 	}
 	contents, err := io.ReadAll(io.LimitReader(file, 257))

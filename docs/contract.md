@@ -403,10 +403,10 @@ protected workflow environment. Both immutable images carry their required
 secret-file argument as a default image `CMD`: Outline reads
 `/etc/secrets/config.yml`, and the upload sink reads
 `/etc/secrets/upload-path`. The trusted request deliberately sends no Render
-Docker-command override. Live provider qualification proved that Render can
-store that override for a prebuilt image while still starting the image with
-an empty argument list. Secret files are never baked into an image or emitted
-in a result.
+Docker-command override. The non-root sink permits Render's provider-managed
+secret path to be a symlink, then validates the opened descriptor as a bounded
+regular file before reading it. Secret files are never baked into an image or
+emitted in a result.
 
 The four manual functional workflows target Linux, Windows, macOS, and Android.
 Each uses a secretless source-build job, a trusted client job with read-only

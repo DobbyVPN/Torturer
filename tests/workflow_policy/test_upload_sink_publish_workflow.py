@@ -131,7 +131,8 @@ class UploadSinkPublishWorkflowPolicyTest(unittest.TestCase):
         self.assertIn('UploadPathFilePath = "/etc/secrets/upload-path"', main)
         self.assertIn('strings.HasPrefix(args[0], "--path-file=")', main)
         self.assertIn("loadUploadPathFile", main)
-        self.assertIn("syscall.O_NOFOLLOW", main)
+        self.assertIn("file, err := os.Open(path)", main)
+        self.assertNotIn("syscall.O_NOFOLLOW", main)
         self.assertIn("file.Stat()", main)
         self.assertNotIn("os.Lstat", main)
 
