@@ -619,7 +619,6 @@ jobs:
             --server-image-digest "$SERVER_IMAGE_DIGEST" \
             --output "$RESULT_PATH" \
             --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" \
-            --download-url "https://proof.ovh.net/files/1Mb.dat" \
             --upload-url "$upload_url" \
             --service-pid "$SERVICE_PID" \
             --service-binary "$GITHUB_WORKSPACE/candidate/ubuntu_grpcvpnserver" \

@@ -34,6 +34,10 @@ from torturer_checks.hosted.linux import (
     LinuxServiceProcessController,
     _SERVICE_LAUNCH_SCRIPT,
 )
+from torturer_checks.hosted.factory import (
+    adapter_for_platform,
+    disposable_measurement_endpoints,
+)
 from torturer_checks.hosted.macos import MacOSHostedAdapter
 from torturer_checks.hosted.windows import WindowsHostedAdapter
 from torturer_checks.hosted.run import (
@@ -123,6 +127,83 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertTrue(any(call[1] == "connect-profile" for call in self.runner.calls))
         self.adapter.reset()
         self.assertFalse(self.runner.connected)
+
+    def test_disposable_upload_url_derives_all_test_owned_probe_endpoints(self) -> None:
+        token = "a" * 32
+        endpoints = disposable_measurement_endpoints(
+            f"https://sink.example.onrender.com/upload/{token}"
+        )
+        self.assertEqual(
+            endpoints.identity_url,
+            f"https://sink.example.onrender.com/identity/{token}",
+        )
+        self.assertEqual(
+            endpoints.latency_url,
+            f"https://sink.example.onrender.com/download/{token}",
+        )
+        self.assertEqual(endpoints.download_url, endpoints.latency_url)
+
+    def test_disposable_endpoint_derivation_rejects_noncanonical_urls(self) -> None:
+        for invalid in (
+            "http://sink.example.onrender.com/upload/" + "a" * 32,
+            "https://sink.example.onrender.com/upload/" + "a" * 31,
+            "https://sink.example.onrender.com/upload/" + "A" * 32,
+            "https://sink.example.onrender.com/upload/" + "a" * 32 + "?x=1",
+            "https://user@sink.example.onrender.com/upload/" + "a" * 32,
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "disposable upload URL is invalid"):
+                    disposable_measurement_endpoints(invalid)
+
+    def test_desktop_identity_probe_can_use_disposable_test_endpoint(self) -> None:
+        token = "a" * 32
+
+        class IdentityRunner(FakeRunner):
+            def run(self, command, *, timeout_seconds):
+                argv = tuple(command)
+                if argv[0] == "curl":
+                    self.calls.append(argv)
+                    self.timeouts.append(float(timeout_seconds))
+                    return CommandResult(argv, 0, b"203.0.113.42\n", b"identity diagnostic\n")
+                return super().run(command, timeout_seconds=timeout_seconds)
+
+        runner = IdentityRunner()
+        adapter = HostedCLIAdapter(
+            cli=self.cli,
+            profile=self.profile,
+            runner=runner,
+            identity_url=f"https://sink.example.onrender.com/identity/{token}",
+        )
+        self.assertEqual(adapter._external_ip(5), "203.0.113.42")
+        self.assertEqual(runner.calls[0][0], "curl")
+        self.assertIn("--show-error", runner.calls[0])
+        self.assertNotIn("--silent", runner.calls[0])
+
+    def test_factory_derives_test_owned_endpoints_for_every_desktop(self) -> None:
+        token = "a" * 32
+        upload_url = f"https://sink.example.onrender.com/upload/{token}"
+        for platform, expected_type in (
+            ("linux", LinuxHostedAdapter),
+            ("windows", WindowsHostedAdapter),
+            ("macos", MacOSHostedAdapter),
+        ):
+            with self.subTest(platform=platform):
+                adapter = adapter_for_platform(
+                    platform,
+                    cli=self.cli,
+                    profile=self.profile,
+                    runner=FakeRunner(),
+                    upload_url=upload_url,
+                )
+                self.assertIsInstance(adapter, expected_type)
+                self.assertEqual(
+                    adapter.identity_url,
+                    f"https://sink.example.onrender.com/identity/{token}",
+                )
+                self.assertEqual(
+                    adapter.download_url,
+                    f"https://sink.example.onrender.com/download/{token}",
+                )
 
     def test_windows_and_macos_use_the_same_canonical_cli_scenarios(self) -> None:
         scenario = get_scenario("functional.connect-route-identity")

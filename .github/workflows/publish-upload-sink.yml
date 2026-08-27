@@ -131,6 +131,18 @@ jobs:
             "http://127.0.0.1:18080$upload_path")"
           printf 'smoke_upload_result=%s\n' "$upload_result"
           test "$upload_result" = "1048576 204"
+          token="${upload_path##*/}"
+          identity_result="$(curl --fail --show-error --max-time 10 \
+            --header 'CF-Connecting-IP: 203.0.113.42' \
+            "http://127.0.0.1:18080/identity/$token")"
+          printf 'smoke_identity_result=%s\n' "$identity_result"
+          test "$identity_result" = "203.0.113.42"
+          download_result="$(curl --fail --show-error --max-time 10 \
+            --output /dev/null \
+            --write-out '%{size_download} %{http_code}\n' \
+            "http://127.0.0.1:18080/download/$token")"
+          printf 'smoke_download_result=%s\n' "$download_result"
+          test "$download_result" = "1048576 200"
 
       - name: Log in to GHCR without exposing the token
         env:
@@ -296,6 +308,18 @@ jobs:
             "http://127.0.0.1:18081$upload_path")"
           printf 'pulled_smoke_upload_result=%s\n' "$pulled_upload_result"
           test "$pulled_upload_result" = "1048576 204"
+          token="${upload_path##*/}"
+          pulled_identity_result="$(curl --fail --show-error --max-time 10 \
+            --header 'CF-Connecting-IP: 203.0.113.42' \
+            "http://127.0.0.1:18081/identity/$token")"
+          printf 'pulled_smoke_identity_result=%s\n' "$pulled_identity_result"
+          test "$pulled_identity_result" = "203.0.113.42"
+          pulled_download_result="$(curl --fail --show-error --max-time 10 \
+            --output /dev/null \
+            --write-out '%{size_download} %{http_code}\n' \
+            "http://127.0.0.1:18081/download/$token")"
+          printf 'pulled_smoke_download_result=%s\n' "$pulled_download_result"
+          test "$pulled_download_result" = "1048576 200"
 
       - name: Upload digest and provenance record
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f

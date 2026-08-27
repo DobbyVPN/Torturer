@@ -1,4 +1,4 @@
-# HTTPS upload sink
+# HTTPS measurement sink
 
 This is a test-owned Render image. Render terminates HTTPS at its edge and
 passes HTTP to the container's injected `PORT`.
@@ -12,7 +12,8 @@ reading it.
 
 The immutable-image workflow builds and exercises the container as
 `linux/amd64`, mounts a representative `/etc/secrets/upload-path`, performs
-the `/healthz` check, and sends an exact 1 MiB upload as UID `65532`/GID `1000`.
+the `/healthz` check, verifies its client-identity response, transfers an exact
+1 MiB download, and sends an exact 1 MiB upload as UID `65532`/GID `1000`.
 It then logs out of GHCR and verifies that the exact digest can be pulled,
 inspected, and run anonymously with the same non-root, secret-file, health,
 and exact 1 MiB upload checks. A successful workflow prints the exact digest
@@ -48,7 +49,12 @@ Operational gates for using the published image with Render:
   workflow reads those variables and rejects missing or stale identities; the
   publish workflow does not modify protected configuration.
 
-`GET /healthz` returns `204`. The configured upload path accepts only a
-positive, explicit `Content-Length` no larger than 2 MiB. The body is read and
-discarded. The handler does not add request logging; Go's complete unmodified
+`GET /healthz` returns `204`. For a configured `/upload/<token>` path, the same
+namespace exposes `GET /identity/<token>` and `GET /download/<token>`. The
+identity response is the canonical `CF-Connecting-IP` supplied by Render's
+Cloudflare edge; it fails closed if that header is absent or invalid. The
+download is exactly 1 MiB. Both GET responses use `Cache-Control: no-store`.
+The upload path accepts only a positive, explicit `Content-Length` no larger
+than 2 MiB; the body is read and discarded. The handler does not add request
+logging, so it does not persist observed identities. Go's complete unmodified
 server diagnostics remain on stderr in the private Render service logs.

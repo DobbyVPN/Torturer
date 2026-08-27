@@ -414,6 +414,27 @@ class HostedAndroidAdapterTests(unittest.TestCase):
         self.assertIsInstance(adapter, AndroidHostedAdapter)
         self.assertEqual(adapter.capabilities, self.adapter.capabilities)
 
+    def test_factory_derives_android_endpoints_from_disposable_upload_url(self) -> None:
+        token = "a" * 32
+        adapter = adapter_for_platform(
+            "android",
+            profile=self.profile,
+            runner=self.runner,
+            adb=self.adb,
+            source_sha=_SOURCE_SHA,
+            upload_url=f"https://sink.example.onrender.com/upload/{token}",
+        )
+        self.assertEqual(
+            adapter.identity_url,
+            f"https://sink.example.onrender.com/identity/{token}",
+        )
+        self.assertEqual(
+            adapter.download_url,
+            f"https://sink.example.onrender.com/download/{token}",
+        )
+        self.assertEqual(adapter.latency_url, adapter.download_url)
+        self.assertTrue(adapter.capabilities)
+
     def test_binary_staging_disables_pty_allocation(self) -> None:
         runner = InputAndroidRunner(Path(self.directory.name) / "input-raw")
         adapter = AndroidHostedAdapter(

@@ -677,10 +677,13 @@ class FunctionalAndroidWorkflowPolicyTest(unittest.TestCase):
     def test_runtime_endpoints_are_query_fragment_and_userinfo_free(self) -> None:
         runtime = self.text[self.text.index("- name: Run canonical Android functional scenarios"):self.text.index("- name: Stop Android emulator")]
         values = re.findall(r"--(?:identity|latency|download|upload)-url\s+\"([^\"]+)\"", runtime)
-        self.assertEqual(len(values), 4)
+        self.assertEqual(values, ["$upload_url"])
         for value in values:
             self.assertNotRegex(value, r"[?#@]")
-        self.assertIn("https://proof.ovh.net/files/1Mb.dat", values)
+        self.assertNotIn("proof.ovh.net", runtime)
+        self.assertNotIn("--identity-url", runtime)
+        self.assertNotIn("--latency-url", runtime)
+        self.assertNotIn("--download-url", runtime)
         self.assertIn('upload_url="$(cat "$HANDOFF_DIR/upload-url.txt")"', runtime)
         self.assertIn('--upload-url "$upload_url"', runtime)
 

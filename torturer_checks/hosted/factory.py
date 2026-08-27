@@ -1,8 +1,11 @@
 """Select one explicit hosted platform adapter."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from .android import AndroidHostedAdapter
 from .cli import CommandRunner
@@ -16,6 +19,51 @@ _ADAPTERS: dict[str, type] = {
     "macos": MacOSHostedAdapter,
     "android": AndroidHostedAdapter,
 }
+
+_DISPOSABLE_UPLOAD_PATH = re.compile(r"^/upload/([0-9a-f]{32})$")
+
+
+@dataclass(frozen=True)
+class DisposableMeasurementEndpoints:
+    """Token-bound endpoints exposed by the disposable Render sink."""
+
+    identity_url: str
+    latency_url: str
+    download_url: str
+    upload_url: str
+
+
+def disposable_measurement_endpoints(upload_url: str) -> DisposableMeasurementEndpoints:
+    """Derive the other test-owned probes from one encrypted upload URL."""
+
+    if not isinstance(upload_url, str) or not 12 <= len(upload_url) <= 512:
+        raise ValueError("disposable upload URL is invalid")
+    try:
+        parsed = urlsplit(upload_url)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("disposable upload URL is invalid") from error
+    match = _DISPOSABLE_UPLOAD_PATH.fullmatch(parsed.path)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or parsed.query
+        or parsed.fragment
+        or match is None
+    ):
+        raise ValueError("disposable upload URL is invalid")
+    origin = urlunsplit((parsed.scheme, parsed.netloc, "", "", "")).rstrip("/")
+    token = match.group(1)
+    download_url = f"{origin}/download/{token}"
+    return DisposableMeasurementEndpoints(
+        identity_url=f"{origin}/identity/{token}",
+        latency_url=download_url,
+        download_url=download_url,
+        upload_url=upload_url,
+    )
 
 
 def adapter_for_platform(
@@ -41,6 +89,17 @@ def adapter_for_platform(
         adapter_class = _ADAPTERS[platform]
     except KeyError as error:
         raise ValueError("unsupported hosted platform") from error
+    if (
+        upload_url is not None
+        and identity_url is None
+        and latency_url is None
+        and download_url is None
+    ):
+        endpoints = disposable_measurement_endpoints(upload_url)
+        identity_url = endpoints.identity_url
+        latency_url = endpoints.latency_url
+        download_url = endpoints.download_url
+
     kwargs: dict[str, object] = {
         "profile": profile,
         "runner": runner,
@@ -69,6 +128,7 @@ def adapter_for_platform(
         if cli is None:
             raise ValueError("hosted desktop adapter requires --cli")
         kwargs["cli"] = cli
+        kwargs["identity_url"] = identity_url
         if platform == "linux":
             kwargs.update({
                 "service_pid": service_pid,
@@ -88,4 +148,8 @@ def adapter_for_platform(
     return adapter_class(**kwargs)
 
 
-__all__ = ["adapter_for_platform"]
+__all__ = [
+    "DisposableMeasurementEndpoints",
+    "adapter_for_platform",
+    "disposable_measurement_endpoints",
+]

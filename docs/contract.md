@@ -383,12 +383,13 @@ than being produced after its evidence references are frozen.
 provider operations, not public candidate steps. The request contains only an
 opaque run ID, platform, and immutable image digest. Acquisition creates one
 schema-2 bundle containing a random WSS profile backed by a tagged Outline
-service and a separately pinned HTTPS upload-sink service for every hosted
+service and a separately pinned HTTPS measurement-sink service for every hosted
 platform. The bundle binds each role to its exact service ID and image digest,
-and generates a fresh 128-bit upload path. The sink accepts only its health
-path and that bounded random POST path; it does not persist or log request
-bodies. The plaintext TOML profile and upload URL are written only to
-owner-only storage; the URL crosses the trusted workflow boundary only as
+and generates a fresh 128-bit path namespace. The sink accepts only its health
+path, a bounded random POST path, a one-MiB download path, and an uncached
+client-identity path in that namespace; it does not persist or log request
+bodies or observed identities. The plaintext TOML profile and upload URL are
+written only to owner-only storage; the URL crosses the trusted workflow boundary only as
 encrypted `upload.cms`, while the safe lease record contains no URL or path.
 Cleanup is idempotent, independently deletes and verifies both exact service
 IDs, and fails closed on missing, duplicate, or conflicting role identity.
@@ -416,7 +417,7 @@ dispatch. The controller binds the origin run ID, attempt, exact Torturer
 acquire a service. The client verifies the exact allow-listed candidate closure
 and platform readiness before publishing its request. GitHub token-bearing
 operations finish before untrusted candidate execution. The client receives
-only the encrypted profile and upload handoffs, never the Render credential or
+only the encrypted profile and measurement handoffs, never the Render credential or
 a write-capable repository token. Legacy schema-1 cleanup records do not create
 a new upload handoff.
 
@@ -451,8 +452,13 @@ worst-case two-service stale-absence repair path: eight Render API calls at
 
 Linux, Windows, and macOS start the exact source-built product service and drive
 the public CLI. Their workflows provide the exact service PID, binary, control
-socket or address, PID file, and fixed query-free HTTPS measurement endpoints,
-so process-loss recovery and bounded endurance are real capabilities. Linux
+socket or address, PID file, and one encrypted query-free HTTPS measurement
+namespace. Torturer derives the identity, latency, download, and upload paths
+from that single handoff, so hosted qualification does not depend on unrelated
+public identity or transfer providers. The sink marks GET responses `no-store`;
+its identity response uses the client address supplied by Render's Cloudflare
+edge, while its download response is exactly one MiB. This keeps process-loss
+recovery and bounded endurance as real capabilities. Linux
 may advertise network-transition only when the workflow supplies an exact
 non-control interface; Windows and macOS report an explicit uplink-toggle
 limitation because interrupting the runner's control interface would destroy

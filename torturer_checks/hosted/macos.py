@@ -253,6 +253,7 @@ class MacOSHostedAdapter(HostedCLIAdapter):
         cli: Path,
         profile: Path,
         runner: CommandRunner,
+        identity_url: str | None = None,
         download_url: str | None = None,
         upload_url: str | None = None,
         service_pid: int | None = None,
@@ -264,6 +265,7 @@ class MacOSHostedAdapter(HostedCLIAdapter):
             cli=cli,
             profile=profile,
             runner=runner,
+            identity_url=identity_url,
             download_url=download_url,
             upload_url=upload_url,
         )

@@ -42,7 +42,7 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         block = self.text[start:end]
         self.assertNotIn("--scenario-id", block)
         for option in (
-            "--download-url", "--upload-url", "--service-pid",
+            "--upload-url", "--service-pid",
             "--service-binary", "--service-socket", "--service-library-path",
             "--service-pid-file",
         ):
@@ -57,8 +57,10 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
             '--expected-unavailable functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED',
             block,
         )
-        self.assertIn('--download-url "https://proof.ovh.net/files/1Mb.dat"', block)
         self.assertIn('--upload-url "$upload_url"', block)
+        self.assertNotIn("--download-url", block)
+        self.assertNotIn("--identity-url", block)
+        self.assertNotIn("proof.ovh.net", block)
         self.assertNotIn("speed.cloudflare.com/__up", block)
         self.assertNotRegex(block, r'--(?:download|upload)-url\s+"[^"\n]*[?#]')
         self.assertNotIn("speed.cloudflare.com/__down?", block)

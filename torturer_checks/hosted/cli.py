@@ -2377,6 +2377,7 @@ class HostedCLIAdapter:
         cli: Path,
         profile: Path,
         runner: CommandRunner,
+        identity_url: str | None = None,
         download_url: str | None = None,
         upload_url: str | None = None,
         stability_samples: int = 3,
@@ -2394,6 +2395,11 @@ class HostedCLIAdapter:
         self.cli = cli
         self.profile = profile
         self.runner = runner
+        self.identity_url = (
+            _https_endpoint(identity_url, "identity_url")
+            if identity_url is not None
+            else None
+        )
         self.download_url = download_url
         self.upload_url = upload_url
         self.stability_samples = stability_samples
@@ -2523,7 +2529,21 @@ class HostedCLIAdapter:
         return isinstance(value, dict) and value.get("state") == "Connected"
 
     def _external_ip(self, timeout: float) -> str:
-        result = self._command(("external-ip",), timeout, "EXTERNAL_IDENTITY_FAILED")
+        if self.identity_url is None:
+            result = self._command(("external-ip",), timeout, "EXTERNAL_IDENTITY_FAILED")
+        else:
+            try:
+                result = self.runner.run(
+                    (
+                        "curl", "--fail", "--location", "--show-error",
+                        "--max-time", str(max(1, int(timeout))), self.identity_url,
+                    ),
+                    timeout_seconds=timeout,
+                )
+            except HostedAdapterError as error:
+                raise ScenarioExecutionError(error.code) from error
+            if result.timed_out or result.returncode != 0:
+                raise ScenarioExecutionError("EXTERNAL_IDENTITY_FAILED")
         candidate = result.stdout_text.strip()
         if "\n" in candidate or "\r" in candidate:
             raise ScenarioExecutionError("EXTERNAL_IDENTITY_INVALID")
