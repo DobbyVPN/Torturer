@@ -64,6 +64,7 @@ class UploadSinkPublishWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("--env PORT=18080", self.text)
         self.assertIn("/etc/secrets/upload-path:ro", self.text)
         self.assertIn("--path-file=/etc/secrets/upload-path", self.text)
+        self.assertIn('sudo chmod 0440 "$smoke_dir/upload-path"', self.text)
         self.assertIn("test \"$image_user\" = \"65532:1000\"", self.text)
         self.assertIn("head -c 1048576 /dev/zero", self.text)
         self.assertIn("%{size_upload} %{http_code}", self.text)
@@ -76,6 +77,7 @@ class UploadSinkPublishWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("test \"$pulled_entrypoint\" = '[\"/upload-sink\"]'", self.text)
         self.assertIn("--env PORT=18081", self.text)
         self.assertIn("--publish 127.0.0.1:18081:18081", self.text)
+        self.assertIn('sudo chmod 0440 "$pulled_smoke_dir/upload-path"', self.text)
         self.assertIn('test "$pulled_upload_result" = "1048576 204"', self.text)
         self.assertIn('docker image rm "$image_ref"', self.text)
 
