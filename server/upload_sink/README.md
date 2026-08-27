@@ -25,8 +25,13 @@ The container requires:
 
 - `PORT`: a decimal TCP port in the range 1–65535;
 - either `UPLOAD_PATH` containing `/upload/` followed by at least 32 lowercase
-  hexadecimal characters (local runs), or the Render command argument
+  hexadecimal characters (local runs), or the default image argument
   `--path-file=/etc/secrets/upload-path` (the secret file contains that path).
+
+The default argument is part of the immutable image configuration. The Render
+service request does not rely on its separately stored `dockerCommand` field:
+Render accepted that field for a prebuilt image but started the image with an
+empty argument list during the live provider qualification.
 
 Operational gates for using the published image with Render:
 

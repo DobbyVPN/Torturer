@@ -153,7 +153,6 @@ def image_spec_with_runtime_config() -> object:
         image_digest=IMAGE_DIGEST,
         health_check_path="/probe/tcp",
         secret_files=(("config.yml", "web:\n  servers: []\n"),),
-        docker_command="/outline-ss-server -config=/etc/secrets/config.yml",
     )
 
 
@@ -170,10 +169,7 @@ class RenderControllerTests(unittest.TestCase):
         value = image_spec_with_runtime_config().payload()
         self.assertEqual(value["image"]["imagePath"], "ghcr.io/dobbyvpn/outline-ss-server@" + IMAGE_DIGEST)
         self.assertEqual(value["secretFiles"], [{"name": "config.yml", "content": "web:\n  servers: []\n"}])
-        self.assertEqual(
-            value["serviceDetails"]["envSpecificDetails"]["dockerCommand"],
-            "/outline-ss-server -config=/etc/secrets/config.yml",
-        )
+        self.assertNotIn("envSpecificDetails", value["serviceDetails"])
 
     def test_outline_wss_spec_can_omit_fake_http_health_path(self) -> None:
         value = image_spec_with_runtime_config().__dict__
@@ -190,12 +186,10 @@ class RenderControllerTests(unittest.TestCase):
                 **{**fields, "image_path": "ghcr.io/dobbyvpn/outline-ss-server@sha256:" + "b" * 64}
             )
 
-    def test_secret_file_and_command_validation_is_fail_closed(self) -> None:
+    def test_secret_file_validation_is_fail_closed(self) -> None:
         fields = image_spec_with_runtime_config().__dict__
         with self.assertRaises(ValueError):
             RENDER.RenderServiceSpec(**{**fields, "secret_files": (("../config", "x"),)})
-        with self.assertRaises(ValueError):
-            RENDER.RenderServiceSpec(**{**fields, "docker_command": "x\ny"})
 
     def test_acquire_waits_for_live_https_service_and_release_verifies_deletion(self) -> None:
         transport = FakeTransport()

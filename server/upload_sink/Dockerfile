@@ -6,3 +6,4 @@ COPY upload-sink /upload-sink
 # while granting it only the group access needed to read the one path file.
 USER 65532:1000
 ENTRYPOINT ["/upload-sink"]
+CMD ["--path-file=/etc/secrets/upload-path"]

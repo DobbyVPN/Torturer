@@ -38,13 +38,33 @@ _IMAGE_PATH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{2,255}$")
 _SERVICE_ID = re.compile(r"^srv-[A-Za-z0-9][A-Za-z0-9_-]{1,99}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _UPLOAD_PATH = re.compile(r"^/upload/[0-9a-f]{32}$")
-_OUTLINE_CONFIG_COMMAND = "/outline-ss-server -config=/etc/secrets/config.yml"
-_UPLOAD_SINK_COMMAND = "/upload-sink --path-file=/etc/secrets/upload-path"
 _UPLOAD_SINK_ROLE = "upload-sink"
+_SAFE_RESULT_CODE = re.compile(r"^[A-Z][A-Z0-9_]{1,127}$")
 
 
 def _owner_output(path: Path, payload: dict[str, object]) -> None:
     _owner_text(path, json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def _write_safe_command_result(args: argparse.Namespace, *, status: str, code: str) -> None:
+    path = getattr(args, "safe_result_output", None)
+    if path is None:
+        return
+    if not isinstance(path, Path):
+        raise ValueError("safe result output path is invalid")
+    if getattr(args, "command", None) != "acquire":
+        raise ValueError("safe result output is only valid for acquisition")
+    if status not in {"completed", "failed"}:
+        raise ValueError("safe result status is invalid")
+    if _SAFE_RESULT_CODE.fullmatch(code) is None:
+        raise ValueError("safe result code is invalid")
+    _owner_output(path, {
+        "schema": 1,
+        "kind": "dobbyvpn.render-lease-command-result",
+        "command": "acquire",
+        "status": status,
+        "code": code,
+    })
 
 
 def _ensure_owner_directory(path: Path) -> None:
@@ -445,7 +465,6 @@ def acquire(args: argparse.Namespace) -> int:
         image_digest=request.image_digest,
         region=args.region,
         secret_files=profile.render_secret_files(args.listen_port),
-        docker_command=_OUTLINE_CONFIG_COMMAND,
     )
     sink_image_owner_id = getattr(args, "sink_image_owner_id", None)
     sink_image_path = getattr(args, "sink_image_path", None)
@@ -477,7 +496,6 @@ def acquire(args: argparse.Namespace) -> int:
         region=args.region,
         health_check_path="/healthz",
         secret_files=(("upload-path", upload_path),),
-        docker_command=_UPLOAD_SINK_COMMAND,
     )
     journal = RenderLeaseJournal(args.journal, schema=2)
     outline = RenderLease(api, outline_spec, descriptor, journal)
@@ -846,6 +864,7 @@ def parser() -> argparse.ArgumentParser:
     acquire_parser.add_argument("--profile-output", type=Path, required=True)
     acquire_parser.add_argument("--lease-output", type=Path, required=True)
     acquire_parser.add_argument("--upload-url-output", type=Path)
+    acquire_parser.add_argument("--safe-result-output", type=Path, required=True)
     acquire_parser.add_argument("--journal", type=Path, required=True)
     acquire_parser.add_argument("--listen-port", type=int, default=10000)
     acquire_parser.add_argument("--region", default="oregon")
@@ -868,11 +887,22 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
-        return int(args.handler(args))
+        result = int(args.handler(args))
     except (LeaseRequestError, RenderAPIError, OSError, ValueError, json.JSONDecodeError) as error:
         code = getattr(error, "code", type(error).__name__.upper())
+        try:
+            _write_safe_command_result(args, status="failed", code=code)
+        except (OSError, ValueError):
+            print("render-lease safe-result failed code=SAFE_RESULT_WRITE_FAILED", file=sys.stderr)
         print(f"render-lease failed code={code}", file=sys.stderr)
         return 1
+    if result == 0:
+        try:
+            _write_safe_command_result(args, status="completed", code="OK")
+        except (OSError, ValueError):
+            print("render-lease safe-result failed code=SAFE_RESULT_WRITE_FAILED", file=sys.stderr)
+            return 1
+    return result
 
 
 if __name__ == "__main__":

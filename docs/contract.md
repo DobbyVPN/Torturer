@@ -392,14 +392,21 @@ owner-only storage; the URL crosses the trusted workflow boundary only as
 encrypted `upload.cms`, while the safe lease record contains no URL or path.
 Cleanup is idempotent, independently deletes and verifies both exact service
 IDs, and fails closed on missing, duplicate, or conflicting role identity.
+Acquisition also writes a strict, public-safe command result containing only
+`completed`/`failed` and a stable uppercase code. An unconditional workflow
+step validates and prints that record, so the private deadline wrapper can
+retain complete raw child streams without reducing a provider failure to an
+opaque digest alone.
 Schema 1 is retained solely so old single-service journals can be cleaned up;
 new acquisition never emits it. Render credentials are read only from the
-protected workflow environment. For the selected Outline image, the trusted
-request sets the complete Render Docker command to
-`/outline-ss-server -config=/etc/secrets/config.yml`; the upload sink uses
-`/upload-sink --path-file=/etc/secrets/upload-path`. Render's
-override is a complete start command, not additional arguments for the image
-ENTRYPOINT. Secret files are never baked into an image or emitted in a result.
+protected workflow environment. Both immutable images carry their required
+secret-file argument as a default image `CMD`: Outline reads
+`/etc/secrets/config.yml`, and the upload sink reads
+`/etc/secrets/upload-path`. The trusted request deliberately sends no Render
+Docker-command override. Live provider qualification proved that Render can
+store that override for a prebuilt image while still starting the image with
+an empty argument list. Secret files are never baked into an image or emitted
+in a result.
 
 The four manual functional workflows target Linux, Windows, macOS, and Android.
 Each uses a secretless source-build job, a trusted client job with read-only

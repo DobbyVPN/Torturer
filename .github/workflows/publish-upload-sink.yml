@@ -99,16 +99,18 @@ jobs:
           }
           trap cleanup EXIT
           image_user="$(docker image inspect "$smoke_tag" --format '{{.Config.User}}')"
+          image_command="$(docker image inspect "$smoke_tag" --format '{{json .Config.Cmd}}')"
           printf 'smoke_image_user=%s\n' "$image_user"
+          printf 'smoke_image_command=%s\n' "$image_command"
           test "$image_user" = "65532:1000"
+          test "$image_command" = '["--path-file=/etc/secrets/upload-path"]'
           docker run --detach \
             --name "$container" \
             --platform linux/amd64 \
             --env PORT=18080 \
             --volume "$smoke_dir/upload-path:/etc/secrets/upload-path:ro" \
             --publish 127.0.0.1:18080:18080 \
-            "$smoke_tag" \
-            --path-file=/etc/secrets/upload-path
+            "$smoke_tag"
           container_started=true
           health_ready=false
           for attempt in $(seq 1 30); do
@@ -258,10 +260,13 @@ jobs:
 
           pulled_image_user="$(docker image inspect "$image_ref" --format '{{.Config.User}}')"
           pulled_entrypoint="$(docker image inspect "$image_ref" --format '{{json .Config.Entrypoint}}')"
+          pulled_command="$(docker image inspect "$image_ref" --format '{{json .Config.Cmd}}')"
           printf 'pulled_image_user=%s\n' "$pulled_image_user"
           printf 'pulled_entrypoint=%s\n' "$pulled_entrypoint"
+          printf 'pulled_command=%s\n' "$pulled_command"
           test "$pulled_image_user" = "65532:1000"
           test "$pulled_entrypoint" = '["/upload-sink"]'
+          test "$pulled_command" = '["--path-file=/etc/secrets/upload-path"]'
 
           docker buildx imagetools inspect "$image_ref"
           docker run --detach \
@@ -270,8 +275,7 @@ jobs:
             --env PORT=18081 \
             --volume "$pulled_smoke_dir/upload-path:/etc/secrets/upload-path:ro" \
             --publish 127.0.0.1:18081:18081 \
-            "$image_ref" \
-            --path-file=/etc/secrets/upload-path
+            "$image_ref"
           pulled_container_started=true
           pulled_health_ready=false
           for attempt in $(seq 1 30); do

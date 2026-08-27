@@ -120,6 +120,7 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         self.assertIn('render-lease-journal-${{ inputs.lease_run_id }}-${{ inputs.platform }}', self.text)
         self.assertIn("RENDER_SINK_IMAGE_DIGEST", self.text)
         self.assertIn("--expected-sink-image-digest", self.text)
+        self.assertIn('--safe-result-output "$LEASE_DIR/acquire-result.json"', self.text)
         self.assertIn('"upload-sink"', self.text)
         self.assertIn('if set(value) != set(expected) | {"services"}', self.text)
 
@@ -307,6 +308,13 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
 
     def test_diagnostic_suppression_is_not_added(self) -> None:
         self.assertNotRegex(self.text, r">\s*/dev/null|2>\s*/dev/null|--quiet(?:\s|$)")
+        report = self.text.index("- name: Report safe Render acquisition result")
+        cleanup = self.text.index("- name: Delete the exact Render service and verify absence")
+        block = self.text[report:cleanup]
+        self.assertIn("if: always()", block)
+        self.assertIn("render_acquisition status={status} code={code}", block)
+        self.assertIn("SAFE_RESULT_MISSING", block)
+        self.assertIn("acquire-result.json", self.text[self.text.index("- name: Upload safe lease journal"):])
 
     def test_every_active_workflow_job_is_bounded_to_thirty_minutes(self) -> None:
         workflows = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
