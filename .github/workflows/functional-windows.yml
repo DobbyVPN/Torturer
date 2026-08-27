@@ -330,7 +330,14 @@ jobs:
           export DOBBYVPN_WINDOWS_SERVICE_ERR="$service_err_windows"
           export DOBBYVPN_WINDOWS_PROGRAMDATA="$programdata_windows"
           # shellcheck disable=SC2016
-          service_pid="$(powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; $env:ProgramData=$env:DOBBYVPN_WINDOWS_PROGRAMDATA; $env:DOBBYVPN_CONTROL_TOKEN_USER=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name; $p=Start-Process -FilePath $env:DOBBYVPN_WINDOWS_SERVICE_BINARY -ArgumentList @("-port","50051") -RedirectStandardOutput $env:DOBBYVPN_WINDOWS_SERVICE_LOG -RedirectStandardError $env:DOBBYVPN_WINDOWS_SERVICE_ERR -PassThru; $p.Id')"
+          # Do not resolve WindowsIdentity.Name here.  On a hosted runner that
+          # account-name lookup can block before Start-Process returns, while
+          # the Bash command substitution waits indefinitely.  USERDOMAIN and
+          # USERNAME are already supplied by the runner and are the account
+          # identity consumed by the product's LookupSID call.  Keep explicit
+          # phase diagnostics on stderr so they remain visible even though the
+          # PID itself is captured from stdout.
+          service_pid="$(powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; [Console]::Error.WriteLine("windows_launch_phase=environment"); $env:ProgramData=$env:DOBBYVPN_WINDOWS_PROGRAMDATA; if ([string]::IsNullOrWhiteSpace($env:USERNAME)) { throw "USERNAME is unavailable" }; $account=$env:USERNAME; if (-not [string]::IsNullOrWhiteSpace($env:USERDOMAIN)) { $account="$($env:USERDOMAIN)\$($env:USERNAME)" }; $env:DOBBYVPN_CONTROL_TOKEN_USER=$account; [Console]::Error.WriteLine("windows_launch_phase=account_ready"); $p=Start-Process -FilePath $env:DOBBYVPN_WINDOWS_SERVICE_BINARY -ArgumentList @("-port","50051") -RedirectStandardOutput $env:DOBBYVPN_WINDOWS_SERVICE_LOG -RedirectStandardError $env:DOBBYVPN_WINDOWS_SERVICE_ERR -PassThru; [Console]::Error.WriteLine("windows_launch_phase=process_started"); $p.Id')"
           unset DOBBYVPN_WINDOWS_SERVICE_BINARY DOBBYVPN_WINDOWS_SERVICE_LOG DOBBYVPN_WINDOWS_SERVICE_ERR DOBBYVPN_WINDOWS_PROGRAMDATA
           export PROGRAMDATA="$programdata_path"
           printf 'PROGRAMDATA=%s\n' "$PROGRAMDATA" >> "$GITHUB_ENV"
@@ -690,7 +697,10 @@ jobs:
           export DOBBYVPN_WINDOWS_SERVICE_ERR="$service_err_windows"
           export DOBBYVPN_WINDOWS_PROGRAMDATA="$programdata_windows"
           # shellcheck disable=SC2016
-          service_pid="$(powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; $env:ProgramData=$env:DOBBYVPN_WINDOWS_PROGRAMDATA; $env:DOBBYVPN_CONTROL_TOKEN_USER=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name; $p=Start-Process -FilePath $env:DOBBYVPN_WINDOWS_SERVICE_BINARY -ArgumentList @("-port","50051") -RedirectStandardOutput $env:DOBBYVPN_WINDOWS_SERVICE_LOG -RedirectStandardError $env:DOBBYVPN_WINDOWS_SERVICE_ERR -PassThru; $p.Id')"
+          # Keep this launch path identical to the preflight path.  The
+          # account is assembled from runner-provided environment values so a
+          # domain lookup cannot hold the command substitution indefinitely.
+          service_pid="$(powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; [Console]::Error.WriteLine("windows_launch_phase=environment"); $env:ProgramData=$env:DOBBYVPN_WINDOWS_PROGRAMDATA; if ([string]::IsNullOrWhiteSpace($env:USERNAME)) { throw "USERNAME is unavailable" }; $account=$env:USERNAME; if (-not [string]::IsNullOrWhiteSpace($env:USERDOMAIN)) { $account="$($env:USERDOMAIN)\$($env:USERNAME)" }; $env:DOBBYVPN_CONTROL_TOKEN_USER=$account; [Console]::Error.WriteLine("windows_launch_phase=account_ready"); $p=Start-Process -FilePath $env:DOBBYVPN_WINDOWS_SERVICE_BINARY -ArgumentList @("-port","50051") -RedirectStandardOutput $env:DOBBYVPN_WINDOWS_SERVICE_LOG -RedirectStandardError $env:DOBBYVPN_WINDOWS_SERVICE_ERR -PassThru; [Console]::Error.WriteLine("windows_launch_phase=process_started"); $p.Id')"
           unset DOBBYVPN_WINDOWS_SERVICE_BINARY DOBBYVPN_WINDOWS_SERVICE_LOG DOBBYVPN_WINDOWS_SERVICE_ERR DOBBYVPN_WINDOWS_PROGRAMDATA
           export PROGRAMDATA="$programdata_path"
           printf 'PROGRAMDATA=%s\n' "$PROGRAMDATA" >> "$GITHUB_ENV"
