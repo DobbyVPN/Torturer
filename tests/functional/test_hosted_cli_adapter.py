@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import gc
 import hashlib
 import os
@@ -251,6 +252,61 @@ class HostedCLIAdapterTests(unittest.TestCase):
         )
         self.assertEqual(network_result.outcome, "passed")
 
+    def test_linux_sleep_wake_is_explicitly_unavailable_with_stable_reason(self) -> None:
+        adapter = LinuxHostedAdapter(cli=self.cli, profile=self.profile, runner=self.runner)
+        scenario = get_scenario("functional.sleep-wake")
+        self.assertNotIn(Capability.SLEEP_WAKE, adapter.capabilities)
+        self.assertEqual(
+            adapter.capability_unavailable_reasons,
+            {Capability.SLEEP_WAKE: "HOSTED_RUNNER_SUSPEND_UNSUPPORTED"},
+        )
+        result = FunctionalEngine("1" * 64).run(
+            scenario,
+            adapter,
+            _provenance(adapter),
+        )
+        self.assertEqual(result.outcome, "unavailable")
+        self.assertEqual(result.reason_code, "HOSTED_RUNNER_SUSPEND_UNSUPPORTED")
+
+    def test_linux_partition_uses_capability_reason_without_string_key_mismatch(self) -> None:
+        adapter = LinuxHostedAdapter(cli=self.cli, profile=self.profile, runner=self.runner)
+        _, unsupported = _partition_applicable(
+            (get_scenario("functional.sleep-wake"),),
+            adapter.capabilities,
+            adapter.capability_unavailable_reasons,
+        )
+        self.assertEqual(
+            unsupported,
+            [{
+                "scenario_id": "functional.sleep-wake",
+                "missing_capabilities": ["sleep_wake"],
+                "reason_code": "HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
+            }],
+        )
+
+    def test_engine_keeps_runtime_unavailability_generic_when_capability_was_advertised(self) -> None:
+        scenario = get_scenario("functional.sleep-wake")
+
+        class RuntimeUnavailableAdapter:
+            adapter_id = "runtime-unavailable"
+            adapter_version = "v1"
+            capabilities = scenario.required_capabilities
+            capability_unavailable_reasons = {
+                Capability.SLEEP_WAKE: "HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
+            }
+
+            def execute(self, step):
+                raise CapabilityUnavailable()
+
+        adapter = RuntimeUnavailableAdapter()
+        result = FunctionalEngine("1" * 64).run(
+            scenario,
+            adapter,
+            _provenance(adapter),
+        )
+        self.assertEqual(result.outcome, "unavailable")
+        self.assertEqual(result.reason_code, "CAPABILITY_UNAVAILABLE")
+
     def test_shared_desktop_endurance_is_url_gated_and_bounded(self) -> None:
         adapter = HostedCLIAdapter(
             cli=self.cli, profile=self.profile, runner=self.runner,
@@ -313,8 +369,14 @@ class HostedCLIAdapterTests(unittest.TestCase):
             "--candidate-manifest", str(self.cli), "--server-image-digest", "sha256:" + "b" * 64,
             "--output", str(self.directory.name + "/result.json"), "--scenario-id",
             "functional.configure", "--scenario-id", "functional.disconnect-cleanup",
+            "--expected-unavailable",
+            "functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
         ])
         self.assertEqual(parsed.scenario_ids, ["functional.configure", "functional.disconnect-cleanup"])
+        self.assertEqual(
+            parsed.expected_unavailable,
+            ["functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED"],
+        )
 
     def test_hosted_runner_accounts_for_one_reset_after_every_selected_scenario(self) -> None:
         scenarios = _select_scenarios([

@@ -38,14 +38,6 @@ class AndroidProfileObservation:
     second_routing_identity_changed: bool
     final_disconnect_clean: bool
     cleanup_verified: bool
-    # The product seam also emits facts for controls that are currently
-    # unavailable to the hosted Android adapter.  Keep those additive fields
-    # in the accepted wire shape so the public parser can consume the same
-    # observation envelope used by the private Harness without claiming the
-    # corresponding capabilities.
-    network_transition_verified: bool = False
-    sleep_wake_verified: bool = False
-    process_loss_verified: bool = False
     error_code: str | None = None
 
     def __post_init__(self) -> None:
@@ -61,8 +53,7 @@ class AndroidProfileObservation:
             "network_transition_verified", "sleep_wake_verified", "process_loss_verified",
             "restart_verified", "reconnect_bounded", "second_tunnel_interface",
             "second_routing_identity_changed", "final_disconnect_clean",
-            "cleanup_verified", "network_transition_verified",
-            "sleep_wake_verified", "process_loss_verified",
+            "cleanup_verified",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise AndroidObservationError(f"{name} must be boolean")
@@ -89,12 +80,7 @@ class AndroidProfileObservation:
             "second_tunnel_interface", "second_routing_identity_changed",
             "final_disconnect_clean", "cleanup_verified",
         }
-        optional = {
-            "error_code",
-            "network_transition_verified",
-            "sleep_wake_verified",
-            "process_loss_verified",
-        }
+        optional = {"error_code"}
         if not isinstance(value, Mapping) or set(value) - (expected | optional) or not expected <= set(value):
             raise AndroidObservationError("observation has an unexpected shape")
         if value.get("schema") != 1 or value.get("kind") != "dobbyvpn.android.profile-observation":
@@ -124,9 +110,6 @@ class AndroidProfileObservation:
             second_routing_identity_changed=value["second_routing_identity_changed"],
             final_disconnect_clean=value["final_disconnect_clean"],
             cleanup_verified=value["cleanup_verified"],
-            network_transition_verified=value.get("network_transition_verified", False),
-            sleep_wake_verified=value.get("sleep_wake_verified", False),
-            process_loss_verified=value.get("process_loss_verified", False),
             error_code=error_code,
         )
         if expected_source_sha is not None:

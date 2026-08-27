@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import hashlib
 import json
 import os
@@ -13,7 +14,10 @@ import sys
 import time
 import uuid
 
-from torturer_contract.functional.engine import FunctionalEngine
+from torturer_contract.functional.engine import (
+    FunctionalEngine,
+    capability_unavailable_reason,
+)
 from torturer_contract.functional.results import (
     EvidenceReference,
     RunProvenance,
@@ -146,29 +150,23 @@ def _select_scenarios(scenario_ids: list[str] | None) -> tuple:
 def _partition_applicable(
     scenarios,
     capabilities,
-    unavailable_reasons=None,
+    unavailable_reasons: object = None,
 ) -> tuple[tuple, list[dict[str, object]]]:
     available = frozenset(capabilities)
     applicable = []
     unsupported = []
     for scenario in scenarios:
-        missing = sorted(
-            capability.value
-            for capability in scenario.required_capabilities - available
-        )
-        if missing:
-            reason_code = "CAPABILITY_UNAVAILABLE"
-            if isinstance(unavailable_reasons, dict):
-                for capability in sorted(missing):
-                    candidate = unavailable_reasons.get(capability)
-                    if isinstance(candidate, str) and candidate:
-                        reason_code = candidate
-                        break
+        missing_capabilities = frozenset(scenario.required_capabilities - available)
+        missing = sorted(capability.value for capability in missing_capabilities)
+        if missing_capabilities:
             unsupported.append(
                 {
                     "scenario_id": scenario.id,
                     "missing_capabilities": missing,
-                    "reason_code": reason_code,
+                    "reason_code": capability_unavailable_reason(
+                        missing_capabilities,
+                        unavailable_reasons,
+                    ),
                 }
             )
         else:
@@ -197,24 +195,42 @@ def _expected_unavailable(values: list[str] | None) -> frozenset[tuple[str, str]
     return frozenset(pairs)
 
 
-def _unavailable_pairs(
+def _unavailable_pair_records(
     values: list[dict[str, object]],
     *,
     result_values: bool = False,
-) -> frozenset[tuple[str, str]]:
-    pairs: set[tuple[str, str]] = set()
+) -> tuple[list[tuple[str, str]], bool]:
+    """Return pairs and whether every record has a valid pair shape."""
+
+    pairs: list[tuple[str, str]] = []
+    valid = True
     for value in values:
+        if not isinstance(value, dict):
+            valid = False
+            pairs.append(("<invalid-scenario>", "<invalid-reason>"))
+            continue
         if result_values and value.get("outcome") != "unavailable":
             continue
         scenario_id = value.get("scenario_id")
         reason_code = value.get("reason_code")
-        if isinstance(scenario_id, str) and isinstance(reason_code, str):
-            pairs.add((scenario_id, reason_code))
+        if (
+            not isinstance(scenario_id, str)
+            or _SCENARIO_ID.fullmatch(scenario_id) is None
+            or not isinstance(reason_code, str)
+            or _REASON_CODE.fullmatch(reason_code) is None
+        ):
+            valid = False
+            pairs.append(("<invalid-scenario>", "<invalid-reason>"))
         else:
-            # Invalid result shape is still an unexpected unavailable item;
-            # it must not be hidden by a permissive comparison.
-            pairs.add(("<invalid-scenario>", "<invalid-reason>"))
-    return frozenset(pairs)
+            pairs.append((scenario_id, reason_code))
+    return pairs, valid
+
+
+def _pair_documents(pairs: list[tuple[str, str]]) -> list[dict[str, str]]:
+    return [
+        {"scenario_id": scenario_id, "reason_code": reason_code}
+        for scenario_id, reason_code in sorted(pairs)
+    ]
 
 
 def _coverage_contract(
@@ -223,44 +239,93 @@ def _coverage_contract(
     results: list[dict[str, object]],
     unsupported_scenarios: list[dict[str, object]],
     expected_unavailable: frozenset[tuple[str, str]],
+    *,
+    reset_count: int,
+    reset_failures: int,
 ) -> dict[str, object]:
-    expected_platform = EXPECTED_UNAVAILABLE_BY_PLATFORM[platform]
-    declared = _unavailable_pairs(unsupported_scenarios)
-    observed = _unavailable_pairs(results, result_values=True)
-    selected_ids = {scenario.id for scenario in selected_scenarios}
-    catalog_ids = {scenario.id for scenario in scenario_catalog()}
+    """Validate complete hosted coverage and return its release-report view."""
+
+    catalog_ids = [scenario.id for scenario in scenario_catalog()]
+    catalog_set = set(catalog_ids)
+    selected_ids = [scenario.id for scenario in selected_scenarios]
+    result_ids = [
+        item.get("scenario_id") if isinstance(item, dict) else None
+        for item in results
+    ]
     selected_catalog_match = (
-        len(selected_scenarios) == len(catalog_ids) and selected_ids == catalog_ids
+        len(selected_ids) == len(catalog_ids)
+        and len(set(selected_ids)) == len(catalog_ids)
+        and set(selected_ids) == catalog_set
     )
-    configured = expected_unavailable == expected_platform
-    reasons_match = declared == observed
-    expected_match = observed == expected_unavailable
+    valid_result_ids = [value for value in result_ids if isinstance(value, str)]
+    result_catalog_match = (
+        len(result_ids) == len(catalog_ids)
+        and len(valid_result_ids) == len(result_ids)
+        and len(set(valid_result_ids)) == len(catalog_ids)
+        and set(valid_result_ids) == catalog_set
+    )
+    result_outcomes_valid = all(
+        isinstance(item, dict)
+        and item.get("outcome") in {"passed", "unavailable"}
+        for item in results
+    )
+    failed_results = [
+        item for item in results
+        if isinstance(item, dict) and item.get("outcome") == "failed"
+    ]
+    declared_pairs, declared_valid = _unavailable_pair_records(unsupported_scenarios)
+    observed_pairs, observed_valid = _unavailable_pair_records(
+        results,
+        result_values=True,
+    )
+    declared_ids = [scenario_id for scenario_id, _ in declared_pairs]
+    observed_ids = [scenario_id for scenario_id, _ in observed_pairs]
+    expected_pairs = sorted(expected_unavailable)
+    declared_results_match = (
+        declared_valid
+        and observed_valid
+        and Counter(declared_pairs) == Counter(observed_pairs)
+        and Counter(declared_ids) == Counter(observed_ids)
+    )
+    actual_matches_allowlist = (
+        observed_valid
+        and Counter(observed_pairs) == Counter(expected_pairs)
+    )
+    configured = (
+        platform in EXPECTED_UNAVAILABLE_BY_PLATFORM
+        and expected_unavailable == EXPECTED_UNAVAILABLE_BY_PLATFORM[platform]
+    )
     status = (
         "supported-subset-with-expected-limitations"
-        if configured and reasons_match and expected_match and selected_catalog_match
+        if (
+            configured
+            and selected_catalog_match
+            and result_catalog_match
+            and result_outcomes_valid
+            and not failed_results
+            and declared_results_match
+            and actual_matches_allowlist
+            and reset_count == len(catalog_ids)
+            and reset_failures == 0
+        )
         else "coverage-contract-failed"
     )
     return {
         "status": status,
         "complete": False,
-        "catalog_scenario_count": len(scenario_catalog()),
-        "selected_scenario_count": len(selected_scenarios),
+        "catalog_scenario_count": len(catalog_ids),
+        "selected_scenario_count": len(selected_ids),
+        "result_scenario_count": len(result_ids),
         "selected_catalog_match": selected_catalog_match,
-        "expected_unavailable": [
-            {"scenario_id": scenario_id, "reason_code": reason_code}
-            for scenario_id, reason_code in sorted(expected_unavailable)
-        ],
-        "actual_unavailable": [
-            {"scenario_id": scenario_id, "reason_code": reason_code}
-            for scenario_id, reason_code in sorted(observed)
-        ],
-        "declared_unavailable": [
-            {"scenario_id": scenario_id, "reason_code": reason_code}
-            for scenario_id, reason_code in sorted(declared)
-        ],
+        "result_catalog_match": result_catalog_match,
+        "expected_unavailable": _pair_documents(expected_pairs),
+        "declared_unavailable": _pair_documents(declared_pairs),
+        "actual_unavailable": _pair_documents(observed_pairs),
         "configured_allowlist_matches_platform": configured,
-        "declared_results_match": reasons_match,
-        "actual_matches_allowlist": expected_match,
+        "declared_results_match": declared_results_match,
+        "actual_matches_allowlist": actual_matches_allowlist,
+        "reset_count": reset_count,
+        "reset_failures": reset_failures,
     }
 
 
@@ -386,21 +451,25 @@ def _qualification_exit_code(
     results: list[dict[str, object]],
     unsupported_scenarios: list[dict[str, object]],
     reset_failures: list[str],
-    expected_unavailable: frozenset[tuple[str, str]] = frozenset(),
+    *,
+    coverage: dict[str, object] | None = None,
 ) -> int:
-    """Allow only the exact reviewed unavailable set, never arbitrary gaps."""
-    failed = [item for item in results if item["outcome"] == "failed"]
-    unavailable = [item for item in results if item["outcome"] == "unavailable"]
-    declared = _unavailable_pairs(unsupported_scenarios)
-    observed = _unavailable_pairs(unavailable)
-    if (
-        failed
-        or reset_failures
-        or declared != observed
-        or observed != expected_unavailable
-    ):
+    """Fail qualification unless the reviewed platform coverage contract matches."""
+    failed = [
+        item for item in results
+        if isinstance(item, dict) and item.get("outcome") == "failed"
+    ]
+    unavailable = [
+        item for item in results
+        if isinstance(item, dict) and item.get("outcome") == "unavailable"
+    ]
+    if failed or reset_failures:
         return 2
-    return 0
+    if coverage is None:
+        # All platforms without an explicit reviewed exception retain the
+        # historical fail-closed behavior.
+        return 2 if unavailable or unsupported_scenarios else 0
+    return 0 if coverage.get("status") == "supported-subset-with-expected-limitations" else 2
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
@@ -604,6 +673,15 @@ def main(argv: list[str] | None = None) -> int:
             provenance,
             deadline=lane_deadline,
         )
+        coverage = _coverage_contract(
+            args.platform,
+            selected_scenarios,
+            results,
+            unsupported_scenarios,
+            expected_unavailable,
+            reset_count=reset_count,
+            reset_failures=len(reset_failures),
+        )
         document = {
             "schema": 2,
             "kind": "dobbyvpn.functional.hosted-run",
@@ -634,15 +712,6 @@ def main(argv: list[str] | None = None) -> int:
                 getattr(adapter.runner, "safe_evidence", lambda: ())()
             ),
         }
-        failed = [item for item in results if item["outcome"] == "failed"]
-        unavailable = [item for item in results if item["outcome"] == "unavailable"]
-        coverage = _coverage_contract(
-            args.platform,
-            selected_scenarios,
-            results,
-            unsupported_scenarios,
-            expected_unavailable,
-        )
         document["coverage"] = coverage
         _require_lane_time(
             lane_deadline,
@@ -655,6 +724,10 @@ def main(argv: list[str] | None = None) -> int:
         # retain the result and fail closed rather than reporting a late pass.
         if time.monotonic() > lane_deadline:
             raise ValueError("HOSTED_LANE_DEADLINE_EXCEEDED during result fsync")
+        failed = [item for item in results if item.get("outcome") == "failed"]
+        unavailable = [
+            item for item in results if item.get("outcome") == "unavailable"
+        ]
         print(
             f"hosted-functional platform={args.platform} scenarios={len(results)} "
             f"unsupported={len(unsupported_scenarios)} failed={len(failed)} "
@@ -665,8 +738,8 @@ def main(argv: list[str] | None = None) -> int:
             results,
             unsupported_scenarios,
             reset_failures,
-            expected_unavailable,
-        ) if coverage["status"] == "supported-subset-with-expected-limitations" else 2
+            coverage=coverage,
+        )
     except Exception as error:
         print(f"hosted-functional failed code={type(error).__name__}", file=sys.stderr)
         return 1

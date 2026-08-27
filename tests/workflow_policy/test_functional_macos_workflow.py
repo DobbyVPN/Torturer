@@ -116,6 +116,14 @@ class FunctionalMacOSWorkflowPolicyTest(unittest.TestCase):
         self.assertNotRegex(functional, r"--artifact(?:\s|=)")
         self.assertIn("--download-url \"https://proof.ovh.net/files/1Mb.dat\"", functional)
         self.assertNotIn("speed.cloudflare.com/__down?", functional)
+        self.assertIn("TORTURER_HOSTED_DEADLINE_EVIDENCE_DIR=", functional)
+        self.assertIn("TORTURER_HOSTED_DEADLINE_SUMMARY_PATH=", functional)
+        self.assertIn('>> "$GITHUB_ENV"', functional)
+        self.assertIn("--summary-output", functional)
+        self.assertIn("FUNCTIONAL_STATUS=", functional)
+        self.assertIn("timeout --foreground --signal=TERM --kill-after=1s 30s route -n get default", self.text)
+        self.assertIn("TMPDIR=", self.text[functional_start:])
+        self.assertIn("DOBBY_LOG_PATH=", self.text[functional_start:])
 
     def test_render_handoff_is_opaque_and_bound_to_macos_origin(self) -> None:
         self.assertIn("render-request-${lease_run_id}-${PLATFORM}", self.text)
@@ -130,14 +138,30 @@ class FunctionalMacOSWorkflowPolicyTest(unittest.TestCase):
 
     def test_cleanup_and_completion_are_unconditional(self) -> None:
         stop = self.text.index("- name: Stop exact macOS service")
+        retain = self.text.index("- name: Retain opaque macOS functional evidence")
+        restore = self.text.index("- name: Restore macOS default route")
+        failure_evidence = self.text.index("- name: Upload safe macOS failure evidence")
         result = self.text.index("- name: Upload safe macOS functional result")
         marker = self.text.index("- name: Publish opaque macOS completion marker")
         remove = self.text.index("- name: Remove plaintext handoff material")
+        self.assertLess(stop, retain)
+        self.assertLess(retain, restore)
+        self.assertLess(restore, failure_evidence)
+        self.assertLess(failure_evidence, result)
         self.assertIn("if: always()", self.text[stop:result])
         self.assertIn("if: always()", self.text[result:marker])
         self.assertIn("if: always()", self.text[marker:remove])
         self.assertIn("sudo -n kill -TERM", self.text[stop:result])
         self.assertIn("rm -f \"$HANDOFF_DIR/profile.toml\" \"$HANDOFF_DIR/recipient.key\"", self.text)
+        self.assertIn("if: always()", self.text[retain:restore])
+        self.assertIn("if: always()", self.text[failure_evidence:result])
+        upload = self.text[failure_evidence:result]
+        self.assertIn("macos-failure-evidence.json", upload)
+        self.assertIn("functional-deadline-summary.json", upload)
+        self.assertNotIn("service.raw.log", upload)
+        self.assertNotIn("hosted-command-raw", upload)
+        self.assertNotIn("profile.toml", upload)
+        self.assertNotIn("recipient.key", upload)
 
     def test_no_diagnostic_suppression(self) -> None:
         self.assertNotRegex(self.text, r">\s*/dev/null|2>\s*/dev/null|--quiet(?:\s|$)|SilentlyContinue")
@@ -153,6 +177,21 @@ class FunctionalMacOSWorkflowPolicyTest(unittest.TestCase):
         self.assertNotIn('| tee "$SERVICE_DIR/control-status.raw.log"', self.text)
         self.assertIn('ps -axo pid=,ppid=,command= > "$children_snapshot" 2>&1', self.text)
         self.assertIn('emit_private_evidence service-children "$children_snapshot"', self.text)
+
+    def test_route_recovery_is_explicit_and_fail_closed(self) -> None:
+        route = self.text[
+            self.text.index("- name: Restore macOS default route"):
+            self.text.index("- name: Upload safe macOS failure evidence")
+        ]
+        self.assertIn("torturer_checks.hosted.macos_route", route)
+        self.assertIn("--confirmation-file", route)
+        self.assertIn("--service-probe-file", route)
+        self.assertIn('"not in table"', route)
+        self.assertNotIn("reason=baseline-not-captured", route)
+        self.assertIn('restore_status=0', route)
+        self.assertIn('exit "$restore_status"', route)
+        self.assertIn('emit_private_evidence macos-restore-default-route', route)
+        self.assertIn('emit_private_evidence macos-service-death-probe', route)
 
 
 if __name__ == "__main__":

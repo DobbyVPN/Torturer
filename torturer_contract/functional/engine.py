@@ -40,16 +40,14 @@ class BulkScenarioAdapter(Protocol):
     def execute_scenario(self, scenario: ScenarioDefinition) -> Mapping[str, object]: ...
 
 
-def _unavailable_reason(adapter: ScenarioAdapter, missing: frozenset[Capability]) -> str:
-    """Return an adapter-owned reason for a proved hosted capability gap.
+EvidenceProvider = Callable[[], Sequence[EvidenceReference]]
 
-    The canonical engine still owns the unavailable outcome.  Adapters may
-    explain why a platform cannot perform one of the shared operations, but
-    they cannot turn that gap into a pass or remove the scenario from the
-    selected catalog.
-    """
 
-    reasons = getattr(adapter, "capability_unavailable_reasons", {})
+def capability_unavailable_reason(
+    missing: frozenset[Capability], reasons: object,
+) -> str:
+    """Return one stable adapter-owned reason for missing capabilities."""
+
     if isinstance(reasons, Mapping):
         for capability in sorted(missing, key=lambda value: value.value):
             reason = reasons.get(capability)
@@ -58,7 +56,13 @@ def _unavailable_reason(adapter: ScenarioAdapter, missing: frozenset[Capability]
     return "CAPABILITY_UNAVAILABLE"
 
 
-EvidenceProvider = Callable[[], Sequence[EvidenceReference]]
+def unavailable_reason(adapter: ScenarioAdapter, missing: frozenset[Capability]) -> str:
+    """Resolve an optional adapter explanation without changing the outcome."""
+
+    return capability_unavailable_reason(
+        missing,
+        getattr(adapter, "capability_unavailable_reasons", {}),
+    )
 
 
 @dataclass(frozen=True)
@@ -85,7 +89,7 @@ class FunctionalEngine:
                 scenario,
                 provenance,
                 outcome="unavailable",
-                reason_code=_unavailable_reason(adapter, missing),
+                reason_code=unavailable_reason(adapter, missing),
                 assertions=(),
                 cleanup={"required": False, "verified": True},
                 metrics={},
@@ -131,8 +135,9 @@ class FunctionalEngine:
                 scenario,
                 provenance,
                 outcome="unavailable",
-                reason_code=_unavailable_reason(
-                    adapter, scenario.required_capabilities - adapter.capabilities
+                reason_code=unavailable_reason(
+                    adapter,
+                    scenario.required_capabilities - adapter.capabilities,
                 ),
                 assertions=(),
                 cleanup={"required": False, "verified": True},
