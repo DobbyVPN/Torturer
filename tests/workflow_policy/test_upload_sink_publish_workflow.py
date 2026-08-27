@@ -13,7 +13,7 @@ EXPECTED_ACTIONS = {
     "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
     "actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16",
     "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f",
-    "docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435",
+    "docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e",
 }
 
 
