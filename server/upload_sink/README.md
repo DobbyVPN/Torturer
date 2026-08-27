@@ -5,7 +5,10 @@ passes HTTP to the container's injected `PORT`.
 
 The image runs as unprivileged UID `65532` in group `1000`. Render's
 `/etc/secrets` runtime mount uses that group for secret-file access; the sink
-needs it only to read the single generated upload path file.
+needs it only to read the single generated upload path file. Render may expose
+that fixed path through a provider-managed symlink; the sink follows the fixed
+path and validates the opened descriptor as a small regular file before
+reading it.
 
 The immutable-image workflow builds and exercises the container as
 `linux/amd64`, mounts a representative `/etc/secrets/upload-path`, performs
@@ -29,9 +32,8 @@ The container requires:
   `--path-file=/etc/secrets/upload-path` (the secret file contains that path).
 
 The default argument is part of the immutable image configuration. The Render
-service request does not rely on its separately stored `dockerCommand` field:
-Render accepted that field for a prebuilt image but started the image with an
-empty argument list during the live provider qualification.
+service request deliberately sends no separate `dockerCommand` override, so
+the published image and the provider use one startup contract.
 
 Operational gates for using the published image with Render:
 
