@@ -35,6 +35,12 @@ _SHA40 = set("0123456789abcdef")
 _MAX_LANE_SECONDS = 1_800
 _RESET_TIMEOUT_SECONDS = 5
 _OPAQUE_EVIDENCE_ID = re.compile(r"[a-z][0-9a-f]{31}\Z")
+# Android's first instrumentation process is cold-started on a freshly booted
+# emulator.  Keep a small, explicit command-cleanup reserve for that one
+# platform so the canonical configure window is spent on the product command;
+# process-tree cleanup remains bounded and still fails closed when it cannot
+# be proven.  Desktop lanes retain the ordinary five-second reserve.
+_ANDROID_COMMAND_CLEANUP_RESERVE_SECONDS = 1.0
 
 
 def _full_sha(value: str, name: str) -> str:
@@ -388,11 +394,21 @@ def main(argv: list[str] | None = None) -> int:
         candidate_closure_sha = closure_sha256(candidate_manifest)
         if candidate_closure_sha == candidate_manifest_sha:
             raise ValueError("candidate closure and manifest digests unexpectedly collide")
+        command_cleanup_reserve = (
+            _ANDROID_COMMAND_CLEANUP_RESERVE_SECONDS
+            if args.platform == "android"
+            else None
+        )
+        runner = (
+            SubprocessRunner(raw_dir, cleanup_reserve_seconds=command_cleanup_reserve)
+            if command_cleanup_reserve is not None
+            else SubprocessRunner(raw_dir)
+        )
         adapter = adapter_for_platform(
             args.platform,
             cli=args.cli,
             profile=args.profile,
-            runner=SubprocessRunner(raw_dir),
+            runner=runner,
             adb=args.adb,
             source_sha=source_sha,
             identity_url=args.identity_url,

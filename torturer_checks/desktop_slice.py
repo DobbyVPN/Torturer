@@ -474,7 +474,7 @@ def _wait_for_process_tree(
         tracked.update(
             _proc_descendants(process.pid, process=process, deadline=deadline)
         )
-        if os.name == "nt" and not getattr(process, "_torturer_tree_census_observed", False):
+        if not getattr(process, "_torturer_tree_census_observed", True):
             return False
         leader_gone = process.poll() is not None
         if leader_gone and not _process_group_alive(process) and not any(
@@ -852,6 +852,9 @@ def run_command(
         if finalization_errors:
             process_tree_proven = False
             cleanup_diagnostics.extend(finalization_errors)
+    tree_diagnostics = getattr(process, "_torturer_tree_census_diagnostics", b"")
+    if tree_diagnostics:
+        stderr += b"\n--- process-tree-census-diagnostics ---\n" + tree_diagnostics
     elapsed_seconds = time.monotonic() - started_at
     deadline_exceeded = elapsed_seconds > timeout_seconds
     if deadline_exceeded:
