@@ -686,7 +686,7 @@ jobs:
 
           raw_dir = Path(sys.argv[1])
           output = Path(sys.argv[2])
-          files = sorted(raw_dir.glob("*.raw.log")) if raw_dir.is_dir() else []
+          files = sorted(raw_dir.glob("command-*.raw.log")) if raw_dir.is_dir() else []
 
           def section(payload: bytes, name: str) -> bytes:
               match = re.search(
