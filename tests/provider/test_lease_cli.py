@@ -159,10 +159,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                     {"outline", "upload-sink"},
                 )
                 self.assertNotIn("lease.example.onrender.com", json.dumps(lease))
-                self.assertEqual(
-                    FakeAcquireAPI.specs[0].docker_command,
-                    "/outline-ss-server -config=/etc/secrets/config.yml",
-                )
+                self.assertFalse(hasattr(FakeAcquireAPI.specs[0], "docker_command"))
                 self.assertRegex(
                     (root / "upload-url.txt").read_text(encoding="utf-8").strip(),
                     r"^https://sink\.example\.onrender\.com/upload/[0-9a-f]{32}$",
@@ -307,7 +304,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                 self.assertRegex(upload_url, r"^https://sink\.example\.onrender\.com/upload/[0-9a-f]{32}$")
                 self.assertEqual((root / "upload-url.txt").stat().st_mode & 0o777, 0o600)
                 self.assertEqual(FakeAcquireAPI.specs[1].health_check_path, "/healthz")
-                self.assertEqual(FakeAcquireAPI.specs[1].docker_command, lease_cli._UPLOAD_SINK_COMMAND)
+                self.assertFalse(hasattr(FakeAcquireAPI.specs[1], "docker_command"))
                 self.assertRegex(FakeAcquireAPI.specs[1].secret_files[0][1], r"^/upload/[0-9a-f]{32}$")
         finally:
             lease_cli.RenderAPI = original
@@ -1030,6 +1027,40 @@ class LeaseCLIContractTests(unittest.TestCase):
                 self.assertNotIn(secret, stderr.getvalue())
         finally:
             lease_cli.RenderAPI = original
+
+    def test_acquire_cli_persists_a_strict_safe_failure_code(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="lease-cli-safe-result-") as directory:
+            root = Path(directory)
+            safe_result = root / "acquire-result.json"
+            stderr = io.StringIO()
+            with mock.patch.object(
+                lease_cli,
+                "acquire",
+                side_effect=RenderAPIError("DEPLOY_FAILED"),
+            ), contextlib.redirect_stderr(stderr):
+                result = lease_cli.main([
+                    "acquire",
+                    "--request", str(root / "request.json"),
+                    "--owner-id", "tea-owner123",
+                    "--image-owner-id", "tea-owner123",
+                    "--image-path", "ghcr.io/dobbyvpn/outline@sha256:" + "a" * 64,
+                    "--expected-image-digest", "sha256:" + "a" * 64,
+                    "--profile-output", str(root / "profile.toml"),
+                    "--lease-output", str(root / "lease.json"),
+                    "--journal", str(root / "journal.json"),
+                    "--safe-result-output", str(safe_result),
+                ])
+            self.assertEqual(result, 1)
+            self.assertIn("render-lease failed code=DEPLOY_FAILED", stderr.getvalue())
+            value = json.loads(safe_result.read_text(encoding="utf-8"))
+            self.assertEqual(value, {
+                "schema": 1,
+                "kind": "dobbyvpn.render-lease-command-result",
+                "command": "acquire",
+                "status": "failed",
+                "code": "DEPLOY_FAILED",
+            })
+            self.assertEqual(safe_result.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

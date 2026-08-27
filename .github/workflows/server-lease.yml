@@ -418,6 +418,7 @@ jobs:
             --expected-image-digest "$RENDER_IMAGE_DIGEST" \
             --profile-output "$LEASE_DIR/profile.toml" \
             --lease-output "$LEASE_DIR/lease.json" \
+            --safe-result-output "$LEASE_DIR/acquire-result.json" \
             --journal "$LEASE_DIR/journal.json" \
             --region "$RENDER_REGION" \
             --timeout-seconds "$readiness_timeout" \
@@ -488,6 +489,50 @@ jobs:
           if any(token in json.dumps(value).lower() for token in ("url", "path", "password", "secret")):
               raise SystemExit("safe lease record contains private handoff data")
           print("lease_identity=validated")
+          PY
+
+      - name: Report safe Render acquisition result
+        if: always()
+        run: |
+          set -euo pipefail
+          result="$LEASE_DIR/acquire-result.json"
+          if [ ! -f "$result" ]; then
+            printf '%s\n' 'render_acquisition status=failed code=SAFE_RESULT_MISSING' >&2
+            exit 1
+          fi
+          python3 - "$result" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
+              raise SystemExit("safe acquisition result is not owner-only")
+          value = json.loads(path.read_text(encoding="utf-8"))
+          expected = {
+              "schema": 1,
+              "kind": "dobbyvpn.render-lease-command-result",
+              "command": "acquire",
+          }
+          if not isinstance(value, dict) or set(value) != set(expected) | {"status", "code"}:
+              raise SystemExit("safe acquisition result has an invalid shape")
+          for key, wanted in expected.items():
+              if value.get(key) != wanted:
+                  raise SystemExit(f"safe acquisition result field {key} is invalid")
+          status = value.get("status")
+          code = value.get("code")
+          if status not in {"completed", "failed"}:
+              raise SystemExit("safe acquisition result status is invalid")
+          if not isinstance(code, str) or re.fullmatch(r"[A-Z][A-Z0-9_]{1,127}", code) is None:
+              raise SystemExit("safe acquisition result code is invalid")
+          if status == "completed" and code != "OK":
+              raise SystemExit("completed acquisition result code is invalid")
+          if status == "failed" and code == "OK":
+              raise SystemExit("failed acquisition result code is invalid")
+          print(f"render_acquisition status={status} code={code}")
+          if status == "failed":
+              raise SystemExit(1)
           PY
 
       - name: Encrypt and publish the profile and upload handoffs
@@ -674,5 +719,6 @@ jobs:
           path: |
             ${{ env.LEASE_DIR }}/lease.json
             ${{ env.LEASE_DIR }}/journal.json
+            ${{ env.LEASE_DIR }}/acquire-result.json
           if-no-files-found: warn
           retention-days: 1

@@ -139,7 +139,6 @@ class RenderServiceSpec:
     # functional adapter rather than a fabricated HTTP health path.
     health_check_path: str | None = None
     secret_files: tuple[tuple[str, str], ...] = ()
-    docker_command: str | None = None
 
     def __post_init__(self) -> None:
         _require(self.owner_id, _OWNER_ID, "owner_id")
@@ -168,11 +167,6 @@ class RenderServiceSpec:
             seen_names.add(name)
             if not isinstance(content, str) or not content or "\x00" in content:
                 raise ValueError("secret file content must be non-empty text")
-        if self.docker_command is not None:
-            if not isinstance(self.docker_command, str) or not self.docker_command or "\x00" in self.docker_command:
-                raise ValueError("docker_command must be non-empty text")
-            if any(character in self.docker_command for character in "\r\n"):
-                raise ValueError("docker_command must be one line")
 
     def payload(self) -> dict[str, object]:
         """Build the image-backed, one-instance, no-autodeploy request."""
@@ -185,8 +179,6 @@ class RenderServiceSpec:
         }
         if self.health_check_path is not None:
             service_details["healthCheckPath"] = self.health_check_path
-        if self.docker_command is not None:
-            service_details["envSpecificDetails"] = {"dockerCommand": self.docker_command}
         payload: dict[str, object] = {
             "type": "web_service",
             "name": self.name,
