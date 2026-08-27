@@ -301,6 +301,7 @@ def _proc_descendants(
 
     parent_by_pid: dict[int, int] = {}
     reliable = True
+    census_diagnostics = bytearray()
     if os.name == "nt":
         try:
             from torturer_checks.hosted.cli import _process_snapshot
@@ -315,16 +316,31 @@ def _proc_descendants(
     else:
         proc_root = Path("/proc")
         if proc_root.is_dir():
-            for entry in proc_root.iterdir():
-                if not entry.name.isdigit():
-                    continue
-                try:
-                    stat_line = (entry / "stat").read_text(encoding="ascii")
-                    close = stat_line.rfind(")")
-                    fields = stat_line[close + 2 :].split()
-                    parent_by_pid[int(entry.name)] = int(fields[1])
-                except (OSError, ValueError, IndexError):
-                    continue
+            try:
+                for entry in proc_root.iterdir():
+                    if not entry.name.isdigit():
+                        continue
+                    try:
+                        stat_line = (entry / "stat").read_text(encoding="ascii")
+                        close = stat_line.rfind(")")
+                        fields = stat_line[close + 2 :].split()
+                        parent_by_pid[int(entry.name)] = int(fields[1])
+                    except FileNotFoundError:
+                        continue
+                    except (OSError, UnicodeError, ValueError, IndexError) as error:
+                        reliable = False
+                        census_diagnostics.extend(
+                            f"procfs-census-entry={entry.name} error={error!r}\n".encode(
+                                "utf-8", errors="replace"
+                            )
+                        )
+            except OSError as error:
+                reliable = False
+                census_diagnostics.extend(
+                    f"procfs-census-iteration-error={error!r}\n".encode(
+                        "utf-8", errors="replace"
+                    )
+                )
         else:
             try:
                 ps_timeout = 2.0
@@ -332,25 +348,76 @@ def _proc_descendants(
                     ps_timeout = max(0.0, min(ps_timeout, deadline - time.monotonic()))
                 if ps_timeout <= 0:
                     raise subprocess.TimeoutExpired(["ps"], 0.0)
-                listing = subprocess.run(
+                completed = subprocess.run(
                     ["ps", "-axo", "pid=,ppid="],
                     check=False,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     timeout=ps_timeout,
-                ).stdout.decode("ascii", errors="ignore")
-            except (OSError, subprocess.TimeoutExpired):
+                )
+                listing_bytes = getattr(completed, "stdout", b"") or b""
+                listing = listing_bytes.decode("ascii", errors="ignore")
+                ps_stderr = getattr(completed, "stderr", b"") or b""
+                ps_returncode = getattr(completed, "returncode", 0)
+                if ps_returncode != 0 or ps_stderr:
+                    reliable = False
+                    census_diagnostics.extend(
+                        b"ps-census-returncode="
+                        + str(ps_returncode).encode("ascii", errors="replace")
+                        + b"\nps-census-stdout-start\n"
+                        + listing_bytes
+                        + b"\nps-census-stdout-finish\nps-census-stderr-start\n"
+                        + (
+                            ps_stderr
+                            if isinstance(ps_stderr, bytes)
+                            else str(ps_stderr).encode("utf-8", errors="replace")
+                        )
+                        + b"\nps-census-stderr-finish\n"
+                    )
+            except subprocess.TimeoutExpired as error:
                 listing = ""
                 reliable = False
+                census_diagnostics.extend(
+                    b"ps-census-timeout\nstdout-start\n"
+                    + _timeout_bytes(error, "output")
+                    + b"\nstdout-finish\nstderr-start\n"
+                    + _timeout_bytes(error, "stderr")
+                    + b"\nstderr-finish\n"
+                )
+            except OSError as error:
+                listing = ""
+                reliable = False
+                census_diagnostics.extend(
+                    f"ps-census-launch-error={error!r}\n".encode(
+                        "utf-8", errors="replace"
+                    )
+                )
             for line in listing.splitlines():
                 fields = line.split()
                 if len(fields) == 2:
                     try:
                         parent_by_pid[int(fields[0])] = int(fields[1])
                     except ValueError:
-                        continue
-    if process is not None and os.name == "nt":
+                        reliable = False
+                        census_diagnostics.extend(
+                            f"ps-census-malformed-line={line!r}\n".encode(
+                                "utf-8", errors="replace"
+                            )
+                        )
+                elif line.strip():
+                    reliable = False
+                    census_diagnostics.extend(
+                        f"ps-census-malformed-line={line!r}\n".encode(
+                            "utf-8", errors="replace"
+                        )
+                    )
+    if process is not None:
         process._torturer_tree_census_observed = reliable  # type: ignore[attr-defined]
+        if census_diagnostics:
+            prior = getattr(process, "_torturer_tree_census_diagnostics", b"")
+            process._torturer_tree_census_diagnostics = (  # type: ignore[attr-defined]
+                prior + bytes(census_diagnostics)
+            )
     descendants: set[int] = set()
     frontier = [root_pid]
     while frontier:
@@ -393,7 +460,7 @@ def _wait_for_tree(process: subprocess.Popen[bytes], tracked: set[int], timeout:
         tracked.update(
             _proc_descendants(process.pid, process=process, deadline=deadline)
         )
-        if os.name == "nt" and not getattr(process, "_torturer_tree_census_observed", False):
+        if not getattr(process, "_torturer_tree_census_observed", True):
             return False
         if process.poll() is not None and not _process_group_alive(process):
             if not any(_pid_alive(pid) for pid in tracked if pid != process.pid):
@@ -783,6 +850,9 @@ def run_bounded_preflight(
         if finalization_errors:
             process_tree_proven = False
             cleanup_errors.extend(finalization_errors)
+    tree_diagnostics = getattr(process, "_torturer_tree_census_diagnostics", b"")
+    if tree_diagnostics:
+        stderr += b"\n--- process-tree-census-diagnostics ---\n" + tree_diagnostics
     elapsed_seconds = time.monotonic() - started_at
     deadline_exceeded = elapsed_seconds > timeout_seconds
     if deadline_exceeded:

@@ -155,7 +155,7 @@ class AndroidHostedAdapter:
     """Run canonical scenarios through DobbyVPN Android instrumentation."""
 
     adapter_id = "hosted-android-app"
-    adapter_version = "v4"
+    adapter_version = "v5"
 
     def __init__(
         self,

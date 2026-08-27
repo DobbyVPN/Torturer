@@ -638,6 +638,51 @@ jobs:
           fi
           printf 'service_ready_for_functional_run=true\n'
 
+      - name: Capture macOS default route baseline before VPN start
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          emit_private_evidence() {
+            label="$1"
+            file="$2"
+            if [ -f "$file" ]; then
+              bytes="$(wc -c < "$file" | tr -d '[:space:]')"
+              digest="$(sha256sum "$file" | awk '{print $1}')"
+              evidence_id="$(printf '%s:%s' "$GITHUB_RUN_ID" "$label" | sha256sum | cut -c1-16)"
+              printf 'diagnostic_evidence label=%s id=%s bytes=%s sha256=%s\n' \
+                "$label" "$evidence_id" "$bytes" "$digest"
+            else
+              printf 'diagnostic_evidence label=%s state=missing\n' "$label"
+            fi
+          }
+          baseline="$DIAGNOSTIC_DIR/baseline-default-route.raw.log"
+          baseline_status=0
+          route -n get default > "$baseline" 2>&1 || baseline_status=$?
+          emit_private_evidence macos-baseline-default-route "$baseline"
+          test "$baseline_status" -eq 0
+          baseline_gateway="$(awk -F: '
+            { key=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+              if (key == "gateway") { value=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value; exit }
+            }
+          ' "$baseline")"
+          baseline_iface="$(awk -F: '
+            { key=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+              if (key == "interface") { value=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value; exit }
+            }
+          ' "$baseline")"
+          baseline_flags="$(awk -F: '
+            { key=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+              if (key == "flags") { value=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value; exit }
+            }
+          ' "$baseline")"
+          case "$baseline_gateway" in ""|*[!A-Za-z0-9.:#_-]*) printf 'invalid baseline route gateway\n' >&2; exit 1;; esac
+          case "$baseline_iface" in ""|*[!A-Za-z0-9._-]*) printf 'invalid baseline route interface\n' >&2; exit 1;; esac
+          case "$baseline_flags" in *[!A-Za-z0-9_,\<\>[:space:]-]*) printf 'invalid baseline route flags\n' >&2; exit 1;; esac
+          printf 'MACOS_BASELINE_DEFAULT_GATEWAY=%s\nMACOS_BASELINE_DEFAULT_INTERFACE=%s\nMACOS_BASELINE_DEFAULT_FLAGS=%s\n' \
+            "$baseline_gateway" "$baseline_iface" "$baseline_flags" >> "$GITHUB_ENV"
+          printf 'macos_baseline_default_route=captured interface=%s\n' "$baseline_iface"
+
       - name: Run canonical macOS functional scenarios
         id: functional
         shell: bash
@@ -710,6 +755,99 @@ jobs:
           else
             printf 'candidate service was not running at cleanup\n'
           fi
+
+      - name: Restore macOS default route before evidence upload
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          emit_private_evidence() {
+            label="$1"
+            file="$2"
+            if [ -f "$file" ]; then
+              bytes="$(wc -c < "$file" | tr -d '[:space:]')"
+              digest="$(sha256sum "$file" | awk '{print $1}')"
+              evidence_id="$(printf '%s:%s' "$GITHUB_RUN_ID" "$label" | sha256sum | cut -c1-16)"
+              printf 'diagnostic_evidence label=%s id=%s bytes=%s sha256=%s\n' \
+                "$label" "$evidence_id" "$bytes" "$digest"
+            else
+              printf 'diagnostic_evidence label=%s state=missing\n' "$label"
+            fi
+          }
+          baseline_gateway="${MACOS_BASELINE_DEFAULT_GATEWAY:-}"
+          baseline_iface="${MACOS_BASELINE_DEFAULT_INTERFACE:-}"
+          baseline_flags="${MACOS_BASELINE_DEFAULT_FLAGS:-}"
+          if [ -z "$baseline_gateway" ] || [ -z "$baseline_iface" ]; then
+            printf 'macos_default_route_restore=skipped reason=baseline-not-captured\n'
+            exit 0
+          fi
+          case "$baseline_gateway" in ""|*[!A-Za-z0-9.:#_-]*) printf 'missing or invalid macOS route baseline gateway\n' >&2; exit 1;; esac
+          case "$baseline_iface" in ""|*[!A-Za-z0-9._-]*) printf 'missing or invalid macOS route baseline interface\n' >&2; exit 1;; esac
+          case "$baseline_flags" in *[!A-Za-z0-9_,\<\>[:space:]-]*) printf 'invalid macOS route baseline flags\n' >&2; exit 1;; esac
+          service_pid="${SERVICE_PID:-}"
+          if [ -f "${SERVICE_PID_FILE:-}" ]; then service_pid="$(cat "$SERVICE_PID_FILE")"; fi
+          case "$service_pid" in ""|*[!0-9]*) printf 'missing or invalid macOS service pid during route cleanup\n' >&2; exit 1;; esac
+          if sudo -n kill -0 "$service_pid"; then
+            printf 'macos_default_route_restore=refused reason=service-still-running pid=%s\n' "$service_pid" >&2
+            exit 1
+          fi
+
+          current="$DIAGNOSTIC_DIR/post-functional-default-route.raw.log"
+          current_status=0
+          route -n get default > "$current" 2>&1 || current_status=$?
+          emit_private_evidence macos-post-functional-default-route "$current"
+          if [ "$current_status" -ne 0 ]; then
+            printf 'macos_default_route_restore=failed stage=inspect status=%s\n' "$current_status" >&2
+            exit "$current_status"
+          fi
+          current_iface="$(awk -F: '
+            { key=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+              if (key == "interface") { value=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value; exit }
+            }
+          ' "$current")"
+          case "$current_iface" in ""|*[!A-Za-z0-9._-]*) printf 'invalid post-functional route interface\n' >&2; exit 1;; esac
+          if [ "$current_iface" = "$baseline_iface" ]; then
+            printf 'macos_default_route_restore=not-needed interface=%s\n' "$current_iface"
+          else
+            case "$current_iface" in
+              utun[0-9]*) ;;
+              *) printf 'macos_default_route_restore=refused baseline_interface=%s current_interface=%s\n' "$baseline_iface" "$current_iface" >&2; exit 1;;
+            esac
+            restore="$DIAGNOSTIC_DIR/restore-default-route.raw.log"
+            restore_status=0
+            if [[ "$baseline_gateway" == link\#* ]]; then
+              sudo -n route -n change default -interface "$baseline_iface" > "$restore" 2>&1 || restore_status=$?
+            elif [[ "$baseline_flags" == *IFSCOPE* ]]; then
+              sudo -n route -n change default "$baseline_gateway" -ifscope "$baseline_iface" > "$restore" 2>&1 || restore_status=$?
+            else
+              sudo -n route -n change default "$baseline_gateway" > "$restore" 2>&1 || restore_status=$?
+            fi
+            emit_private_evidence macos-restore-default-route "$restore"
+            if [ "$restore_status" -ne 0 ]; then
+              printf 'macos_default_route_restore=failed stage=change status=%s\n' "$restore_status" >&2
+              exit "$restore_status"
+            fi
+          fi
+          verified="$DIAGNOSTIC_DIR/verified-default-route.raw.log"
+          verified_status=0
+          route -n get default > "$verified" 2>&1 || verified_status=$?
+          emit_private_evidence macos-verified-default-route "$verified"
+          if [ "$verified_status" -ne 0 ]; then
+            printf 'macos_default_route_restore=failed stage=verify status=%s\n' "$verified_status" >&2
+            exit "$verified_status"
+          fi
+          verified_iface="$(awk -F: '
+            { key=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+              if (key == "interface") { value=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value; exit }
+            }
+          ' "$verified")"
+          if [ "$verified_iface" != "$baseline_iface" ]; then
+            printf 'macos_default_route_restore=failed stage=verify expected_interface=%s actual_interface=%s\n' \
+              "$baseline_iface" "$verified_iface" >&2
+            exit 1
+          fi
+          printf 'macos_default_route_restore=verified interface=%s\n' "$verified_iface"
 
       - name: Upload safe macOS functional result
         if: always()
