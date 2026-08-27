@@ -159,13 +159,14 @@ WebSocket connection is the functional readiness check. The module's unit
 contract is tested locally, but no live provider run is claimed by this public
 contract until the trusted lease workflow and account eligibility are proven.
 
-The cross-job profile handoff uses an ephemeral recipient certificate and
-OpenSSL CMS `-aes-256-gcm` argument vectors. The platform job keeps its private
-key and plaintext profile owner-only; the trusted lease job encrypts the
-profile to the public certificate and publishes only the ciphertext under an
-opaque run/platform artifact name. Command construction rejects shell-style
-interpolation and file collisions. The handoff helper is a contract boundary,
-not permission to publish a plaintext profile or to expose the Render token.
+The cross-job profile and upload handoffs use an ephemeral recipient
+certificate and OpenSSL CMS `-aes-256-gcm` argument vectors. The platform job
+keeps its private key and plaintext values owner-only; the trusted lease job
+encrypts both values to the public certificate and publishes only ciphertext
+under an opaque run/platform artifact name. Command construction rejects
+shell-style interpolation and file collisions. The handoff helper is a
+contract boundary, not permission to publish plaintext values or to expose the
+Render token.
 
 ## Android profile-observation seam
 
@@ -334,14 +335,24 @@ than being produced after its evidence references are frozen.
 `python3 -m torturer_provider.lease_cli acquire` and `cleanup` are trusted
 provider operations, not public candidate steps. The request contains only an
 opaque run ID, platform, and immutable image digest. Acquisition creates one
-random WSS profile and tagged service, writes the plaintext TOML profile only
-to owner-only storage, and emits an opaque lease record. Cleanup is idempotent
-and independently verifies the exact service is absent. Render credentials are
-read only from the protected workflow environment. For the selected Outline
-image, the trusted request sets the complete Render Docker command to
-`/outline-ss-server -config=/etc/secrets/config.yml`. Render's override is a
-complete start command, not additional arguments for the image ENTRYPOINT. The
-secret file is never baked into the image or emitted in a result.
+schema-2 bundle containing a random WSS profile backed by a tagged Outline
+service and a separately pinned HTTPS upload-sink service for every hosted
+platform. The bundle binds each role to its exact service ID and image digest,
+and generates a fresh 128-bit upload path. The sink accepts only its health
+path and that bounded random POST path; it does not persist or log request
+bodies. The plaintext TOML profile and upload URL are written only to
+owner-only storage; the URL crosses the trusted workflow boundary only as
+encrypted `upload.cms`, while the safe lease record contains no URL or path.
+Cleanup is idempotent, independently deletes and verifies both exact service
+IDs, and fails closed on missing, duplicate, or conflicting role identity.
+Schema 1 is retained solely so old single-service journals can be cleaned up;
+new acquisition never emits it. Render credentials are read only from the
+protected workflow environment. For the selected Outline image, the trusted
+request sets the complete Render Docker command to
+`/outline-ss-server -config=/etc/secrets/config.yml`; the upload sink uses
+`/upload-sink --path-file=/etc/secrets/upload-path`. Render's
+override is a complete start command, not additional arguments for the image
+ENTRYPOINT. Secret files are never baked into an image or emitted in a result.
 
 The four manual functional workflows target Linux, Windows, macOS, and Android.
 Each uses a secretless source-build job, a trusted client job with read-only
@@ -351,8 +362,16 @@ dispatch. The controller binds the origin run ID, attempt, exact Torturer
 acquire a service. The client verifies the exact allow-listed candidate closure
 and platform readiness before publishing its request. GitHub token-bearing
 operations finish before untrusted candidate execution. The client receives
-only the encrypted profile handoff, never the Render credential or a
-write-capable repository token.
+only the encrypted profile and upload handoffs, never the Render credential or
+a write-capable repository token. Legacy schema-1 cleanup records do not create
+a new upload handoff.
+
+Full hosted qualification dispatches the four platform leases sequentially.
+The unattended controller dispatches the next platform only after the preceding
+platform's two Render services have been deleted and their absence has been
+independently verified. The fixed account-wide concurrency group on
+`server-lease.yml` is an admission guard against overlapping leases, not a
+matrix queue; sequencing remains an explicit controller responsibility.
 
 Every platform deadline is measured from the workflow run start and ends after
 at most 30 minutes, including build, readiness, lease coordination, scenarios,
@@ -365,14 +384,16 @@ subprocess but inside the same 30-minute deadline. This rule also applies to
 the trusted `server-lease.yml` provider controller: its Render acquisition,
 completion-marker wait, diagnostic output, encrypted handoff, deletion, exact
 absence proof, and safe journal publication all share one 30-minute job bound.
-The controller reserves 120 seconds for finalization and refuses to start or
+The controller reserves 680 seconds for finalization and refuses to start or
 continue work once that reserve is reached; it has no longer provider-job
 exception or separate 40-minute allowance. The reserve is partitioned into a
-44-second provider cleanup budget, its 1-second termination grace, a 4-second
+600-second provider cleanup budget, its 1-second termination grace, a 4-second
 plaintext removal budget, its 1-second termination grace, a 60-second safe
 journal upload budget, and 10 seconds of bounded finalization overhead. Their
-sum is exactly 120 seconds and is enforced by workflow policy tests; the outer
-job timeout is not the cleanup mechanism.
+sum is 676 seconds and is enforced by workflow policy tests; the outer job
+timeout is not the cleanup mechanism. The provider budget covers the bounded
+worst-case two-service stale-absence repair path: eight Render API calls at
+61.5 seconds each, including the configured retries and backoff.
 
 Linux, Windows, and macOS start the exact source-built product service and drive
 the public CLI. Their workflows provide the exact service PID, binary, control

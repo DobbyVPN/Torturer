@@ -113,6 +113,7 @@ jobs:
       PLATFORM: linux
       TORTURER_SHA: ${{ github.sha }}
       SERVER_IMAGE_DIGEST: ${{ vars.RENDER_IMAGE_DIGEST }}
+      SERVER_SINK_IMAGE_DIGEST: ${{ vars.RENDER_SINK_IMAGE_DIGEST }}
 
     steps:
       - name: Establish runner-local paths
@@ -143,6 +144,11 @@ jobs:
               raise SystemExit("RENDER_IMAGE_DIGEST must be an immutable SHA-256 digest")
           if set(image_digest.removeprefix("sha256:")) == {"0"}:
               raise SystemExit("RENDER_IMAGE_DIGEST must not be all zeroes")
+          sink_digest = os.environ["SERVER_SINK_IMAGE_DIGEST"]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", sink_digest):
+              raise SystemExit("RENDER_SINK_IMAGE_DIGEST must be an immutable SHA-256 digest")
+          if set(sink_digest.removeprefix("sha256:")) == {"0"}:
+              raise SystemExit("RENDER_SINK_IMAGE_DIGEST must not be all zeroes")
           print(f"source_repository={repository}")
           print(f"source_sha={source_sha}")
           print(f"platform={os.environ['PLATFORM']}")
@@ -233,6 +239,8 @@ jobs:
               raise SystemExit("workflow run identity mismatch")
           started = datetime.datetime.fromisoformat(run["run_started_at"].replace("Z", "+00:00"))
           deadline = int(started.timestamp()) + 30 * 60
+          if int(datetime.datetime.now(datetime.timezone.utc).timestamp()) >= deadline:
+              raise SystemExit("workflow already exceeded its hard thirty-minute deadline")
           with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as output:
               output.write(f"RUN_DEADLINE_EPOCH={deadline}\n")
           print(f"run_deadline_epoch={deadline}")
@@ -330,6 +338,12 @@ jobs:
               raise SystemExit("lease workflow repository mismatch")
           print("lease_workflow_run=validated")
           PY
+              transfer_timeout=30
+              if [ "$transfer_timeout" -gt "$api_remaining" ]; then transfer_timeout="$api_remaining"; fi
+              if [ "$transfer_timeout" -le 0 ]; then
+                printf 'lease response transfer reached the cleanup reserve: remaining=%s\n' "$api_remaining" >&2
+                break
+              fi
               if PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.artifacts \
                 --repository "$GITHUB_REPOSITORY" \
                 --artifact-name "$response_name" \
@@ -337,8 +351,10 @@ jobs:
                 --output-dir "$attempt_dir/unpacked" \
                 --metadata "$attempt_dir/artifacts.json" \
                 --archive "$attempt_dir/response.zip" \
+                --timeout-seconds "$transfer_timeout" \
                 --expect-file lease.json \
-                --expect-file profile.cms
+                --expect-file profile.cms \
+                --expect-file upload.cms
               then
                 printf 'LEASE_RESPONSE_DIR=%s\n' "$attempt_dir/unpacked" >> "$GITHUB_ENV"
                 found=true
@@ -362,6 +378,7 @@ jobs:
           test -n "${LEASE_RESPONSE_DIR:-}"
           test -f "$LEASE_RESPONSE_DIR/lease.json"
           test -f "$LEASE_RESPONSE_DIR/profile.cms"
+          test -f "$LEASE_RESPONSE_DIR/upload.cms"
           python3 - "$LEASE_RESPONSE_DIR/lease.json" <<'PY'
           import json
           import os
@@ -371,22 +388,52 @@ jobs:
 
           value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           expected = {
-              "schema": 1,
+              "schema": 2,
               "kind": "dobbyvpn.render-lease",
-             "run_id": os.environ["LEASE_RUN_ID"],
-             "platform": "linux",
+              "run_id": os.environ["LEASE_RUN_ID"],
+              "platform": "linux",
               "source_sha": os.environ["SOURCE_SHA"],
-             "image_digest": os.environ["SERVER_IMAGE_DIGEST"],
               "state": "issued",
           }
+          expected_keys = set(expected) | {"services"}
+          if set(value) != expected_keys:
+              raise SystemExit("Linux safe lease record has an unsafe shape")
           for key, wanted in expected.items():
               if value.get(key) != wanted:
                   raise SystemExit(f"lease field {key} is invalid")
-          if not re.fullmatch(r"srv-[A-Za-z0-9][A-Za-z0-9_-]{1,99}", str(value.get("service_id"))):
-              raise SystemExit("lease service id is invalid")
+          services = value.get("services")
+          if not isinstance(services, list) or len(services) != 2:
+              raise SystemExit("Linux lease service bundle is invalid")
+          roles = {service.get("role") for service in services if isinstance(service, dict)}
+          if roles != {"outline", "upload-sink"}:
+              raise SystemExit("Linux lease service roles are invalid")
+          service_ids = set()
+          services_by_role = {}
+          for service in services:
+              if not isinstance(service, dict) or set(service) != {"role", "service_id", "image_digest", "provider_generation"}:
+                  raise SystemExit("Linux lease service shape is invalid")
+              if not isinstance(service["role"], str) or service["role"] in services_by_role:
+                  raise SystemExit("Linux lease service roles are duplicated")
+              if not isinstance(service["service_id"], str) or not re.fullmatch(r"srv-[A-Za-z0-9][A-Za-z0-9_-]{1,99}", service["service_id"]):
+                  raise SystemExit("lease service id is invalid")
+              if service["service_id"] in service_ids:
+                  raise SystemExit("Linux lease service IDs are not distinct")
+              service_ids.add(service["service_id"])
+              if not isinstance(service["image_digest"], str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", service["image_digest"]):
+                  raise SystemExit("Linux lease image digest is invalid")
+              if not isinstance(service["provider_generation"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{1,99}", service["provider_generation"]):
+                  raise SystemExit("Linux lease provider generation is invalid")
+              services_by_role[service["role"]] = service
+          if services_by_role["outline"]["image_digest"] != os.environ["SERVER_IMAGE_DIGEST"]:
+              raise SystemExit("Linux Outline image identity is not bound")
+          if services_by_role["upload-sink"]["image_digest"] != os.environ["SERVER_SINK_IMAGE_DIGEST"]:
+              raise SystemExit("Linux upload-sink image identity is not bound")
+          if any(token in json.dumps(value).lower() for token in ("url", "path", "password", "secret")):
+              raise SystemExit("Linux safe lease record contains private handoff data")
           print("lease_record=validated")
           PY
-          openssl_timeout=$((RUN_DEADLINE_EPOCH - $(date +%s) - 1))
+          cleanup_reserve_seconds=120
+          openssl_timeout=$((RUN_DEADLINE_EPOCH - $(date +%s) - cleanup_reserve_seconds - 1))
           if [ "$openssl_timeout" -le 0 ]; then printf "%s\n" "profile decryption reached the hard workflow deadline" >&2; exit 1; fi
           if [ "$openssl_timeout" -gt 60 ]; then openssl_timeout=60; fi
           timeout --foreground --signal=TERM --kill-after=1s "${openssl_timeout}s" openssl cms -decrypt -binary -inform DER \
@@ -396,6 +443,25 @@ jobs:
             -out "$HANDOFF_DIR/profile.toml"
           chmod 600 "$HANDOFF_DIR/profile.toml"
           test -s "$HANDOFF_DIR/profile.toml"
+          openssl_timeout=$((RUN_DEADLINE_EPOCH - $(date +%s) - cleanup_reserve_seconds - 1))
+          if [ "$openssl_timeout" -le 0 ]; then printf "%s\n" "upload URL decryption reached the hard workflow deadline" >&2; exit 1; fi
+          if [ "$openssl_timeout" -gt 60 ]; then openssl_timeout=60; fi
+          timeout --foreground --signal=TERM --kill-after=1s "${openssl_timeout}s" openssl cms -decrypt -binary -inform DER \
+            -in "$LEASE_RESPONSE_DIR/upload.cms" \
+            -recip "$HANDOFF_DIR/recipient.crt" \
+            -inkey "$HANDOFF_DIR/recipient.key" \
+            -out "$HANDOFF_DIR/upload-url.txt"
+          chmod 600 "$HANDOFF_DIR/upload-url.txt"
+          python3 - "$HANDOFF_DIR/upload-url.txt" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          value = Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+          if not re.fullmatch(r"https://[A-Za-z0-9.-]{1,253}/upload/[0-9a-f]{32}", value):
+              raise SystemExit("encrypted upload URL is invalid")
+          print("upload_handoff=validated")
+          PY
 
       - name: Start the candidate Linux service
         run: |
@@ -422,8 +488,19 @@ jobs:
           expected_service="$GITHUB_WORKSPACE/candidate/ubuntu_grpcvpnserver"
           expected_exe="$(readlink -f "$expected_service")"
           peer_uid="$(id -u)"
+          launch_log="$HANDOFF_DIR/service-launch.raw.log"
+          : > "$launch_log"
+          chmod 600 "$launch_log"
+          launch_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 60 - 1))
+          launch_timeout=10
+          if [ "$launch_timeout" -gt "$launch_remaining" ]; then launch_timeout="$launch_remaining"; fi
+          if [ "$launch_timeout" -le 0 ]; then
+            printf 'candidate service launch reached cleanup reserve: remaining=%s\n' "$launch_remaining" >&2
+            exit 1
+          fi
+          launch_status=0
           service_pid="$(
-            sudo -n sh -c '
+            timeout --foreground --signal=TERM --kill-after=1s "${launch_timeout}s" sudo -n sh -c '
               set -eu
               binary=$1
               control_socket=$2
@@ -443,7 +520,13 @@ jobs:
               "$peer_uid" \
               "$GITHUB_WORKSPACE/candidate" \
               "$service_log"
-          )"
+          )" 2>"$launch_log" || launch_status=$?
+          emit_private_evidence service-launch "$launch_log"
+          if [ "$launch_status" -ne 0 ]; then
+            printf 'candidate_service_launch=failed code=LAUNCH status=%s\n' "$launch_status" >&2
+            emit_private_evidence service-log "$service_log"
+            exit 1
+          fi
           case "$service_pid" in
             ""|0|*[!0-9]*) printf 'candidate service returned invalid pid=%s\n' "$service_pid" >&2; exit 1 ;;
           esac
@@ -458,7 +541,17 @@ jobs:
             printf 'SERVICE_LOG=%s\n' "$service_log"
           } >> "$GITHUB_ENV"
           ready=false
-          for _ in $(seq 1 60); do
+          readiness_reserve_seconds=120
+          readiness_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - readiness_reserve_seconds))
+          if [ "$readiness_remaining" -le 0 ]; then
+            printf 'candidate service readiness reached the cleanup reserve: remaining=%s\n' "$readiness_remaining" >&2
+            exit 1
+          fi
+          readiness_timeout=60
+          if [ "$readiness_timeout" -gt "$readiness_remaining" ]; then readiness_timeout="$readiness_remaining"; fi
+          for _ in $(seq 1 "$readiness_timeout"); do
+            readiness_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - readiness_reserve_seconds))
+            if [ "$readiness_remaining" -le 0 ]; then break; fi
             if ! sudo -n kill -0 "$service_pid"; then
               emit_private_evidence candidate-service-exited "$service_log"
               printf 'candidate_service_readiness=failed code=SERVICE_EXITED\n' >&2
@@ -500,7 +593,18 @@ jobs:
           set -euo pipefail
           umask 077
           route_log="$HANDOFF_DIR/default-route-interface.raw.log"
-          timeout --foreground --signal=TERM --kill-after=1s 10s \
+          route_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 120 - 1))
+          if [ "$route_remaining" -le 0 ]; then
+            printf 'default-route discovery reached cleanup reserve: remaining=%s\n' "$route_remaining" >&2
+            exit 1
+          fi
+          route_timeout=10
+          if [ "$route_timeout" -gt "$route_remaining" ]; then route_timeout="$route_remaining"; fi
+          if [ "$route_timeout" -le 0 ]; then
+            printf 'default-route discovery reached cleanup reserve: remaining=%s\n' "$route_remaining" >&2
+            exit 1
+          fi
+          timeout --foreground --signal=TERM --kill-after=1s "${route_timeout}s" \
             ip -o route show table main default > "$route_log" 2>&1
           network_interface="$(awk '
             $1 == "default" {
@@ -518,7 +622,18 @@ jobs:
               exit 1
               ;;
           esac
-          timeout --foreground --signal=TERM --kill-after=1s 10s \
+          route_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 120 - 1))
+          if [ "$route_remaining" -le 0 ]; then
+            printf 'default-route interface verification reached cleanup reserve: remaining=%s\n' "$route_remaining" >&2
+            exit 1
+          fi
+          route_timeout=10
+          if [ "$route_timeout" -gt "$route_remaining" ]; then route_timeout="$route_remaining"; fi
+          if [ "$route_timeout" -le 0 ]; then
+            printf 'default-route interface verification reached cleanup reserve: remaining=%s\n' "$route_remaining" >&2
+            exit 1
+          fi
+          timeout --foreground --signal=TERM --kill-after=1s "${route_timeout}s" \
             ip link show dev "$network_interface" >> "$route_log" 2>&1
           printf 'NETWORK_INTERFACE=%s\n' "$network_interface" >> "$GITHUB_ENV"
           printf 'network_transition_interface_discovered=true\n'
@@ -537,6 +652,8 @@ jobs:
             remaining=1260
           fi
           printf 'canonical_lane_timeout_seconds=%s\n' "$remaining"
+          upload_url="$(cat "$HANDOFF_DIR/upload-url.txt")"
+          test -n "$upload_url"
           PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.deadline \
             --timeout-seconds "$remaining" --kill-grace-seconds 30 \
             env PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.run \
@@ -551,7 +668,7 @@ jobs:
             --output "$RESULT_PATH" \
             --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" \
             --download-url "https://proof.ovh.net/files/1Mb.dat" \
-            --upload-url "https://speed.cloudflare.com/__up" \
+            --upload-url "$upload_url" \
             --service-pid "$SERVICE_PID" \
             --service-binary "$GITHUB_WORKSPACE/candidate/ubuntu_grpcvpnserver" \
             --service-socket "$SERVICE_SOCKET" \
@@ -586,13 +703,29 @@ jobs:
             "") ;;
             0|*[!0-9]*) printf 'cleanup received invalid service pid=%s\n' "$service_pid" >&2; exit 1 ;;
           esac
+          cleanup_deadline_epoch=$((RUN_DEADLINE_EPOCH - 60))
+          cleanup_deadline_hit=false
           service_state_probe="$HANDOFF_DIR/service-state-probes.raw.log"
           : > "$service_state_probe"
           process_is_live() {
-            local pid="$1" state probe_status=0
-            sudo -n ps -o state= -p "$pid" >> "$service_state_probe" 2>&1 || probe_status=$?
+            local pid="$1" state probe_status=0 remaining probe_timeout kill_timeout kill_status=0
+            remaining=$((cleanup_deadline_epoch - $(date +%s) - 1))
+            if [ "$remaining" -le 0 ]; then cleanup_deadline_hit=true; return 1; fi
+            probe_timeout=5
+            if [ "$probe_timeout" -gt "$remaining" ]; then probe_timeout="$remaining"; fi
+            timeout --foreground --signal=TERM --kill-after=1s "${probe_timeout}s" \
+              sudo -n ps -o state= -p "$pid" >> "$service_state_probe" 2>&1 || probe_status=$?
+            if [ "$probe_status" -eq 124 ]; then cleanup_deadline_hit=true; return 1; fi
+            if [ "$probe_status" -ne 0 ]; then return 1; fi
             state="$(awk 'NF {last=$1} END {print last}' "$service_state_probe")"
-            if [ "$probe_status" -ne 0 ] || ! sudo -n kill -0 "$pid"; then
+            remaining=$((cleanup_deadline_epoch - $(date +%s) - 1))
+            if [ "$remaining" -le 0 ]; then cleanup_deadline_hit=true; return 1; fi
+            kill_timeout=5
+            if [ "$kill_timeout" -gt "$remaining" ]; then kill_timeout="$remaining"; fi
+            timeout --foreground --signal=TERM --kill-after=1s "${kill_timeout}s" \
+              sudo -n kill -0 "$pid" >> "$service_state_probe" 2>&1 || kill_status=$?
+            if [ "$kill_status" -eq 124 ]; then cleanup_deadline_hit=true; return 1; fi
+            if [ "$kill_status" -ne 0 ]; then
               return 1
             fi
             case "$state" in
@@ -601,31 +734,55 @@ jobs:
             esac
           }
           if [ -n "$service_pid" ] && process_is_live "$service_pid"; then
-            sudo -n kill -TERM "$service_pid"
+            remaining=$((cleanup_deadline_epoch - $(date +%s) - 1))
+            if [ "$remaining" -le 0 ]; then printf 'candidate_service_cleanup=failed code=CLEANUP_DEADLINE\n' >&2; exit 1; fi
+            term_timeout=10
+            if [ "$term_timeout" -gt "$remaining" ]; then term_timeout="$remaining"; fi
+            timeout --foreground --signal=TERM --kill-after=1s "${term_timeout}s" \
+              sudo -n kill -TERM "$service_pid"
             stopped=false
-            for _ in $(seq 1 30); do
+            stop_timeout=30
+            remaining=$((cleanup_deadline_epoch - $(date +%s) - 1))
+            if [ "$stop_timeout" -gt "$remaining" ]; then stop_timeout="$remaining"; fi
+            if [ "$stop_timeout" -gt 0 ]; then for _ in $(seq 1 "$stop_timeout"); do
               if ! process_is_live "$service_pid"; then
                 stopped=true
                 break
               fi
               sleep 1
-            done
+            done; fi
             if [ "$stopped" != true ]; then
               kill_status=0
-              sudo -n kill -KILL "$service_pid" || kill_status=$?
+              remaining=$((cleanup_deadline_epoch - $(date +%s) - 1))
+              kill_timeout=10
+              if [ "$kill_timeout" -gt "$remaining" ]; then kill_timeout="$remaining"; fi
+              if [ "$kill_timeout" -gt 0 ]; then
+                timeout --foreground --signal=KILL "${kill_timeout}s" sudo -n kill -KILL "$service_pid" || kill_status=$?
+              else
+                cleanup_deadline_hit=true
+              fi
               printf 'candidate_service_kill=KILL status=%s\n' "$kill_status"
-              for _ in $(seq 1 10); do
+              force_timeout=10
+              remaining=$((cleanup_deadline_epoch - $(date +%s) - 1))
+              if [ "$force_timeout" -gt "$remaining" ]; then force_timeout="$remaining"; fi
+              if [ "$force_timeout" -gt 0 ]; then for _ in $(seq 1 "$force_timeout"); do
                 if ! process_is_live "$service_pid"; then
                   stopped=true
                   break
                 fi
                 sleep 1
-              done
+              done; fi
             fi
+            if [ "$cleanup_deadline_hit" = true ]; then printf 'candidate_service_cleanup=failed code=CLEANUP_DEADLINE\n' >&2; exit 1; fi
             test "$stopped" = true
             children_snapshot="$HANDOFF_DIR/service-children.raw.log"
             children_status=0
-            ps -eo pid=,ppid=,args= > "$children_snapshot" 2>&1 || children_status=$?
+            remaining=$((cleanup_deadline_epoch - $(date +%s) - 1))
+            children_timeout=10
+            if [ "$children_timeout" -gt "$remaining" ]; then children_timeout="$remaining"; fi
+            if [ "$children_timeout" -le 0 ]; then printf 'candidate_service_cleanup=failed code=CLEANUP_DEADLINE\n' >&2; exit 1; fi
+            timeout --foreground --signal=TERM --kill-after=1s "${children_timeout}s" \
+              ps -eo pid=,ppid=,args= > "$children_snapshot" 2>&1 || children_status=$?
             children_count="$(awk -v parent="$service_pid" '$2 == parent {count++} END {print count + 0}' "$children_snapshot")"
             emit_private_evidence service-children "$children_snapshot"
             if [ "$children_count" -ne 0 ] || [ "$children_status" -ne 0 ]; then
@@ -634,6 +791,10 @@ jobs:
             fi
           else
             printf '%s\n' 'candidate service was not running at cleanup'
+          fi
+          if [ "$cleanup_deadline_hit" = true ]; then
+            printf 'candidate_service_cleanup=failed code=CLEANUP_DEADLINE\n' >&2
+            exit 1
           fi
           emit_private_evidence service-state-probes "$service_state_probe"
 
@@ -670,7 +831,7 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/recipient.key"
+          rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/upload-url.txt" "$HANDOFF_DIR/recipient.key"
 
 
   controller:

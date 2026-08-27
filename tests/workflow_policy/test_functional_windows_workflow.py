@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 import unittest
 
+from .lease_validator_helpers import adversarial_leases, run_validator, valid_lease
+
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "functional-windows.yml"
@@ -35,6 +37,7 @@ class FunctionalWindowsWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("hosted.deadline", self.text)
         self.assertIn("--kill-grace-seconds 30", self.text)
         self.assertIn("for attempt in $(seq 1 360); do", self.text)
+        self.assertIn("if int(datetime.datetime.now(datetime.timezone.utc).timestamp()) >= deadline:", self.text)
         self.assertIn("timeout-minutes: 30", self.text)
 
     def test_actions_are_immutable_and_minimal(self) -> None:
@@ -111,6 +114,15 @@ class FunctionalWindowsWorkflowPolicyTest(unittest.TestCase):
         self.assertNotRegex(functional, r"--artifact(?:\s|=)")
         self.assertIn("--download-url \"https://proof.ovh.net/files/1Mb.dat\"", functional)
         self.assertNotIn("speed.cloudflare.com/__down?", functional)
+        self.assertIn('upload_url="$(cat "$HANDOFF_DIR/upload-url.txt")"', functional)
+        self.assertIn('--upload-url "$upload_url"', functional)
+        self.assertIn("SERVER_SINK_IMAGE_DIGEST", client)
+        self.assertIn("--expect-file upload.cms", client)
+        self.assertIn('test -f "$LEASE_RESPONSE_DIR/upload.cms"', client)
+        self.assertIn('"schema": 2', client)
+        self.assertIn('{"outline", "upload-sink"}', client)
+        self.assertIn('"provider_generation"', client)
+        self.assertIn('"url", "path", "password", "secret"', client)
 
     def test_preflight_startup_bounds_every_candidate_probe_and_preserves_cleanup(self) -> None:
         client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
@@ -125,7 +137,7 @@ class FunctionalWindowsWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("run_preflight_probe()", preflight)
         self.assertGreaterEqual(
             preflight.count("timeout --foreground --signal=TERM --kill-after=1s"),
-            3,
+            2,
         )
         self.assertRegex(
             preflight,
@@ -161,6 +173,81 @@ class FunctionalWindowsWorkflowPolicyTest(unittest.TestCase):
         )
         self.assertIn("emit_private_evidence preflight-launch", preflight)
 
+    def test_native_launch_uses_bounded_file_handoff_not_bash_pipe_capture(self) -> None:
+        client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
+        preflight_start = client.index("- name: Start exact Windows preflight candidate")
+        preflight_stop = client.index("- name: Stop Windows preflight candidate before Render handoff")
+        functional_start = client.index("- name: Start exact Windows functional candidate")
+        run_start = client.index("- name: Run canonical Windows functional scenarios")
+        preflight = client[preflight_start:preflight_stop]
+        functional = client[functional_start:run_start]
+
+        for launch in (preflight, functional):
+            # A native child must not be placed inside Bash command
+            # substitution or a background PowerShell job: either can outlive
+            # the shell and strand the candidate without a cleanup handoff.
+            self.assertNotRegex(launch, r"service_pid=\"\$\(.*powershell\.exe")
+            self.assertNotIn("Start-Job", launch)
+            self.assertNotIn("Wait-Job", launch)
+            self.assertNotIn("Stop-Job", launch)
+            self.assertIn('timeout --signal=TERM --kill-after=1s "${launch_watchdog_timeout}s"', launch)
+            self.assertIn('> "$launch_log" 2>&1 || launch_status=$?', launch)
+            self.assertIn("WriteAllText($env:DOBBYVPN_WINDOWS_SERVICE_PID_FILE", launch)
+            self.assertIn("System.Text.Encoding]::ASCII", launch)
+            self.assertNotIn("[Environment]::NewLine", launch)
+            self.assertIn("SERVICE_IDENTITY_FILE", launch)
+            self.assertIn("candidate-discovery", launch)
+            self.assertIn("service_pid=\"\"", launch)
+            self.assertIn("tr -d '\\r\\n'", launch)
+            self.assertIn("emit_private_evidence", launch)
+            self.assertIn("LAUNCH_TIMEOUT", launch)
+
+        self.assertIn("PREFLIGHT_SERVICE_PID_FILE", preflight)
+        self.assertIn("SERVICE_PID_FILE", functional)
+        self.assertIn("launch_watchdog_timeout=$((launch_timeout + 3))", preflight)
+        self.assertIn("launch_watchdog_timeout=$((launch_timeout + 3))", functional)
+        self.assertIn('emit_private_evidence preflight-service-log "$service_log"', preflight)
+        self.assertIn('emit_private_evidence preflight-service-error "$service_err"', preflight)
+        self.assertIn('emit_private_display preflight-launch "$launch_log"', preflight)
+        self.assertIn('emit_private_evidence service-log "$service_log"', functional)
+        self.assertIn('emit_private_evidence service-error "$service_err"', functional)
+        self.assertIn('emit_private_display service-launch "$launch_log"', functional)
+        self.assertLess(
+            preflight.index('printf \'PREFLIGHT_SERVICE_PID_FILE='),
+            preflight.index('powershell.exe -NoLogo -NoProfile -NonInteractive -Command'),
+        )
+        self.assertLess(
+            functional.index('printf \'SERVICE_PID_FILE='),
+            functional.index('powershell.exe -NoLogo -NoProfile -NonInteractive -Command'),
+        )
+
+    def test_windows_client_paths_are_private_and_process_identity_is_required(self) -> None:
+        client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
+        self.assertIn('private_root="$RUNNER_TEMP/dobbyvpn-private"', client)
+        self.assertIn('test ! -e "$private_root" && test ! -L "$private_root"', client)
+        self.assertIn('mkdir "$private_root"', client)
+        self.assertIn('mkdir "$handoff" "$service"', client)
+        self.assertIn('chmod 700 "$private_root" "$handoff" "$service"', client)
+        self.assertIn("WindowsIdentity]::GetCurrent().User.Value", client)
+        self.assertIn("SetAccessRuleProtection($true,$false)", client)
+        self.assertIn("private ACL verification failed", client)
+        self.assertIn("SERVICE_IDENTITY_FILE", client)
+        self.assertIn("PREFLIGHT_SERVICE_IDENTITY_FILE", client)
+        self.assertIn("CreationDate.ToUniversalTime().Ticks", client)
+        self.assertIn("service_state=path-mismatch", client)
+        self.assertIn("service_state=identity-mismatch", client)
+        self.assertIn("PREFLIGHT_SERVICE_LAUNCH_STARTED_EPOCH", client)
+        self.assertIn("SERVICE_LAUNCH_STARTED_EPOCH", client)
+        self.assertGreaterEqual(client.count("FromUnixTimeSeconds([int64]$args[2])"), 4)
+        self.assertIn("cleanup_deadline_epoch=$((RUN_DEADLINE_EPOCH - 60))", client)
+        self.assertIn("launch_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 60))", client)
+        self.assertGreaterEqual(client.count('timeout --foreground --signal=TERM --kill-after=1s "${probe_timeout}s"'), 2)
+        self.assertIn("readiness_reserve_seconds=180", client)
+        self.assertIn('readiness_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - readiness_reserve_seconds))', client)
+        self.assertIn('timeout --foreground --signal=TERM --kill-after=1s "${status_timeout}s"', client)
+        self.assertIn('discovery_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 60 - 1))', client)
+        self.assertIn('timeout --foreground --signal=TERM --kill-after=1s "${kill_timeout}s"', client)
+
     def test_render_handoff_is_opaque_and_bound_to_windows_origin(self) -> None:
         self.assertIn("render-request-${lease_run_id}-${PLATFORM}", self.text)
         self.assertIn("render-lease-${LEASE_RUN_ID}-${PLATFORM}", self.text)
@@ -181,7 +268,12 @@ class FunctionalWindowsWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("if: always()", self.text[result:marker])
         self.assertIn("if: always()", self.text[marker:remove])
         self.assertIn("taskkill.exe /PID", self.text[stop:result])
-        self.assertIn("rm -f \"$HANDOFF_DIR/profile.toml\" \"$HANDOFF_DIR/recipient.key\"", self.text)
+        uploads = self.text[result:marker]
+        self.assertNotIn("profile.cms", uploads)
+        self.assertNotIn("upload.cms", uploads)
+        self.assertNotIn("upload-url.txt", uploads)
+        self.assertNotIn("profile.toml", uploads)
+        self.assertIn("rm -f \"$HANDOFF_DIR/profile.toml\" \"$HANDOFF_DIR/upload-url.txt\" \"$HANDOFF_DIR/recipient.key\"", self.text)
 
     def test_no_diagnostic_suppression(self) -> None:
         self.assertNotRegex(self.text, r">\s*/dev/null|2>\s*/dev/null|--quiet(?:\s|$)|SilentlyContinue")
@@ -198,6 +290,21 @@ class FunctionalWindowsWorkflowPolicyTest(unittest.TestCase):
         self.assertIn('taskkill.exe /PID "$service_pid" /T /F > "$taskkill_log" 2>&1', self.text)
         self.assertIn('emit_private_evidence preflight-taskkill "$taskkill_log"', self.text)
         self.assertIn('emit_private_evidence taskkill "$taskkill_log"', self.text)
+
+    def test_schema_two_validator_rejects_identity_binding_and_private_field_attacks(self) -> None:
+        self.assertEqual(run_validator(self.text, valid_lease("windows")).returncode, 0)
+        for label, lease in adversarial_leases("windows").items():
+            with self.subTest(label=label):
+                self.assertNotEqual(run_validator(self.text, lease).returncode, 0)
+
+    def test_expired_and_short_budgets_fail_closed(self) -> None:
+        client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
+        self.assertIn('if [ "$readiness_remaining" -le 0 ]; then', client)
+        self.assertIn('if [ "$discovery_remaining" -le 0 ]; then', client)
+        self.assertIn('if [ "$discovery_timeout" -gt "$discovery_remaining" ]; then', client)
+        self.assertIn('if [ "$status_timeout" -le 0 ]; then', client)
+        self.assertIn('if [ "$openssl_timeout" -le 0 ]; then', client)
+        self.assertIn('if [ "$transfer_timeout" -le 0 ]; then', client)
 
 
 if __name__ == "__main__":

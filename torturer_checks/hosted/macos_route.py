@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import re
@@ -241,13 +242,34 @@ def _capture(command: Sequence[str], path: Path, timeout_seconds: float) -> int:
         raise MacOSRouteError("DEFAULT_ROUTE_COMMAND_UNAVAILABLE") from error
 
 
-def _service_is_dead(pid: int, timeout_seconds: float, evidence_file: Path) -> bool:
+def _service_is_dead(
+    pid: int,
+    timeout_seconds: float,
+    evidence_file: Path,
+    identity_file: Path | None = None,
+) -> bool:
     if not _PID.fullmatch(str(pid)):
         raise MacOSRouteError("DEFAULT_ROUTE_SERVICE_PID_INVALID")
     timeout_seconds = min(float(timeout_seconds), float(_ROUTE_TIMEOUT_SECONDS))
+    expected_identity: dict[str, object] | None = None
+    if identity_file is not None:
+        try:
+            value = json.loads(identity_file.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("identity is not an object")
+            expected_identity = value
+            if int(value.get("pid", 0)) != pid:
+                raise ValueError("identity PID does not match service PID")
+            if not all(isinstance(value.get(key), str) and value[key] for key in ("start", "command")):
+                raise ValueError("identity fields are incomplete")
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise MacOSRouteError("DEFAULT_ROUTE_SERVICE_IDENTITY_INVALID") from error
     try:
         returncode = _capture(
-            ("sudo", "-n", "ps", "-p", str(pid), "-o", "pid="),
+            (
+                "sudo", "-n", "ps", "-p", str(pid), "-o",
+                "pid=,lstart=,command=" if expected_identity is not None else "pid=",
+            ),
             evidence_file,
             timeout_seconds,
         )
@@ -258,10 +280,24 @@ def _service_is_dead(pid: int, timeout_seconds: float, evidence_file: Path) -> b
         raise MacOSRouteError("DEFAULT_ROUTE_SERVICE_PROBE_UNAVAILABLE") from error
     except OSError as error:
         raise MacOSRouteError("DEFAULT_ROUTE_SERVICE_PROBE_UNAVAILABLE") from error
-    if returncode == 0 and output.strip() == str(pid):
-        return False
     if returncode == 1 and not output.strip():
         return True
+    if returncode == 0 and expected_identity is None and output.strip() == str(pid):
+        return False
+    if returncode == 0 and expected_identity is not None:
+        lines = [line for line in output.splitlines() if line.strip()]
+        fields = lines[0].split(maxsplit=6) if len(lines) == 1 else []
+        if len(fields) >= 7 and fields[0].isdigit():
+            actual_pid = int(fields[0])
+            actual_start = " ".join(fields[1:6])
+            actual_command = fields[6]
+            if (
+                actual_pid == pid
+                and actual_start == expected_identity["start"]
+                and actual_command == expected_identity["command"]
+            ):
+                return False
+        raise MacOSRouteError("DEFAULT_ROUTE_SERVICE_IDENTITY_MISMATCH")
     raise MacOSRouteError("DEFAULT_ROUTE_SERVICE_PROBE_FAILED")
 
 
@@ -275,13 +311,19 @@ def restore(
     verified_file: Path,
     service_pid: int,
     timeout_seconds: float,
+    service_identity_file: Path | None = None,
 ) -> str:
     """Inspect, restore, and verify the default route using bounded probes."""
 
     if timeout_seconds <= 0:
         raise MacOSRouteError("DEFAULT_ROUTE_TIMEOUT_INVALID")
     baseline = parse_baseline(baseline_file)
-    service_dead = _service_is_dead(service_pid, timeout_seconds, service_probe_file)
+    service_dead = _service_is_dead(
+        service_pid,
+        timeout_seconds,
+        service_probe_file,
+        service_identity_file,
+    )
     current_status = _capture(
         ("sudo", "-n", "route", "-n", "get", "default"),
         current_file,
@@ -330,6 +372,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--restore-file", type=Path, required=True)
     parser.add_argument("--verified-file", type=Path, required=True)
     parser.add_argument("--service-pid", type=int, required=True)
+    parser.add_argument("--service-identity-file", type=Path)
     parser.add_argument("--timeout-seconds", type=float, default=10.0)
     return parser
 
@@ -346,6 +389,7 @@ def main(argv: list[str] | None = None) -> int:
             verified_file=args.verified_file,
             service_pid=args.service_pid,
             timeout_seconds=args.timeout_seconds,
+            service_identity_file=args.service_identity_file,
         )
     except MacOSRouteError as error:
         print(f"macos_default_route_restore=failed code={error.code}", file=sys.stderr)

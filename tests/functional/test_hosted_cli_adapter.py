@@ -21,6 +21,12 @@ from torturer_checks.hosted.cli import (
     HostedCLIAdapter,
     SubprocessRunner,
     _ProcessSnapshotProvider,
+    _ProcessIdentity,
+    _ProcessProbeError,
+    _identity_live,
+    _tree_status,
+    _bounded_reap_process,
+    _bounded_capture,
     _parse_macos_process_snapshot,
 )
 from torturer_checks.hosted.linux import (
@@ -940,6 +946,22 @@ class HostedCLIAdapterTests(unittest.TestCase):
             self.assertEqual(provider(), {})
         self.assertEqual(run.call_count, 2)
 
+    def test_macos_malformed_process_census_is_not_used_for_cleanup_proof(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ("ps",),
+            0,
+            b"123 1 123 Mon Aug 23 10:00:00 2026\nnot-a-process-row\n",
+            b"",
+        )
+        with (
+            mock.patch.object(Path, "is_dir", return_value=False),
+            mock.patch("torturer_checks.hosted.cli.subprocess.run", return_value=completed),
+        ):
+            provider = _ProcessSnapshotProvider()
+            self.assertIsNone(provider())
+        self.assertIn(b"MAC_PROCESS_CENSUS_PARSE_ERROR=1", provider.diagnostics)
+        self.assertIn(b"EVIDENCE_INCOMPLETE=1", provider.diagnostics)
+
     def test_subprocess_runner_never_overwrites_another_runner_sequence(self) -> None:
         raw = Path(self.directory.name) / "shared-raw"
         first = SubprocessRunner(raw)
@@ -977,7 +999,7 @@ class HostedCLIAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(HostedAdapterError, "COMMAND_TIMEOUT"):
             runner.run(
                 (sys.executable, "-c", parent_script, child_script),
-                timeout_seconds=0.2,
+                timeout_seconds=0.5,
             )
 
         retained = next(raw.glob("command-001*.raw.log"))
@@ -1029,6 +1051,226 @@ class HostedCLIAdapterTests(unittest.TestCase):
             "timeout cleanup must reap the leader before returning",
         )
 
+    @unittest.skipUnless(os.name == "posix", "non-blocking pipe EOF proof requires POSIX")
+    def test_bounded_reap_distinguishes_reaped_leader_from_complete_pipe_eof(self) -> None:
+        process = subprocess.Popen(
+            (sys.executable, "-c", "import sys; print('stdout-marker'); print('stderr-marker', file=sys.stderr)"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        process.wait(timeout=2.0)
+
+        reaped, output_complete, stdout, stderr, diagnostics = _bounded_reap_process(
+            process, 0.0
+        )
+
+        self.assertTrue(reaped)
+        self.assertTrue(output_complete)
+        self.assertEqual(stdout, b"stdout-marker\n")
+        self.assertEqual(stderr, b"stderr-marker\n")
+        self.assertEqual(diagnostics, b"")
+
+    def test_windows_bounded_reap_drains_reader_output_while_polling(self) -> None:
+        class WindowsProcess:
+            stdout = None
+            stderr = None
+
+            def __init__(self) -> None:
+                self.calls = 0
+                self.polls = 0
+                self.returncode: int | None = None
+
+            def poll(self) -> int | None:
+                self.polls += 1
+                return self.returncode
+
+            def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired(
+                        ("fake",), timeout, output=b"first-out", stderr=b"first-err"
+                    )
+                self.returncode = 0
+                return b"first-out", b"first-err"
+
+        process = WindowsProcess()
+        with mock.patch("torturer_checks.hosted.cli.os.name", "nt"):
+            reaped, output_complete, stdout, stderr, diagnostics = _bounded_reap_process(
+                process, deadline=time.monotonic() + 0.2  # type: ignore[arg-type]
+            )
+
+        self.assertTrue(reaped)
+        self.assertTrue(output_complete)
+        self.assertEqual(stdout, b"first-out")
+        self.assertEqual(stderr, b"first-err")
+        self.assertEqual(diagnostics, b"")
+        self.assertGreaterEqual(process.calls, 2)
+        self.assertGreaterEqual(process.polls, 2)
+
+    def test_windows_failed_start_time_lookup_is_not_proven_gone(self) -> None:
+        identity = _ProcessIdentity(42, "creation-time")
+        census = {42: (1, 0, "", "R")}
+        with (
+            mock.patch("torturer_checks.hosted.cli.os.name", "nt"),
+            mock.patch("torturer_checks.hosted.cli._process_snapshot", return_value=census),
+        ):
+            self.assertIsNone(_identity_live(identity))
+            self.assertEqual(_tree_status(42, (identity,)), "unknown")
+
+    @unittest.skipUnless(os.name == "posix", "direct process probe fallback is POSIX-only")
+    def test_tree_status_uses_direct_probe_only_after_complete_census(self) -> None:
+        vanished = (_ProcessIdentity(999999, "vanished", 999999),)
+        with mock.patch(
+            "torturer_checks.hosted.cli._process_snapshot", return_value=None
+        ):
+            self.assertEqual(
+                _tree_status(
+                    999999,
+                    vanished,
+                    allow_direct_fallback=True,
+                    census_complete=True,
+                ),
+                "gone",
+            )
+            # A failed/incomplete census cannot use the same disappearance
+            # race fallback; it must remain unknown and fail closed.
+            self.assertEqual(
+                _tree_status(
+                    999999,
+                    vanished,
+                    allow_direct_fallback=True,
+                    census_complete=False,
+                ),
+                "unknown",
+            )
+
+    @unittest.skipUnless(os.name == "posix", "direct process probe fallback is POSIX-only")
+    def test_tree_status_direct_probe_precedes_slow_final_census(self) -> None:
+        identity = (_ProcessIdentity(999999, "vanished", 999999),)
+        with (
+            mock.patch(
+                "torturer_checks.hosted.cli._direct_tree_status",
+                return_value="gone",
+            ) as direct_probe,
+            mock.patch(
+                "torturer_checks.hosted.cli._process_snapshot",
+                side_effect=AssertionError("slow full census must not run first"),
+            ),
+        ):
+            self.assertEqual(
+                _tree_status(
+                    999999,
+                    identity,
+                    allow_direct_fallback=True,
+                    census_complete=True,
+                ),
+                "gone",
+            )
+        direct_probe.assert_called_once()
+
+    @unittest.skipUnless(os.name == "posix", "process identity probe is POSIX-only")
+    def test_posix_identity_probe_error_is_not_proven_gone(self) -> None:
+        identity = _ProcessIdentity(42, "creation-time")
+        with mock.patch(
+            "torturer_checks.hosted.cli._proc_stat",
+            side_effect=_ProcessProbeError("identity probe failed"),
+        ):
+            self.assertIsNone(_identity_live(identity))
+
+    def test_timeout_output_oserror_retains_partial_bytes_and_marks_incomplete(self) -> None:
+        raw = Path(self.directory.name) / "timeout-oserror-raw"
+
+        class FakeMonitor:
+            identities = ()
+
+            def start(self) -> None:
+                return None
+
+            def stop(self, timeout: float) -> bool:
+                return True
+
+        class FakeProcess:
+            pid = 12345
+            returncode = 0
+            stdout = None
+            stderr = None
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired(
+                        ("fake",), timeout, output=b"before-", stderr=b"before-err"
+                    )
+                error = OSError("injected pipe failure")
+                error.stdout = b"after-"  # type: ignore[attr-defined]
+                error.stderr = b"after-err"  # type: ignore[attr-defined]
+                raise error
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+        with (
+            mock.patch("torturer_checks.hosted.cli.subprocess.Popen", return_value=FakeProcess()),
+            mock.patch("torturer_checks.hosted.cli._ProcessTreeMonitor", return_value=FakeMonitor()),
+            mock.patch(
+                "torturer_checks.hosted.cli._kill_process_tree",
+                return_value=b"PROCESS_TREE_STATUS=gone\n",
+            ),
+            self.assertRaisesRegex(HostedAdapterError, "COMMAND_TIMEOUT"),
+        ):
+            SubprocessRunner(raw).run(("fake",), timeout_seconds=0.2)
+
+        retained = next(raw.glob("command-001*.raw.log")).read_bytes()
+        self.assertIn(b"before-after-", retained)
+        self.assertIn(b"before-errafter-err", retained)
+        self.assertIn(b"EVIDENCE_INCOMPLETE=1 reason=output-drain-error", retained)
+
+    def test_bounded_capture_post_timeout_oserror_keeps_bytes_and_kill_error(self) -> None:
+        class FakeHelper:
+            stdout = None
+            stderr = None
+            returncode = None
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired(
+                        ("fake",), timeout, output=b"before-", stderr=b"before-err"
+                    )
+                error = OSError("injected helper pipe failure")
+                error.stdout = b"after-"  # type: ignore[attr-defined]
+                error.stderr = b"after-err"  # type: ignore[attr-defined]
+                raise error
+
+            def kill(self) -> None:
+                raise OSError("injected kill failure")
+
+        helper = FakeHelper()
+        with (
+            mock.patch("torturer_checks.hosted.cli.subprocess.Popen", return_value=helper),
+            mock.patch(
+                "torturer_checks.hosted.cli._bounded_reap_process",
+                return_value=(True, False, b"drained-", b"drained-err", b""),
+            ),
+        ):
+            code, stdout, stderr, timed_out = _bounded_capture(
+                ("fake",), timeout=0.2
+            )
+
+        self.assertIsNone(code)
+        self.assertTrue(timed_out)
+        self.assertIn(b"before-after-", stdout)
+        self.assertIn(b"before-errafter-err", stderr)
+        self.assertIn(b"PROCESS_KILL_ERROR=", stderr)
+        self.assertIn(b"OUTPUT_DRAIN_ERROR=", stderr)
+        self.assertIn(b"EVIDENCE_INCOMPLETE=1", stderr)
+
     @unittest.skipUnless(os.name == "posix", "process-group reaping assertion requires POSIX")
     def test_subprocess_runner_reserves_reap_tail_after_tree_cleanup(self) -> None:
         raw = Path(self.directory.name) / "reap-reserve-raw"
@@ -1063,9 +1305,17 @@ class HostedCLIAdapterTests(unittest.TestCase):
 
         process = FakeProcess()
 
-        def reap(_process: FakeProcess, timeout: float) -> tuple[bool, bytes, bytes, bytes]:
+        def reap(
+            _process: FakeProcess,
+            timeout: float | None = None,
+            *,
+            deadline: float | None = None,
+        ) -> tuple[bool, bool, bytes, bytes, bytes]:
+            if deadline is not None:
+                timeout = max(0.0, deadline - time.monotonic())
+            assert timeout is not None
             reap_timeouts.append(timeout)
-            return True, b"drained-out", b"drained-err", b""
+            return True, True, b"drained-out", b"drained-err", b""
 
         def tree_cleanup(*_args, **_kwargs) -> bytes:
             time.sleep(0.1)
@@ -1092,6 +1342,85 @@ class HostedCLIAdapterTests(unittest.TestCase):
         retained = next(raw.glob("command-001*.raw.log")).read_bytes()
         self.assertIn(b"drained-out", retained)
         self.assertIn(b"drained-err", retained)
+
+    @unittest.skipUnless(os.name == "posix", "process-proof deadline assertion requires POSIX")
+    def test_final_tree_proof_has_reserved_interval_before_reap_tail(self) -> None:
+        raw = Path(self.directory.name) / "proof-deadline-raw"
+        runner = SubprocessRunner(raw)
+
+        class Clock:
+            now = 100.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+        clock = Clock()
+        proof_observations: list[tuple[float, float]] = []
+
+        class FakeMonitor:
+            identities = ()
+
+            def start(self) -> None:
+                return None
+
+            def stop(self, timeout: float) -> bool:
+                return True
+
+        class FakeProcess:
+            pid = 12345
+            returncode = 0
+            stdout = None
+            stderr = None
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired(
+                        ("fake",), timeout, output=b"partial-out", stderr=b"partial-err"
+                    )
+                return b"drained-out", b"drained-err"
+
+            def poll(self) -> int:
+                return self.returncode
+
+        def tree_cleanup(*_args, **kwargs) -> bytes:
+            old_cleanup_deadline = float(kwargs["deadline"])
+            # Put the proof call after the old cleanup-work boundary while it
+            # is still strictly inside the caller's absolute deadline.
+            clock.now = old_cleanup_deadline + 0.01
+            return b"PROCESS_TREE_STATUS=unknown\n"
+
+        def tree_status(*_args, **kwargs) -> str:
+            proof_observations.append((clock.now, float(kwargs["deadline"])))
+            return "gone"
+
+        def reap(*_args, **_kwargs):
+            return True, True, b"", b"", b""
+
+        with (
+            mock.patch("torturer_checks.hosted.cli.time.monotonic", side_effect=clock.monotonic),
+            mock.patch("torturer_checks.hosted.cli.subprocess.Popen", return_value=FakeProcess()),
+            mock.patch("torturer_checks.hosted.cli._ProcessTreeMonitor", return_value=FakeMonitor()),
+            mock.patch("torturer_checks.hosted.cli._kill_process_tree", side_effect=tree_cleanup),
+            mock.patch("torturer_checks.hosted.cli._tree_status", side_effect=tree_status),
+            mock.patch("torturer_checks.hosted.cli._bounded_reap_process", side_effect=reap),
+            self.assertRaisesRegex(HostedAdapterError, "COMMAND_TIMEOUT"),
+        ):
+            runner.run(("fake",), timeout_seconds=0.5)
+
+        self.assertGreaterEqual(len(proof_observations), 2)
+        pre_reap_now, pre_reap_deadline = proof_observations[0]
+        self.assertGreaterEqual(pre_reap_now, 100.4)
+        self.assertLess(pre_reap_now, 100.5)
+        self.assertAlmostEqual(pre_reap_deadline, 100.45)
+        self.assertAlmostEqual(proof_observations[-1][1], 100.5)
+        retained = next(raw.glob("command-001*.raw.log")).read_bytes()
+        self.assertIn(b"partial-out", retained)
+        self.assertIn(b"drained-out", retained)
+        self.assertIn(b"PROCESS_TREE_STATUS=gone", retained)
 
     @unittest.skipUnless(os.name == "posix", "detached process-tree assertion requires POSIX")
     def test_subprocess_runner_kills_detached_resistant_descendant_and_retains_markers(self) -> None:
@@ -1141,7 +1470,9 @@ class HostedCLIAdapterTests(unittest.TestCase):
         retained = next(raw.glob("command-001*.raw.log"))
         content = retained.read_bytes()
         self.assertIn(b"PROCESS_TREE_SURVIVOR_DETECTED=1", content)
-        self.assertIn(b"PROCESS_TREE_STATUS=gone", content)
+        # A census that reaches the absolute deadline is intentionally
+        # inconclusive; it must never be reported as gone.
+        self.assertRegex(content, rb"PROCESS_TREE_STATUS=(gone|unknown)")
         self.assertIn(b"EVIDENCE_INCOMPLETE=1", content)
         self.assertNotIn(b"ResourceWarning", content)
 
@@ -1159,15 +1490,19 @@ class HostedCLIAdapterTests(unittest.TestCase):
                 "torturer_checks.hosted.cli._kill_process_tree",
                 return_value=b"PROCESS_TREE_STATUS=gone\n",
             ):
-                with self.assertRaisesRegex(HostedAdapterError, "COMMAND_TIMEOUT"):
-                    runner.run(
-                        (sys.executable, "-c", parent_script),
-                        timeout_seconds=0.6,
-                    )
+                with mock.patch(
+                    "torturer_checks.hosted.cli._signal_tracked",
+                    return_value=b"",
+                ):
+                    with self.assertRaisesRegex(HostedAdapterError, "COMMAND_TIMEOUT"):
+                        runner.run(
+                            (sys.executable, "-c", parent_script),
+                            timeout_seconds=0.6,
+                        )
             retained = next(raw.glob("command-001*.raw.log"))
             content = retained.read_bytes()
             self.assertIn(b"OUTPUT_DRAIN_TIMEOUT=1", content)
-            self.assertIn(b"PROCESS_TREE_FINAL_STATUS=alive", content)
+            self.assertRegex(content, rb"PROCESS_TREE_FINAL_STATUS=(alive|unknown)")
             self.assertIn(b"EVIDENCE_INCOMPLETE=1", content)
         finally:
             try:

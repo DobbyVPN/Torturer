@@ -102,6 +102,10 @@ class CommandResult:
     elapsed_seconds: float = 0.0
     cleanup_reserve_seconds: float = 0.0
     deadline_exceeded: bool = False
+    # Process-census output is separate from the child-owned stderr stream;
+    # adding it to stderr would mutate the exact bytes emitted by the command.
+    process_tree_diagnostics_bytes: bytes = b""
+    process_tree_diagnostics_path: Path | None = None
 
     def describe(self) -> str:
         return (
@@ -311,7 +315,11 @@ def emit_command_diagnostics(result: CommandResult) -> None:
     emit_evidence(
         "desktop-command",
         status=("failed" if result.returncode != 0 else "completed"),
-        payloads={"stdout": result.stdout_bytes, "stderr": result.stderr_bytes},
+        payloads={
+            "stdout": result.stdout_bytes,
+            "stderr": result.stderr_bytes,
+            "process-tree-census": result.process_tree_diagnostics_bytes,
+        },
     )
 
 
@@ -389,6 +397,7 @@ def _retain_command_streams(
     label: str,
     stdout: bytes,
     stderr: bytes,
+    process_tree_diagnostics: bytes = b"",
 ) -> dict[str, Path]:
     """Retain original command streams and cleanup metadata exclusively."""
 
@@ -401,6 +410,12 @@ def _retain_command_streams(
             f"{stem}.{suffix}.raw.log",
             payload,
         )
+    if process_tree_diagnostics:
+        paths["process_tree_diagnostics"] = _retain_exclusive_bytes(
+            evidence_directory,
+            f"{stem}.process-tree-census.raw.log",
+            process_tree_diagnostics,
+        )
     return paths
 
 
@@ -412,6 +427,7 @@ def _retain_cleanup_record(
     elapsed_seconds: float = 0.0,
     cleanup_reserve_seconds: float = 0.0,
     deadline_exceeded: bool = False,
+    process_tree_diagnostics_path: Path | None = None,
 ) -> Path:
     metadata = {
         "schema": "torturer.desktop.command-cleanup.v1",
@@ -421,6 +437,9 @@ def _retain_cleanup_record(
         "elapsed_seconds": elapsed_seconds,
         "cleanup_reserve_seconds": cleanup_reserve_seconds,
         "deadline_exceeded": deadline_exceeded,
+        "process_tree_census_path": (
+            str(process_tree_diagnostics_path) if process_tree_diagnostics_path else None
+        ),
     }
     return _retain_exclusive_bytes(
         evidence_directory,
@@ -459,8 +478,10 @@ def _process_group_alive(process: subprocess.Popen[bytes]) -> bool:
 
 def _wait_for_process_tree(
     process: subprocess.Popen[bytes],
-    timeout_seconds: float,
+    timeout_seconds: float | None = None,
     tracked: set[int] | None = None,
+    *,
+    deadline: float | None = None,
 ) -> bool:
     """Wait for both the leader and its process group, proving disappearance."""
 
@@ -469,7 +490,10 @@ def _wait_for_process_tree(
         # missing Toolhelp census is unprovable, so callers must fail closed.
         return False
     tracked = tracked if tracked is not None else set()
-    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    if deadline is None:
+        if timeout_seconds is None:
+            raise SliceFailure("process-tree deadline is required")
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
     while True:
         tracked.update(
             _proc_descendants(process.pid, process=process, deadline=deadline)
@@ -478,7 +502,9 @@ def _wait_for_process_tree(
             return False
         leader_gone = process.poll() is not None
         if leader_gone and not _process_group_alive(process) and not any(
-            _pid_alive(pid) for pid in tracked if pid != process.pid
+            _pid_alive(pid, deadline=deadline)
+            for pid in tracked
+            if pid != process.pid
         ):
             return True
         remaining = deadline - time.monotonic()
@@ -514,27 +540,45 @@ def _retain_taskkill_diagnostics(
 def _terminate_process_tree(
     process: subprocess.Popen[bytes],
     *,
-    grace_seconds: float,
+    grace_seconds: float | None = None,
     description: str,
     force_immediately: bool = False,
     evidence_directory: Path | None = None,
+    deadline: float | None = None,
 ) -> ProcessTreeResult:
     """Terminate a command and prove its process group did not survive."""
 
     # Lightweight fakes in the helper tests model only the public Popen
     # lifecycle methods. Preserve that seam while real processes always use
     # the process-group path below.
-    cleanup_deadline = time.monotonic() + max(0.0, grace_seconds)
+    if deadline is None:
+        if grace_seconds is None:
+            raise SliceFailure("process-tree cleanup deadline is required")
+        cleanup_deadline = time.monotonic() + max(0.0, grace_seconds)
+    else:
+        cleanup_deadline = float(deadline)
     process_id = getattr(process, "pid", None)
     if process_id is None:
         diagnostics: list[str] = []
         if process.poll() is None:
-            process.terminate()
+            try:
+                process.terminate()
+            except OSError as error:
+                diagnostics.append(
+                    f"{description} graceful-stop-error={type(error).__name__}; "
+                    "EVIDENCE_INCOMPLETE=1 reason=process-term-error"
+                )
             try:
                 process.wait(timeout=_remaining_until(cleanup_deadline))
             except subprocess.TimeoutExpired:
                 diagnostics.append(f"{description} graceful-stop-expired")
-                process.kill()
+                try:
+                    process.kill()
+                except OSError as error:
+                    diagnostics.append(
+                        f"{description} forced-stop-error={type(error).__name__}; "
+                        "EVIDENCE_INCOMPLETE=1 reason=process-kill-error"
+                    )
                 try:
                     process.wait(timeout=_remaining_until(cleanup_deadline))
                 except subprocess.TimeoutExpired:
@@ -548,6 +592,7 @@ def _terminate_process_tree(
         _proc_descendants(process_id, process=process, deadline=cleanup_deadline)
     )
     diagnostics = []
+    termination_errors: list[str] = []
     was_running = process.poll() is None
     if force_immediately:
         if os.name == "nt":
@@ -555,31 +600,63 @@ def _terminate_process_tree(
                 process.kill()
             except ProcessLookupError:
                 pass
+            except OSError as error:
+                termination_errors.append(
+                    f"{description} forced leader kill error={type(error).__name__}; "
+                    "EVIDENCE_INCOMPLETE=1 reason=process-kill-error"
+                )
         else:
             if was_running:
                 try:
                     os.killpg(process_id, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                except OSError as error:
+                    termination_errors.append(
+                        f"{description} forced group kill error={type(error).__name__}; "
+                        "EVIDENCE_INCOMPLETE=1 reason=process-group-kill-error"
+                    )
             for pid in tracked:
                 if pid != process_id:
                     try:
                         os.kill(pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-        if _wait_for_process_tree(process, _remaining_until(cleanup_deadline), tracked):
-            return ProcessTreeResult(True, (), tuple(diagnostics))
+                    except OSError as error:
+                        termination_errors.append(
+                            f"{description} forced descendant kill pid={pid} "
+                            f"error={type(error).__name__}; "
+                            "EVIDENCE_INCOMPLETE=1 reason=process-kill-error"
+                        )
+        if _wait_for_process_tree(process, tracked=tracked, deadline=cleanup_deadline):
+            return ProcessTreeResult(
+                not termination_errors,
+                (),
+                tuple(diagnostics + termination_errors),
+            )
         return ProcessTreeResult(
             False,
-            tuple(sorted(pid for pid in tracked if _pid_alive(pid))),
-            f"{description} process group survived forced termination",
+            tuple(
+                sorted(
+                    pid for pid in tracked
+                    if _pid_alive(pid, deadline=cleanup_deadline)
+                )
+            ),
+            tuple(
+                diagnostics
+                + termination_errors
+                + [f"{description} process group survived forced termination"]
+            ),
         )
     if was_running:
         if os.name == "nt":
             try:
                 process.send_signal(signal.CTRL_BREAK_EVENT)
             except (OSError, ValueError) as error:
-                diagnostics.append(f"{description} graceful-stop-error={type(error).__name__}")
+                diagnostics.append(
+                    f"{description} graceful-stop-error={type(error).__name__}; "
+                    "EVIDENCE_INCOMPLETE=1 reason=process-term-error"
+                )
                 print(
                     f"[torturer-process] {description} graceful-stop-error={type(error).__name__}",
                     file=sys.stderr,
@@ -589,16 +666,31 @@ def _terminate_process_tree(
                 os.killpg(process_id, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+            except OSError as error:
+                termination_errors.append(
+                    f"{description} graceful group termination error={type(error).__name__}; "
+                    "EVIDENCE_INCOMPLETE=1 reason=process-group-term-error"
+                )
             for pid in tracked:
                 if pid != process_id:
                     try:
                         os.kill(pid, signal.SIGTERM)
                     except ProcessLookupError:
                         pass
+                    except OSError as error:
+                        termination_errors.append(
+                            f"{description} graceful descendant termination pid={pid} "
+                            f"error={type(error).__name__}; "
+                            "EVIDENCE_INCOMPLETE=1 reason=process-term-error"
+                        )
 
-    tree_gone = _wait_for_process_tree(process, _remaining_until(cleanup_deadline), tracked)
+    tree_gone = _wait_for_process_tree(process, tracked=tracked, deadline=cleanup_deadline)
     if tree_gone and os.name != "nt":
-        return ProcessTreeResult(True, (), tuple(diagnostics))
+        return ProcessTreeResult(
+            not termination_errors,
+            (),
+            tuple(diagnostics + termination_errors),
+        )
 
     if not tree_gone and os.name != "nt":
         diagnostics.append(f"{description} graceful-stop-expired")
@@ -641,31 +733,58 @@ def _terminate_process_tree(
                 diagnostics.append(f"{description} taskkill diagnostics were not retained")
             print(f"[torturer-process] {description} taskkill-expired", file=sys.stderr)
         except OSError as error:
-            diagnostics.append(f"{description} taskkill-error={type(error).__name__}")
+            diagnostics.append(
+                f"{description} taskkill-error={type(error).__name__}; "
+                "EVIDENCE_INCOMPLETE=1 reason=taskkill-error"
+            )
             print(
                 f"[torturer-process] {description} taskkill-error={type(error).__name__}",
                 file=sys.stderr,
             )
         if process.poll() is None:
-            process.kill()
+            try:
+                process.kill()
+            except OSError as error:
+                termination_errors.append(
+                    f"{description} forced leader kill error={type(error).__name__}; "
+                    "EVIDENCE_INCOMPLETE=1 reason=process-kill-error"
+                )
     else:
         if process.poll() is None:
             try:
                 os.killpg(process_id, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            except OSError as error:
+                termination_errors.append(
+                    f"{description} forced group kill error={type(error).__name__}; "
+                    "EVIDENCE_INCOMPLETE=1 reason=process-group-kill-error"
+                )
         for pid in tracked:
             if pid != process_id:
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                except OSError as error:
+                    termination_errors.append(
+                        f"{description} forced descendant kill pid={pid} "
+                        f"error={type(error).__name__}; "
+                        "EVIDENCE_INCOMPLETE=1 reason=process-kill-error"
+                    )
 
-    if _wait_for_process_tree(process, _remaining_until(cleanup_deadline), tracked):
-        return ProcessTreeResult(True, (), tuple(diagnostics))
-    survivors = {pid for pid in tracked if _pid_alive(pid)}
+    if _wait_for_process_tree(process, tracked=tracked, deadline=cleanup_deadline):
+        return ProcessTreeResult(
+            not termination_errors,
+            (),
+            tuple(diagnostics + termination_errors),
+        )
+    survivors = {
+        pid for pid in tracked if _pid_alive(pid, deadline=cleanup_deadline)
+    }
     if _process_group_alive(process):
         survivors.add(process_id)
+    diagnostics.extend(termination_errors)
     diagnostics.append(f"{description} process group survived forced termination")
     return ProcessTreeResult(False, tuple(sorted(survivors)), tuple(diagnostics))
 
@@ -675,14 +794,32 @@ def _timeout_bytes(error: subprocess.TimeoutExpired, name: str) -> bytes:
     return payload if isinstance(payload, bytes) else str(payload).encode("utf-8", errors="replace")
 
 
+def _output_bytes(value: bytes | str | None) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="replace")
+    return b""
+
+
+def _merge_output(previous: bytes, current: bytes) -> bytes:
+    """Merge cumulative communicate output without duplicating a prefix."""
+
+    if not previous:
+        return current
+    if not current or current.startswith(previous) or previous.startswith(current):
+        return current if len(current) >= len(previous) else previous
+    return previous + current
+
+
 def _communicate_with_tracking(
     process: subprocess.Popen[bytes],
-    timeout_seconds: float,
+    deadline: float,
     tracked: set[int],
 ) -> tuple[bytes, bytes]:
     """Communicate in bounded slices so short-lived descendants are observed."""
 
-    deadline = time.monotonic() + timeout_seconds
+    timeout_seconds = max(0.0, deadline - time.monotonic())
     stdout = b""
     stderr = b""
     while True:
@@ -696,14 +833,18 @@ def _communicate_with_tracking(
             timeout.stderr = stderr
             raise timeout
         try:
-            stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+            current_stdout, current_stderr = process.communicate(
+                timeout=min(0.1, remaining)
+            )
+            stdout = _merge_output(stdout, _output_bytes(current_stdout))
+            stderr = _merge_output(stderr, _output_bytes(current_stderr))
             tracked.update(
                 _proc_descendants(process.pid, process=process, deadline=deadline)
             )
             return stdout, stderr
         except subprocess.TimeoutExpired as error:
-            stdout = _timeout_bytes(error, "output") or stdout
-            stderr = _timeout_bytes(error, "stderr") or stderr
+            stdout = _merge_output(stdout, _timeout_bytes(error, "output"))
+            stderr = _merge_output(stderr, _timeout_bytes(error, "stderr"))
 
 
 def run_command(
@@ -750,39 +891,67 @@ def run_command(
     stdout = b""
     stderr = b""
     try:
-        observation_timeout = max(
-            0.0,
-            deadline - time.monotonic() - cleanup_reserve,
+        # Keep this as one absolute deadline across the caller/helper boundary.
+        # A fresh relative deadline here would consume the cleanup reserve if
+        # the process were descheduled between computing and using it.
+        observation_deadline = deadline - cleanup_reserve
+        stdout, stderr = _communicate_with_tracking(process, observation_deadline, tracked)
+        normal_tree_deadline = min(
+            deadline - cleanup_reserve,
+            time.monotonic() + min(COMMAND_TERMINATION_GRACE_SECONDS, 1.0),
         )
-        stdout, stderr = _communicate_with_tracking(process, observation_timeout, tracked)
-        normal_tree_timeout = min(
-            COMMAND_TERMINATION_GRACE_SECONDS,
-            1.0,
-            max(0.0, deadline - time.monotonic() - cleanup_reserve),
+        process_tree_proven = _wait_for_process_tree(
+            process,
+            tracked=tracked,
+            deadline=normal_tree_deadline,
         )
-        process_tree_proven = _wait_for_process_tree(process, normal_tree_timeout, tracked)
         if not process_tree_proven:
             cleanup_diagnostics.append("normal completion left an unproven or surviving process tree")
             cleanup_result = _terminate_process_tree(
                 process,
-                grace_seconds=_remaining_until(deadline),
                 description="command",
                 force_immediately=True,
                 evidence_directory=evidence_root,
+                deadline=deadline,
             )
             cleanup_diagnostics.extend(cleanup_result.diagnostics)
             process_tree_proven = cleanup_result.process_tree_proven
             survivor_pids = cleanup_result.survivor_pids
             try:
-                stdout, stderr = process.communicate(timeout=_remaining_until(deadline))
+                drained_stdout, drained_stderr = process.communicate(
+                    timeout=_remaining_until(deadline)
+                )
+                stdout = _merge_output(stdout, _output_bytes(drained_stdout))
+                stderr = _merge_output(stderr, _output_bytes(drained_stderr))
             except subprocess.TimeoutExpired as error:
-                stdout = _timeout_bytes(error, "output") or stdout
-                stderr = _timeout_bytes(error, "stderr") or stderr
+                stdout = _merge_output(stdout, _timeout_bytes(error, "output"))
+                stderr = _merge_output(stderr, _timeout_bytes(error, "stderr"))
                 cleanup_diagnostics.append("command diagnostics did not drain after normal-completion cleanup")
-            final_proof = _wait_for_process_tree(process, _remaining_until(deadline), tracked)
+            except OSError as error:
+                stdout = _merge_output(
+                    stdout, _output_bytes(getattr(error, "stdout", None))
+                )
+                stderr = _merge_output(
+                    stderr, _output_bytes(getattr(error, "stderr", None))
+                )
+                cleanup_diagnostics.append(
+                    "command diagnostics drain error="
+                    + type(error).__name__
+                    + "; output evidence is incomplete; EVIDENCE_INCOMPLETE=1 reason=output-drain-error"
+                )
+            final_proof = _wait_for_process_tree(
+                process,
+                tracked=tracked,
+                deadline=deadline,
+            )
             process_tree_proven = process_tree_proven and final_proof
             if not final_proof:
-                survivor_pids = tuple(sorted({pid for pid in tracked if _pid_alive(pid)}))
+                survivor_pids = tuple(
+                    sorted(
+                        pid for pid in tracked
+                        if _pid_alive(pid, deadline=deadline)
+                    )
+                )
                 cleanup_diagnostics.append(
                     "command process tree could not be proven gone after normal-completion cleanup"
                 )
@@ -799,10 +968,10 @@ def run_command(
         )
         cleanup_result = _terminate_process_tree(
             process,
-            grace_seconds=_remaining_until(deadline),
             description="command",
             force_immediately=True,
             evidence_directory=evidence_root,
+            deadline=deadline,
         )
         cleanup_diagnostics.extend(cleanup_result.diagnostics)
         process_tree_proven = cleanup_result.process_tree_proven
@@ -814,35 +983,103 @@ def run_command(
             )
         try:
             drain_timeout = _remaining_until(deadline)
-            stdout, stderr = process.communicate(timeout=drain_timeout)
+            drained_stdout, drained_stderr = process.communicate(timeout=drain_timeout)
+            stdout = _merge_output(stdout, _output_bytes(drained_stdout))
+            stderr = _merge_output(stderr, _output_bytes(drained_stderr))
         except subprocess.TimeoutExpired as error:
-            stdout = _timeout_bytes(error, "output") or stdout
-            stderr = _timeout_bytes(error, "stderr") or stderr
+            stdout = _merge_output(stdout, _timeout_bytes(error, "output"))
+            stderr = _merge_output(stderr, _timeout_bytes(error, "stderr"))
             cleanup_diagnostics.append("command diagnostics did not drain after forced termination")
-        final_proof = _wait_for_process_tree(process, _remaining_until(deadline), tracked)
+        except OSError as error:
+            stdout = _merge_output(
+                stdout, _output_bytes(getattr(error, "stdout", None))
+            )
+            stderr = _merge_output(
+                stderr, _output_bytes(getattr(error, "stderr", None))
+            )
+            cleanup_diagnostics.append(
+                "command diagnostics drain error="
+                + type(error).__name__
+                + "; output evidence is incomplete; EVIDENCE_INCOMPLETE=1 reason=output-drain-error"
+            )
+        final_proof = _wait_for_process_tree(
+            process,
+            tracked=tracked,
+            deadline=deadline,
+        )
         process_tree_proven = process_tree_proven and final_proof
         if not final_proof:
             final_cleanup = _terminate_process_tree(
                 process,
-                grace_seconds=_remaining_until(deadline),
                 description="command-final",
                 force_immediately=True,
                 evidence_directory=evidence_root,
+                deadline=deadline,
             )
             cleanup_diagnostics.extend(final_cleanup.diagnostics)
             process_tree_proven = process_tree_proven and final_cleanup.process_tree_proven
             survivor_pids = final_cleanup.survivor_pids
             try:
-                stdout, stderr = process.communicate(timeout=_remaining_until(deadline))
+                drained_stdout, drained_stderr = process.communicate(
+                    timeout=_remaining_until(deadline)
+                )
+                stdout = _merge_output(stdout, _output_bytes(drained_stdout))
+                stderr = _merge_output(stderr, _output_bytes(drained_stderr))
             except subprocess.TimeoutExpired as error:
-                stdout = _timeout_bytes(error, "output") or stdout
-                stderr = _timeout_bytes(error, "stderr") or stderr
+                stdout = _merge_output(stdout, _timeout_bytes(error, "output"))
+                stderr = _merge_output(stderr, _timeout_bytes(error, "stderr"))
                 cleanup_diagnostics.append("command diagnostics did not drain after final cleanup")
-            final_proof = _wait_for_process_tree(process, _remaining_until(deadline), tracked)
+            except OSError as error:
+                stdout = _merge_output(
+                    stdout, _output_bytes(getattr(error, "stdout", None))
+                )
+                stderr = _merge_output(
+                    stderr, _output_bytes(getattr(error, "stderr", None))
+                )
+                cleanup_diagnostics.append(
+                    "command final diagnostics drain error="
+                    + type(error).__name__
+                    + "; output evidence is incomplete; EVIDENCE_INCOMPLETE=1 reason=output-drain-error"
+                )
+            final_proof = _wait_for_process_tree(
+                process,
+                tracked=tracked,
+                deadline=deadline,
+            )
             process_tree_proven = process_tree_proven and final_proof
             if not final_proof:
-                survivor_pids = tuple(sorted({pid for pid in tracked if _pid_alive(pid)}))
+                survivor_pids = tuple(
+                    sorted(
+                        pid for pid in tracked
+                        if _pid_alive(pid, deadline=deadline)
+                    )
+                )
                 cleanup_diagnostics.append("command process tree survived final cleanup")
+    except OSError as error:
+        # Preserve any bytes collected before a pipe/read failure, perform the
+        # same bounded tree cleanup, and retain an explicit incomplete-output
+        # diagnostic instead of dropping the exception out of the runner.
+        cleanup_diagnostics.append(
+            "command diagnostics error="
+            + type(error).__name__
+            + "; output evidence is incomplete; EVIDENCE_INCOMPLETE=1 reason=output-drain-error"
+        )
+        stdout = _merge_output(
+            stdout, _output_bytes(getattr(error, "stdout", None))
+        )
+        stderr = _merge_output(
+            stderr, _output_bytes(getattr(error, "stderr", None))
+        )
+        cleanup_result = _terminate_process_tree(
+            process,
+            description="command-output-error",
+            force_immediately=True,
+            evidence_directory=evidence_root,
+            deadline=deadline,
+        )
+        cleanup_diagnostics.extend(cleanup_result.diagnostics)
+        process_tree_proven = process_tree_proven and cleanup_result.process_tree_proven
+        survivor_pids = cleanup_result.survivor_pids
     finally:
         finalization_errors = _finalize_process(
             process,
@@ -853,8 +1090,6 @@ def run_command(
             process_tree_proven = False
             cleanup_diagnostics.extend(finalization_errors)
     tree_diagnostics = getattr(process, "_torturer_tree_census_diagnostics", b"")
-    if tree_diagnostics:
-        stderr += b"\n--- process-tree-census-diagnostics ---\n" + tree_diagnostics
     elapsed_seconds = time.monotonic() - started_at
     deadline_exceeded = elapsed_seconds > timeout_seconds
     if deadline_exceeded:
@@ -875,9 +1110,17 @@ def run_command(
         elapsed_seconds=elapsed_seconds,
         cleanup_reserve_seconds=cleanup_reserve,
         deadline_exceeded=deadline_exceeded,
+        process_tree_diagnostics_bytes=tree_diagnostics,
+        process_tree_diagnostics_path=None,
     )
     try:
-        paths = _retain_command_streams(evidence_root, evidence_label, stdout, stderr)
+        paths = _retain_command_streams(
+            evidence_root,
+            evidence_label,
+            stdout,
+            stderr,
+            tree_diagnostics,
+        )
         cleanup_path = _retain_cleanup_record(
             evidence_root,
             evidence_label,
@@ -885,12 +1128,14 @@ def run_command(
             elapsed_seconds=elapsed_seconds,
             cleanup_reserve_seconds=cleanup_reserve,
             deadline_exceeded=deadline_exceeded,
+            process_tree_diagnostics_path=paths.get("process_tree_diagnostics"),
         )
         result = replace(
             result,
             stdout_path=paths["stdout"],
             stderr_path=paths["stderr"],
             cleanup_path=cleanup_path,
+            process_tree_diagnostics_path=paths.get("process_tree_diagnostics"),
         )
     except SliceFailure as error:
         evidence_error = error
@@ -909,10 +1154,17 @@ def run_command(
     emit_command_diagnostics(result)
     if evidence_error is not None:
         raise SliceFailure(f"{evidence_error}\n{result.describe()}") from evidence_error
-    if not process_tree_proven or (cleanup_diagnostics and not timed_out):
-        raise SliceFailure(f"{'; '.join(cleanup_diagnostics)}\n{result.describe()}")
+    # Preserve the primary timeout classification even when the same absolute
+    # deadline also made a cleanup/census proof inconclusive.  The detail
+    # remains attached so a caller cannot mistake this for a clean timeout.
     if timed_out:
-        raise SliceFailure(f"command timed out after {timeout_seconds:g}s\n{result.describe()}")
+        details = "; ".join(cleanup_diagnostics)
+        suffix = f"; {details}" if details else ""
+        raise SliceFailure(
+            f"command timed out after {timeout_seconds:g}s{suffix}\n{result.describe()}"
+        )
+    if not process_tree_proven or cleanup_diagnostics:
+        raise SliceFailure(f"{'; '.join(cleanup_diagnostics)}\n{result.describe()}")
     return result
 
 
@@ -1046,11 +1298,12 @@ def stop_service(
 ) -> None:
     """Stop the service tree, prove it is gone, and remove only our socket."""
 
+    cleanup_deadline = time.monotonic() + max(0.0, timeout_seconds)
     cleanup = _terminate_process_tree(
         process,
-        grace_seconds=max(0.0, timeout_seconds),
         description="service",
         evidence_directory=evidence_directory,
+        deadline=cleanup_deadline,
     )
     if not cleanup.process_tree_proven or cleanup.diagnostics:
         raise SliceFailure(

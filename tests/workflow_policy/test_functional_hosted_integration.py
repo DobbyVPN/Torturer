@@ -31,7 +31,16 @@ class FunctionalHostedIntegrationPolicyTest(unittest.TestCase):
                 values = [int(value) for value in re.findall(r"(?m)^    timeout-minutes:\s*(\d+)\s*$", text)]
                 self.assertTrue(values)
                 self.assertLessEqual(max(values), 30)
-                self.assertIn("    timeout-minutes: 30", _job(text, "client", "controller"))
+                client = _job(text, "client", "controller")
+                if platform == "android":
+                    build = _job(text, "build", "client")
+                    build_timeout = int(re.search(r"(?m)^    timeout-minutes:\s*(\d+)\s*$", build).group(1))
+                    client_timeout = int(re.search(r"(?m)^    timeout-minutes:\s*(\d+)\s*$", client).group(1))
+                    self.assertEqual(build_timeout, 10)
+                    self.assertEqual(client_timeout, 20)
+                    self.assertLessEqual(build_timeout + client_timeout, 30)
+                else:
+                    self.assertIn("    timeout-minutes: 30", client)
                 self.assertIn("    timeout-minutes: 30", _job(text, "controller"))
 
     def test_client_and_controller_have_absolute_deadlines_and_reserve(self) -> None:

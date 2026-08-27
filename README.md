@@ -40,6 +40,13 @@ profile to the client's ephemeral certificate. Candidate execution begins only
 after token-bearing GitHub operations finish; it never receives the Render
 credential or a repository-control token.
 
+Hosted full qualification leases the Render account sequentially: the
+unattended controller dispatches the next platform only after the previous
+platform's two services have been deleted and their absence independently
+verified. The fixed concurrency group in `server-lease.yml` is an account-wide
+admission guard for overlapping dispatches; it is not a matrix queue and must
+not be treated as the sequencing mechanism.
+
 Linux, Windows, and macOS use the product's public service and CLI. Android uses
 a headless KVM emulator and the candidate-owned
 `AndroidHostedProfileInstrumentationTest` driver. Every adapter executes the
@@ -84,9 +91,12 @@ prefix and key, emits both canonical `websocket-stream` (`/tcp`) and
 builds the in-memory DobbyVPN profile only after a trusted service URL is
 known. The key and generated config are provider handoff data; they are never
 public result data. The protected `python -m torturer_provider.lease_cli`
-boundary creates and cleans one tagged Render lease, writes the profile only to
-owner-only storage for immediate encryption, and starts the immutable Outline
-image with `/outline-ss-server -config=/etc/secrets/config.yml`.
+boundary uses one schema-2 bundle of the Outline lease and a separately pinned
+upload sink for Linux, Windows, macOS, and Android. It writes the profile and
+the random sink URL only to owner-only storage for immediate CMS encryption,
+and starts the immutable images with
+`/outline-ss-server -config=/etc/secrets/config.yml` and
+`/upload-sink --path-file=/etc/secrets/upload-path`.
 
 The trusted-runner package `torturer_checks.hosted` records complete command
 bytes in its private runner-local directory, converts independently observed
@@ -100,8 +110,9 @@ endpoint, key, URL, command argument, or observed public identity.
 - Untrusted candidate builds receive no secrets and have read-only repository
   permissions.
 - A trusted functional client receives only its short-lived synthetic VPN
-  profile, after exact closure verification and after GitHub token operations
-  finish; it never receives the provider credential or a write-capable token.
+  profile and upload handoff, after exact closure verification and after
+  GitHub token operations finish; it never receives the provider credential or
+  a write-capable token.
 - The exact source repository and full 40-character commit SHA are recorded.
 - Workflow and third-party action references are pinned to immutable commits.
 - Candidate-controlled values are passed through environment variables and

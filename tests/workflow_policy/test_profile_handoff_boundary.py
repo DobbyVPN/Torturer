@@ -59,15 +59,21 @@ class ProfileHandoffBoundaryPolicyTest(unittest.TestCase):
             self.assertIn('"$HANDOFF_DIR/recipient.key"', text, name)
             remove = self._step(text, "Remove plaintext handoff material")
             self.assertIn("if: always()", remove, name)
-            self.assertIn('rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/recipient.key"', remove, name)
+            self.assertIn(
+                'rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/upload-url.txt" "$HANDOFF_DIR/recipient.key"',
+                remove,
+                name,
+            )
             self.assertNotIn("recipient.key", self._step(text, "Upload public certificate"), name)
             self.assertIn("profile.cms", text, name)
+            self.assertIn("upload.cms", text, name)
             self.assertIn("openssl cms -decrypt", text, name)
 
     def test_lease_job_uploads_only_ciphertext_and_safe_record(self) -> None:
         upload = self._step(self.lease, "Upload encrypted profile and safe lease record")
         self.assertIn("profile.cms", upload)
         self.assertIn("lease.json", upload)
+        self.assertIn("upload.cms", upload)
         self.assertNotIn("profile.toml", upload)
         self.assertNotIn("recipient.key", upload)
         self.assertNotIn("recipient.crt", upload)
@@ -88,7 +94,7 @@ class ProfileHandoffBoundaryPolicyTest(unittest.TestCase):
         upload = self.lease.index("- name: Upload encrypted profile and safe lease record")
         cleanup = self.lease.index("- name: Remove plaintext lease material")
         self.assertLess(encrypt, upload)
-        self.assertIn('rm -f "$lease_dir/profile.toml" "$lease_dir/request/unpacked/recipient.crt"', self.lease[cleanup:])
+        self.assertIn('rm -f "$lease_dir/profile.toml" "$lease_dir/upload-url.txt" "$lease_dir/request/unpacked/recipient.crt"', self.lease[cleanup:])
         self.assertIn("if: always()", self.lease[self.lease.index("- name: Remove plaintext lease material") - 30:])
         self.assertIn('rm -f "$LEASE_DIR/profile.toml"', self.lease)
         self.assertNotIn("recipient.key", self.lease)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -16,6 +17,7 @@ from torturer_checks.hosted.macos_route import (
     restore,
     verify_baseline,
 )
+from torturer_checks.hosted.macos_route import _service_is_dead
 
 
 _BASELINE_TEXT = (
@@ -195,6 +197,50 @@ class HostedMacOSRouteTests(unittest.TestCase):
                     )
             with self.assertRaisesRegex(MacOSRouteError, "DEFAULT_ROUTE_BASELINE_MISSING"):
                 decide_restore(None, MacOSRouteProbe(0, None, True), service_dead=True)
+
+    def test_service_probe_is_bound_to_pid_start_identity_and_command(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="macos-route-identity-") as directory:
+            root = Path(directory)
+            probe = root / "service-probe.raw.log"
+            identity = root / "service.identity.json"
+            identity.write_text(
+                json.dumps(
+                    {
+                        "pid": 123,
+                        "start": "Wed Aug 27 12:34:56 2026",
+                        "command": "/candidate/macos_grpcvpnserver -port 50051",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def capture(command, path, timeout_seconds):
+                path.write_text(
+                    "123 Wed Aug 27 12:34:56 2026 /candidate/macos_grpcvpnserver -port 50051\n",
+                    encoding="utf-8",
+                )
+                return 0
+
+            with mock.patch("torturer_checks.hosted.macos_route._capture", side_effect=capture):
+                self.assertFalse(_service_is_dead(123, 10, probe, identity))
+
+            identity.write_text(
+                json.dumps(
+                    {
+                        "pid": 123,
+                        "start": "Wed Aug 27 12:34:57 2026",
+                        "command": "/candidate/macos_grpcvpnserver -port 50051",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch("torturer_checks.hosted.macos_route._capture", side_effect=capture),
+                self.assertRaisesRegex(
+                    MacOSRouteError, "DEFAULT_ROUTE_SERVICE_IDENTITY_MISMATCH"
+                ),
+            ):
+                _service_is_dead(123, 10, probe, identity)
 
 
 if __name__ == "__main__":

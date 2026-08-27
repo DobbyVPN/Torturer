@@ -1,0 +1,299 @@
+name: Publish immutable HTTPS upload sink
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-upload-sink-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and publish upload-sink image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      image_digest: ${{ steps.image_identity.outputs.digest }}
+      image_ref: ${{ steps.image_identity.outputs.image_ref }}
+    env:
+      IMAGE_NAME: ghcr.io/dobbyvpn/torturer-upload-sink
+      GO_VERSION: '1.24.6'
+
+    steps:
+      - name: Check out exact source revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify clean source identity
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Set up pinned Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Test and build static binary
+        working-directory: server/upload_sink
+        env:
+          CGO_ENABLED: '0'
+          GOFLAGS: '-mod=readonly'
+          GOPROXY: 'off'
+          GOSUMDB: 'off'
+          GOTOOLCHAIN: 'local'
+        run: |
+          set -euo pipefail
+          test "$(go env GOVERSION)" = "go${GO_VERSION}"
+          go test -count=1 ./...
+          mkdir -p "$RUNNER_TEMP/upload-sink-context"
+          go build -trimpath -buildvcs=false -ldflags='-buildid=' -o "$RUNNER_TEMP/upload-sink-context/upload-sink" .
+          cp Dockerfile .dockerignore "$RUNNER_TEMP/upload-sink-context/"
+          sha256sum "$RUNNER_TEMP/upload-sink-context/upload-sink"
+
+      - name: Build container and run non-root upload smoke test
+        run: |
+          set -euo pipefail
+          context="$RUNNER_TEMP/upload-sink-context"
+          smoke_tag="$IMAGE_NAME:smoke-$GITHUB_SHA"
+          docker buildx build \
+            --platform linux/amd64 \
+            --tag "$smoke_tag" \
+            --load \
+            "$context"
+          smoke_dir="$RUNNER_TEMP/upload-sink-smoke"
+          mkdir -p "$smoke_dir"
+          upload_path="/upload/0123456789abcdef0123456789abcdef"
+          printf '%s\n' "$upload_path" > "$smoke_dir/upload-path"
+          sudo chown 0:1000 "$smoke_dir/upload-path"
+          chmod 0440 "$smoke_dir/upload-path"
+          head -c 1048576 /dev/zero > "$smoke_dir/payload.bin"
+          chmod 0600 "$smoke_dir/payload.bin"
+          container="upload-sink-smoke-$GITHUB_RUN_ID"
+          container_started=false
+          cleanup() {
+            status="$?"
+            cleanup_status=0
+            if [ "$container_started" = true ]; then
+              docker logs "$container" || cleanup_status=$?
+              docker rm -f "$container" || cleanup_status=$?
+            fi
+            docker image rm "$smoke_tag" || cleanup_status=$?
+            if [ "$status" -ne 0 ]; then
+              exit "$status"
+            fi
+            exit "$cleanup_status"
+          }
+          trap cleanup EXIT
+          image_user="$(docker image inspect "$smoke_tag" --format '{{.Config.User}}')"
+          printf 'smoke_image_user=%s\n' "$image_user"
+          test "$image_user" = "65532:1000"
+          docker run --detach \
+            --name "$container" \
+            --platform linux/amd64 \
+            --env PORT=18080 \
+            --volume "$smoke_dir/upload-path:/etc/secrets/upload-path:ro" \
+            --publish 127.0.0.1:18080:18080 \
+            "$smoke_tag" \
+            --path-file=/etc/secrets/upload-path
+          container_started=true
+          health_ready=false
+          for attempt in $(seq 1 30); do
+            if curl --fail --show-error --max-time 2 \
+              --write-out "smoke_health_attempt=$attempt status=%{http_code}\n" \
+              http://127.0.0.1:18080/healthz; then
+              health_ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$health_ready" = true
+          upload_result="$(curl --fail --show-error --max-time 10 \
+            --request POST \
+            --upload-file "$smoke_dir/payload.bin" \
+            --output /dev/null \
+            --write-out '%{size_upload} %{http_code}\n' \
+            "http://127.0.0.1:18080$upload_path")"
+          printf 'smoke_upload_result=%s\n' "$upload_result"
+          test "$upload_result" = "1048576 204"
+
+      - name: Log in to GHCR without exposing the token
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build and push immutable image with provenance
+        env:
+          BUILD_METADATA: ${{ runner.temp }}/upload-sink-build-metadata.json
+        run: |
+          set -euo pipefail
+          image_tag="$IMAGE_NAME:$GITHUB_SHA"
+          docker buildx build \
+            --platform linux/amd64 \
+            --file "$RUNNER_TEMP/upload-sink-context/Dockerfile" \
+            --tag "$image_tag" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label 'org.opencontainers.image.created=1970-01-01T00:00:00Z' \
+            --provenance=mode=max \
+            --sbom=true \
+            --metadata-file "$BUILD_METADATA" \
+            --push "$RUNNER_TEMP/upload-sink-context"
+
+      - name: Verify and emit immutable digest and provenance
+        id: image_identity
+        env:
+          BUILD_METADATA: ${{ runner.temp }}/upload-sink-build-metadata.json
+          RECORD: ${{ runner.temp }}/upload-sink-image-identity.json
+        run: |
+          set -euo pipefail
+          python3 - "$BUILD_METADATA" "$RECORD" "$IMAGE_NAME" "$GITHUB_SHA" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          metadata_path, record_path, image_name, source_sha = sys.argv[1:]
+          metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+          digest = metadata.get("containerimage.digest")
+          if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit("BuildKit did not emit an immutable image digest")
+          if set(digest[7:]) == {"0"}:
+              raise SystemExit("BuildKit emitted an invalid zero image digest")
+          provenance = metadata.get("buildx.build.provenance")
+          if provenance in (None, "", {}):
+              raise SystemExit("BuildKit did not emit provenance metadata")
+          record = {
+              "image": image_name,
+              "tag": source_sha,
+              "digest": digest,
+              "image_ref": f"{image_name}@{digest}",
+              "source_sha": source_sha,
+              "provenance": provenance,
+          }
+          Path(record_path).write_text(
+              json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          print(f"image_ref={record['image_ref']}")
+          print(f"source_sha={source_sha}")
+          with Path(sys.argv[2] + ".env").open("w", encoding="utf-8") as output:
+              output.write(f"IMAGE_DIGEST={digest}\n")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"digest={digest}\n")
+              output.write(f"image_ref={image_name}@{digest}\n")
+          PY
+          digest="$(sed -n 's/^IMAGE_DIGEST=//p' "$RECORD.env")"
+          test -n "$digest"
+          {
+            printf 'image=%s\n' "$IMAGE_NAME"
+            printf 'tag=%s\n' "$GITHUB_SHA"
+            printf 'digest=%s\n' "$digest"
+            printf 'image_ref=%s@%s\n' "$IMAGE_NAME" "$digest"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify anonymous digest pull and pushed manifest
+        env:
+          BUILD_METADATA: ${{ runner.temp }}/upload-sink-build-metadata.json
+        run: |
+          set -euo pipefail
+          digest="$(python3 - "$BUILD_METADATA" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          digest = value.get("containerimage.digest")
+          if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit("BuildKit metadata does not contain a valid image digest")
+          print(digest)
+          PY
+          )"
+          image_ref="$IMAGE_NAME@$digest"
+          printf 'anonymous_pull_image_ref=%s\n' "$image_ref"
+          docker logout ghcr.io
+          docker pull --platform linux/amd64 "$image_ref"
+
+          pulled_smoke_dir="$RUNNER_TEMP/upload-sink-pulled-smoke"
+          mkdir -p "$pulled_smoke_dir"
+          upload_path="/upload/0123456789abcdef0123456789abcdef"
+          printf '%s\n' "$upload_path" > "$pulled_smoke_dir/upload-path"
+          sudo chown 0:1000 "$pulled_smoke_dir/upload-path"
+          chmod 0440 "$pulled_smoke_dir/upload-path"
+          head -c 1048576 /dev/zero > "$pulled_smoke_dir/payload.bin"
+          chmod 0600 "$pulled_smoke_dir/payload.bin"
+          pulled_container="upload-sink-pulled-smoke-$GITHUB_RUN_ID"
+          pulled_container_started=false
+          cleanup_pulled() {
+            status="$?"
+            cleanup_status=0
+            if [ "$pulled_container_started" = true ]; then
+              docker logs "$pulled_container" || cleanup_status=$?
+              docker rm -f "$pulled_container" || cleanup_status=$?
+            fi
+            docker image rm "$image_ref" || cleanup_status=$?
+            if [ "$status" -ne 0 ]; then
+              exit "$status"
+            fi
+            exit "$cleanup_status"
+          }
+          trap cleanup_pulled EXIT
+
+          pulled_image_user="$(docker image inspect "$image_ref" --format '{{.Config.User}}')"
+          pulled_entrypoint="$(docker image inspect "$image_ref" --format '{{json .Config.Entrypoint}}')"
+          printf 'pulled_image_user=%s\n' "$pulled_image_user"
+          printf 'pulled_entrypoint=%s\n' "$pulled_entrypoint"
+          test "$pulled_image_user" = "65532:1000"
+          test "$pulled_entrypoint" = '["/upload-sink"]'
+
+          docker buildx imagetools inspect "$image_ref"
+          docker run --detach \
+            --name "$pulled_container" \
+            --platform linux/amd64 \
+            --env PORT=18081 \
+            --volume "$pulled_smoke_dir/upload-path:/etc/secrets/upload-path:ro" \
+            --publish 127.0.0.1:18081:18081 \
+            "$image_ref" \
+            --path-file=/etc/secrets/upload-path
+          pulled_container_started=true
+          pulled_health_ready=false
+          for attempt in $(seq 1 30); do
+            if curl --fail --show-error --max-time 2 \
+              --write-out "pulled_smoke_health_attempt=$attempt status=%{http_code}\n" \
+              "http://127.0.0.1:18081/healthz"; then
+              pulled_health_ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$pulled_health_ready" = true
+          pulled_upload_result="$(curl --fail --show-error --max-time 10 \
+            --request POST \
+            --upload-file "$pulled_smoke_dir/payload.bin" \
+            --output /dev/null \
+            --write-out '%{size_upload} %{http_code}\n' \
+            "http://127.0.0.1:18081$upload_path")"
+          printf 'pulled_smoke_upload_result=%s\n' "$pulled_upload_result"
+          test "$pulled_upload_result" = "1048576 204"
+
+      - name: Upload digest and provenance record
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: upload-sink-image-identity-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/upload-sink-image-identity.json
+            ${{ runner.temp }}/upload-sink-build-metadata.json
+          if-no-files-found: error
+          retention-days: 7

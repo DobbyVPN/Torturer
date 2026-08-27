@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 import unittest
 
+from .lease_validator_helpers import adversarial_leases, run_validator, valid_lease
+
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "functional.yml"
@@ -28,6 +30,10 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("deadline = int(started.timestamp()) + 30 * 60", self.text)
         self.assertIn("RUN_DEADLINE_EPOCH", self.text)
         self.assertIn("RUN_DEADLINE_EPOCH - $(date +%s) - 120", self.text)
+        self.assertIn("if int(datetime.datetime.now(datetime.timezone.utc).timestamp()) >= deadline:", self.text)
+        self.assertIn("readiness_reserve_seconds=120", self.text)
+        self.assertIn('route_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 120 - 1))', self.text)
+        self.assertIn('"${route_timeout}s"', self.text)
         self.assertIn("torturer_checks.hosted.deadline", self.text)
         self.assertIn('--timeout-seconds "$remaining" --kill-grace-seconds 30', self.text)
         self.assertIn("PLATFORM: linux", self.text)
@@ -49,7 +55,7 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("ip -o route show table main default", discovery_block)
         self.assertIn('NETWORK_INTERFACE=%s\\n', discovery_block)
         self.assertIn('ip link show dev "$network_interface"', discovery_block)
-        self.assertIn('timeout --foreground --signal=TERM --kill-after=1s 10s', discovery_block)
+        self.assertIn('timeout --foreground --signal=TERM --kill-after=1s "${route_timeout}s"', discovery_block)
         self.assertNotIn("> /dev/null", discovery_block)
         self.assertNotIn("2> /dev/null", discovery_block)
         self.assertIn('--network-interface "$NETWORK_INTERFACE"', block)
@@ -58,6 +64,8 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
             block,
         )
         self.assertIn('--download-url "https://proof.ovh.net/files/1Mb.dat"', block)
+        self.assertIn('--upload-url "$upload_url"', block)
+        self.assertNotIn("speed.cloudflare.com/__up", block)
         self.assertNotRegex(block, r'--(?:download|upload)-url\s+"[^"\n]*[?#]')
         self.assertNotIn("speed.cloudflare.com/__down?", block)
 
@@ -117,12 +125,15 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         deadline = self.text.index("- name: Establish the hard thirty-minute workflow deadline")
         request = self.text.index("- name: Upload public certificate and opaque request after verified client readiness")
         wait = self.text.index("- name: Wait for and download the exact encrypted lease response")
+        decrypt = self.text.index("- name: Validate and decrypt the encrypted profile")
         start = self.text.index("- name: Start the candidate Linux service")
         functional = self.text.index("- name: Run canonical Linux functional scenarios")
         self.assertLess(verify, deadline)
         self.assertLess(deadline, request)
         self.assertLess(request, wait)
+        self.assertLess(wait, decrypt)
         self.assertLess(wait, start)
+        self.assertLess(decrypt, start)
         self.assertLess(start, functional)
         self.assertNotIn("GH_TOKEN", self.text[start:functional])
 
@@ -138,6 +149,11 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("torturer_checks.hosted.artifacts", self.text)
         self.assertIn("--expect-file lease.json", self.text)
         self.assertIn("--expect-file profile.cms", self.text)
+        self.assertIn("--expect-file upload.cms", self.text)
+        self.assertIn('test -f "$LEASE_RESPONSE_DIR/upload.cms"', self.text)
+        self.assertIn('SERVER_SINK_IMAGE_DIGEST', self.text)
+        self.assertIn('upload-url.txt', self.text)
+        self.assertIn(r'https://[A-Za-z0-9.-]{1,253}/upload/[0-9a-f]{32}', self.text)
         self.assertIn('--run-id "$lease_workflow_run_id"', self.text)
         self.assertNotIn('--run-id "$GITHUB_RUN_ID"', self.text)
         self.assertIn('"path": ".github/workflows/server-lease.yml"', self.text)
@@ -174,7 +190,10 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("if: always()", self.text[stop:result])
         self.assertIn("if: always()", self.text[result:marker])
         self.assertIn("if: always()", self.text[marker:remove])
-        self.assertIn('rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/recipient.key"', self.text)
+        self.assertIn(
+            'rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/upload-url.txt" "$HANDOFF_DIR/recipient.key"',
+            self.text,
+        )
 
     def test_diagnostic_suppression_is_not_added(self) -> None:
         self.assertNotRegex(self.text, r">\s*/dev/null|2>\s*/dev/null|--quiet(?:\s|$)")
@@ -186,6 +205,21 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         cleanup = self.text[stop:]
         self.assertIn('ps -eo pid=,ppid=,args= > "$children_snapshot" 2>&1', cleanup)
         self.assertIn('emit_private_evidence service-children "$children_snapshot"', cleanup)
+
+    def test_schema_two_validator_rejects_identity_binding_and_private_field_attacks(self) -> None:
+        self.assertEqual(run_validator(self.text, valid_lease("linux")).returncode, 0)
+        for label, lease in adversarial_leases("linux").items():
+            with self.subTest(label=label):
+                self.assertNotEqual(run_validator(self.text, lease).returncode, 0)
+
+    def test_expired_and_short_budgets_fail_closed(self) -> None:
+        client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
+        self.assertIn('if [ "$readiness_remaining" -le 0 ]; then', client)
+        self.assertIn('if [ "$route_remaining" -le 0 ]; then', client)
+        self.assertIn('if [ "$route_timeout" -gt "$route_remaining" ]; then', client)
+        self.assertIn('if [ "$openssl_timeout" -le 0 ]; then', client)
+        self.assertIn('if [ "$transfer_timeout" -le 0 ]; then', client)
+        self.assertIn('if [ "$cleanup_deadline_hit" = true ]; then', client)
 
 
 if __name__ == "__main__":
