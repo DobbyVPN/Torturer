@@ -119,6 +119,16 @@ class FunctionalAndroidWorkflowPolicyTest(unittest.TestCase):
         self.assertIn('kill -KILL -- "-$emulator_pid"', client)
         self.assertNotIn('adb_missing_during_cleanup=%s', client)
 
+    def test_android_diagnostics_ignore_non_command_raw_logs(self) -> None:
+        self.assertIn(
+            'files = sorted(raw_dir.glob("command-*.raw.log"))',
+            self.text,
+        )
+        self.assertNotIn(
+            'files = sorted(raw_dir.glob("*.raw.log"))',
+            self.text,
+        )
+
     def test_android_cleanup_worst_case_fits_the_finalization_reserve(self) -> None:
         client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
         cleanup = client[client.index("- name: Stop Android emulator"):]

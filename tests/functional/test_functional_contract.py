@@ -513,6 +513,68 @@ class FunctionalContractTests(unittest.TestCase):
         self.assertEqual(result.metrics, {})
         validate_result_payload(result.to_dict())
 
+    def test_non_throughput_zero_metrics_are_omitted_from_v2_result(self):
+        class ZeroMetricAdapter(FakeAdapter):
+            def execute(self, step):
+                value = super().execute(step)
+                for key in ("latency_ms", "download_mbps", "upload_mbps"):
+                    value[key] = 0.0
+                return value
+
+        reference = EvidenceReference(id="command-001", bytes=17, sha256="f" * 64)
+        result = FunctionalEngine("e" * 64, schema_version=2).run(
+            get_scenario("functional.configure"),
+            ZeroMetricAdapter(),
+            provenance(),
+            evidence_provider=lambda: (reference,),
+        )
+        self.assertEqual(result.outcome, "passed")
+        self.assertEqual(result.metrics, {})
+        validate_result_payload(result.to_dict())
+
+    def test_throughput_failure_retains_zero_metrics_for_diagnostics(self):
+        class ZeroMetricAdapter(FakeAdapter):
+            def execute(self, step):
+                value = super().execute(step)
+                for key in ("latency_ms", "download_mbps", "upload_mbps"):
+                    value[key] = 0.0
+                return value
+
+        reference = EvidenceReference(id="command-001", bytes=17, sha256="f" * 64)
+        result = FunctionalEngine("e" * 64, schema_version=2).run(
+            get_scenario("functional.stability-throughput"),
+            ZeroMetricAdapter(),
+            provenance(),
+            evidence_provider=lambda: (reference,),
+        )
+        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(result.reason_code, "ASSERTION_FAILED")
+        self.assertEqual(
+            result.metrics,
+            {"latency_ms": 0.0, "download_mbps": 0.0, "upload_mbps": 0.0},
+        )
+        validate_result_payload(result.to_dict())
+
+    def test_non_throughput_invalid_metrics_fail_closed(self):
+        reference = EvidenceReference(id="command-001", bytes=17, sha256="f" * 64)
+        for invalid in (-1.0, float("nan")):
+            with self.subTest(invalid=invalid):
+                class InvalidMetricAdapter(FakeAdapter):
+                    def execute(self, step):
+                        value = super().execute(step)
+                        value["latency_ms"] = invalid
+                        return value
+
+                with self.assertRaisesRegex(
+                    ResultValidationError, "metrics.latency_ms"
+                ):
+                    FunctionalEngine("e" * 64, schema_version=2).run(
+                        get_scenario("functional.configure"),
+                        InvalidMetricAdapter(),
+                        provenance(),
+                        evidence_provider=lambda: (reference,),
+                    )
+
     def test_private_provenance_can_omit_render_image_digest(self):
         private = RunProvenance(
             source_repository="DobbyVPN/DobbyVPN",

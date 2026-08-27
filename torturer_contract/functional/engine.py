@@ -159,7 +159,10 @@ class FunctionalEngine:
         ended_ns = time.monotonic_ns()
         cleanup_required = "cleanup.restored" in scenario.assertion_ids
         cleanup_verified = observations.get("cleanup_verified") is True
-        metrics = self._metrics(observations)
+        metrics = self._metrics(
+            observations,
+            retain_zero="traffic.metrics_positive" in scenario.assertion_ids,
+        )
         if not all(assertion.passed for assertion in assertions):
             outcome = "failed"
             reason_code = "ASSERTION_FAILED"
@@ -206,7 +209,10 @@ class FunctionalEngine:
                 "required": "cleanup.restored" in scenario.assertion_ids,
                 "verified": observations.get("cleanup_verified") is True,
             },
-            metrics=self._metrics(observations),
+            metrics=self._metrics(
+                observations,
+                retain_zero="traffic.metrics_positive" in scenario.assertion_ids,
+            ),
             started_ns=started_ns,
             ended_ns=ended_ns,
             phase_durations_ms={
@@ -284,10 +290,20 @@ class FunctionalEngine:
         )
 
     @staticmethod
-    def _metrics(observations: Mapping[str, object]) -> dict[str, float | int]:
+    def _metrics(
+        observations: Mapping[str, object], *, retain_zero: bool
+    ) -> dict[str, float | int]:
         result: dict[str, float | int] = {}
         for key in ("latency_ms", "download_mbps", "upload_mbps"):
             value = observations.get(key)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
-                result[key] = value
+                # Non-throughput scenarios may receive zero-valued default
+                # telemetry from an adapter that did not measure traffic.
+                # Keep every supplied numeric value for throughput scenarios,
+                # including zero/invalid values, so failed results retain the
+                # diagnostic that caused the assertion to fail.  Invalid
+                # non-throughput values are likewise retained and fail closed
+                # in ScenarioResult validation rather than being hidden.
+                if retain_zero or value != 0:
+                    result[key] = value
         return result
