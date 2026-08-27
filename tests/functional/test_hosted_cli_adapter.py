@@ -324,7 +324,7 @@ class HostedCLIAdapterTests(unittest.TestCase):
             mock.patch.object(adapter, "_throughput", return_value=metrics) as throughput,
             mock.patch(
                 "torturer_checks.hosted.cli.time.monotonic",
-                side_effect=[100.0, 100.0, 101.0, 159.0, 159.5],
+                side_effect=[100.0, 100.0, 101.0, 102.0, 159.0, 159.5],
             ),
             mock.patch("torturer_checks.hosted.linux.time.sleep") as sleep,
         ):
@@ -343,6 +343,58 @@ class HostedCLIAdapterTests(unittest.TestCase):
         with mock.patch("torturer_checks.hosted.cli.time.monotonic", side_effect=[100.0, 100.0]):
             with self.assertRaisesRegex(ScenarioExecutionError, "ENDURANCE_NO_COMPLETE_SAMPLE"):
                 adapter._endurance(0.0)
+
+    def test_shared_desktop_endurance_retries_one_transient_transfer_failure(self) -> None:
+        adapter = HostedCLIAdapter(
+            cli=self.cli, profile=self.profile, runner=self.runner,
+            download_url="https://download.example.test/blob",
+            upload_url="https://upload.example.test/blob",
+        )
+        metrics = {"latency_ms": 1.0, "download_mbps": 2.0, "upload_mbps": 3.0}
+        with (
+            mock.patch.object(adapter, "_connected", return_value=True),
+            mock.patch.object(adapter, "_routing_identity_changed", return_value=True),
+            mock.patch.object(
+                adapter,
+                "_throughput",
+                side_effect=[ScenarioExecutionError("THROUGHPUT_FAILED"), metrics],
+            ) as throughput,
+            mock.patch(
+                "torturer_checks.hosted.cli.time.monotonic",
+                side_effect=[100.0, 100.0, 100.5, 101.0, 102.0, 159.5, 159.75, 160.0],
+            ),
+            mock.patch("torturer_checks.hosted.cli.time.sleep") as sleep,
+        ):
+            result = adapter._endurance(60.0)
+
+        self.assertEqual(result, {"endurance_verified": True, **metrics})
+        self.assertEqual(throughput.call_args_list, [mock.call(30.0), mock.call(30.0)])
+        self.assertEqual(sleep.call_args_list, [mock.call(1.0), mock.call(0.25)])
+
+    def test_shared_desktop_endurance_fails_after_two_transfer_failures(self) -> None:
+        adapter = HostedCLIAdapter(
+            cli=self.cli, profile=self.profile, runner=self.runner,
+            download_url="https://download.example.test/blob",
+            upload_url="https://upload.example.test/blob",
+        )
+        with (
+            mock.patch.object(adapter, "_connected", return_value=True),
+            mock.patch.object(adapter, "_routing_identity_changed", return_value=True),
+            mock.patch.object(
+                adapter,
+                "_throughput",
+                side_effect=ScenarioExecutionError("THROUGHPUT_FAILED"),
+            ) as throughput,
+            mock.patch(
+                "torturer_checks.hosted.cli.time.monotonic",
+                side_effect=[100.0, 100.0, 100.5, 101.0, 102.0],
+            ),
+            mock.patch("torturer_checks.hosted.cli.time.sleep"),
+        ):
+            with self.assertRaisesRegex(ScenarioExecutionError, "THROUGHPUT_FAILED"):
+                adapter._endurance(60.0)
+
+        self.assertEqual(throughput.call_count, 2)
 
     def test_hosted_runner_can_select_a_bounded_canonical_subset(self) -> None:
         parsed = build_parser().parse_args([

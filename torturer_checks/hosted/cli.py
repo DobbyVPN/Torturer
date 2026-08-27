@@ -1700,12 +1700,30 @@ class HostedCLIAdapter:
                     raise ScenarioExecutionError("ENDURANCE_IDENTITY_TIMEOUT") from error
                 raise
             if not last_metrics:
-                try:
-                    last_metrics = self._throughput(min(30.0, remaining))
-                except ScenarioExecutionError as error:
-                    if error.reason_code == "COMMAND_TIMEOUT":
-                        raise ScenarioExecutionError("ENDURANCE_THROUGHPUT_TIMEOUT") from error
-                    raise
+                for attempt in range(2):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ScenarioExecutionError("ENDURANCE_THROUGHPUT_TIMEOUT")
+                    try:
+                        last_metrics = self._throughput(min(30.0, remaining))
+                        break
+                    except ScenarioExecutionError as error:
+                        if error.reason_code == "COMMAND_TIMEOUT":
+                            raise ScenarioExecutionError("ENDURANCE_THROUGHPUT_TIMEOUT") from error
+                        if (
+                            error.reason_code not in {"THROUGHPUT_FAILED", "THROUGHPUT_INVALID"}
+                            or attempt == 1
+                        ):
+                            raise
+                        # One bounded retry prevents a single transient public
+                        # transfer-endpoint response from deciding the entire
+                        # endurance scenario. Both attempts retain their full
+                        # command streams, and a persistent failure remains a
+                        # hard scenario failure.
+                        remaining = deadline - time.monotonic()
+                        if remaining < _MIN_ENDURANCE_SAMPLE_SECONDS:
+                            raise
+                        time.sleep(min(1.0, remaining))
             if time.monotonic() >= deadline:
                 return {"endurance_verified": True, **last_metrics}
             time.sleep(min(5.0, max(0.0, deadline - time.monotonic())))
