@@ -96,8 +96,8 @@ builds the in-memory DobbyVPN profile only after a trusted service URL is
 known. The key and generated config are provider handoff data; they are never
 public result data. The protected `python -m torturer_provider.lease_cli`
 boundary uses one schema-2 bundle of the Outline lease and a separately pinned
-upload sink for Linux, Windows, macOS, and Android. It writes the profile and
-the random sink URL only to owner-only storage for immediate CMS encryption,
+measurement sink for Linux, Windows, macOS, and Android. It writes the profile
+and the random sink URL only to owner-only storage for immediate CMS encryption,
 and starts the immutable images with
 `/outline-ss-server -config=/etc/secrets/config.yml` and
 `/upload-sink --path-file=/etc/secrets/upload-path`.
@@ -114,8 +114,8 @@ endpoint, key, URL, command argument, or observed public identity.
 - Untrusted candidate builds receive no secrets and have read-only repository
   permissions.
 - A trusted functional client receives only its short-lived synthetic VPN
-  profile and upload handoff, after exact closure verification and after
-  GitHub token operations finish; it never receives the provider credential or
+  profile and token-bound measurement handoff, after exact closure verification
+  and after GitHub token operations finish; it never receives the provider credential or
   a write-capable token.
 - The exact source repository and full 40-character commit SHA are recorded.
 - Workflow and third-party action references are pinned to immutable commits.

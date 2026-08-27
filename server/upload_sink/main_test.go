@@ -176,6 +176,62 @@ func TestHandlerAcceptsExactBodyAndDiscardsIt(t *testing.T) {
 	}
 }
 
+func TestHandlerReturnsUncachedClientIdentityOnTokenBoundPath(t *testing.T) {
+	identityPath := strings.Replace(testUploadPath, "/upload/", "/identity/", 1)
+	request := httptest.NewRequest(http.MethodGet, "https://sink"+identityPath, nil)
+	request.Header.Set("CF-Connecting-IP", "203.0.113.42")
+	recording := httptest.NewRecorder()
+	NewHandler(testUploadPath).ServeHTTP(recording, request)
+	if recording.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recording.Code, http.StatusOK)
+	}
+	if recording.Body.String() != "203.0.113.42\n" {
+		t.Fatalf("identity body = %q", recording.Body.String())
+	}
+	if recording.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q", recording.Header().Get("Cache-Control"))
+	}
+}
+
+func TestHandlerRejectsMissingOrInvalidClientIdentity(t *testing.T) {
+	identityPath := strings.Replace(testUploadPath, "/upload/", "/identity/", 1)
+	for _, value := range []string{"", "not-an-ip", "203.0.113.1, 203.0.113.2"} {
+		t.Run(value, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "https://sink"+identityPath, nil)
+			if value != "" {
+				request.Header.Set("CF-Connecting-IP", value)
+			}
+			recording := httptest.NewRecorder()
+			NewHandler(testUploadPath).ServeHTTP(recording, request)
+			if recording.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want %d", recording.Code, http.StatusBadGateway)
+			}
+			if recording.Body.Len() != 0 {
+				t.Fatalf("response body is not empty: %q", recording.Body.String())
+			}
+		})
+	}
+}
+
+func TestHandlerReturnsExactUncachedDownload(t *testing.T) {
+	downloadPath := strings.Replace(testUploadPath, "/upload/", "/download/", 1)
+	request := httptest.NewRequest(http.MethodGet, "https://sink"+downloadPath, nil)
+	recording := httptest.NewRecorder()
+	NewHandler(testUploadPath).ServeHTTP(recording, request)
+	if recording.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recording.Code, http.StatusOK)
+	}
+	if int64(recording.Body.Len()) != DownloadBytes {
+		t.Fatalf("download bytes = %d, want %d", recording.Body.Len(), DownloadBytes)
+	}
+	if recording.Header().Get("Content-Length") != strconv.FormatInt(DownloadBytes, 10) {
+		t.Fatalf("Content-Length = %q", recording.Header().Get("Content-Length"))
+	}
+	if recording.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q", recording.Header().Get("Cache-Control"))
+	}
+}
+
 func TestHandlerAcceptsExactlyOneMiBBody(t *testing.T) {
 	body := bytes.Repeat([]byte{0x5a}, 1<<20)
 	request := httptest.NewRequest(http.MethodPost, "https://sink"+testUploadPath, bytes.NewReader(body))

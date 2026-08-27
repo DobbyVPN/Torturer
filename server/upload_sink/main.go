@@ -24,6 +24,7 @@ const (
 	UploadPathEnv      = "UPLOAD_PATH"
 	UploadPathFilePath = "/etc/secrets/upload-path"
 	MaxUploadBytes     = int64(2 * 1024 * 1024)
+	DownloadBytes      = int64(1024 * 1024)
 
 	readHeaderTimeout = 5 * time.Second
 	readTimeout       = 15 * time.Second
@@ -111,6 +112,8 @@ func loadUploadPathFile(path string) (string, error) {
 // path simply makes every upload request fail closed; LoadConfig rejects it
 // before a production listener is opened.
 func NewHandler(uploadPath string) http.Handler {
+	identityPath := strings.Replace(uploadPath, "/upload/", "/identity/", 1)
+	downloadPath := strings.Replace(uploadPath, "/upload/", "/download/", 1)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Body != nil {
 			defer r.Body.Close()
@@ -122,6 +125,40 @@ func NewHandler(uploadPath string) http.Handler {
 		}
 		if r.Method == http.MethodGet && r.URL.Path == "/healthz" {
 			writeStatus(w, http.StatusNoContent)
+			return
+		}
+		if r.Method == http.MethodGet && r.URL.Path == identityPath && uploadPathPattern.MatchString(uploadPath) {
+			clientIP := net.ParseIP(strings.TrimSpace(r.Header.Get("CF-Connecting-IP")))
+			if clientIP == nil {
+				writeStatus(w, http.StatusBadGateway)
+				return
+			}
+			body := []byte(clientIP.String() + "\n")
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+			return
+		}
+		if r.Method == http.MethodGet && r.URL.Path == downloadPath && uploadPathPattern.MatchString(uploadPath) {
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Content-Length", strconv.FormatInt(DownloadBytes, 10))
+			w.WriteHeader(http.StatusOK)
+			var block [32 * 1024]byte
+			remaining := DownloadBytes
+			for remaining > 0 {
+				count := int64(len(block))
+				if remaining < count {
+					count = remaining
+				}
+				written, err := w.Write(block[:count])
+				remaining -= int64(written)
+				if err != nil || int64(written) != count {
+					return
+				}
+			}
 			return
 		}
 		if r.Method != http.MethodPost || r.URL.Path != uploadPath || !uploadPathPattern.MatchString(uploadPath) {

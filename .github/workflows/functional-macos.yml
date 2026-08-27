@@ -1071,8 +1071,8 @@ jobs:
             --profile "$HANDOFF_DIR/profile.toml" --source-repository "$SOURCE_REPOSITORY" --source-sha "$SOURCE_SHA" \
             --platform-version "macos-15" \
             --candidate-manifest "$GITHUB_WORKSPACE/candidate/manifest.json" --server-image-digest "$SERVER_IMAGE_DIGEST" --output "$RESULT_PATH" \
-            --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" --download-url "https://proof.ovh.net/files/1Mb.dat" \
-            --upload-url "$upload_url" --service-pid "$SERVICE_PID" --service-binary "$SERVICE_BINARY" \
+            --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" --upload-url "$upload_url" \
+            --service-pid "$SERVICE_PID" --service-binary "$SERVICE_BINARY" \
             --service-socket "$SERVICE_CONTROL_SOCKET" --service-pid-file "$SERVICE_PID_FILE" \
             --expected-unavailable functional.network-transition=HOSTED_MACOS_UPLINK_TOGGLE_UNSUPPORTED \
             --expected-unavailable functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED || functional_status=$?

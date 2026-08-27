@@ -1154,9 +1154,7 @@ jobs:
             --profile "$HANDOFF_DIR/profile.toml" --source-repository "$SOURCE_REPOSITORY" --source-sha "$SOURCE_SHA" \
             --platform-version "35" \
             --candidate-manifest "$GITHUB_WORKSPACE/candidate/manifest.json" --server-image-digest "$SERVER_IMAGE_DIGEST" --output "$RESULT_PATH" \
-            --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" --identity-url "https://api.ipify.org" \
-            --latency-url "https://proof.ovh.net/files/1Mb.dat" \
-            --download-url "https://proof.ovh.net/files/1Mb.dat" --upload-url "$upload_url" \
+            --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" --upload-url "$upload_url" \
             --adb "$ADB_PATH" \
             --expected-unavailable functional.network-transition=ANDROID_UPLINK_TOGGLE_UNSUPPORTED \
             --expected-unavailable functional.bounded-endurance=ANDROID_ENDURANCE_SEAM_UNSUPPORTED

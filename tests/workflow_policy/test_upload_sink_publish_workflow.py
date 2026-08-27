@@ -74,6 +74,10 @@ class UploadSinkPublishWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("head -c 1048576 /dev/zero", self.text)
         self.assertIn("%{size_upload} %{http_code}", self.text)
         self.assertIn('test "$upload_result" = "1048576 204"', self.text)
+        self.assertIn('/identity/$token', self.text)
+        self.assertIn('/download/$token', self.text)
+        self.assertIn('CF-Connecting-IP: 203.0.113.42', self.text)
+        self.assertIn('test "$download_result" = "1048576 200"', self.text)
 
     def test_pushed_digest_is_run_headless_with_the_same_contract(self) -> None:
         self.assertIn('docker image inspect "$image_ref" --format \'{{.Config.User}}\'', self.text)
@@ -86,6 +90,8 @@ class UploadSinkPublishWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("--publish 127.0.0.1:18081:18081", self.text)
         self.assertIn('sudo chmod 0440 "$pulled_smoke_dir/upload-path"', self.text)
         self.assertIn('test "$pulled_upload_result" = "1048576 204"', self.text)
+        self.assertIn('test "$pulled_identity_result" = "203.0.113.42"', self.text)
+        self.assertIn('test "$pulled_download_result" = "1048576 200"', self.text)
         self.assertIn('docker image rm "$image_ref"', self.text)
 
     def test_external_visibility_and_render_variable_gates_are_documented(self) -> None:
