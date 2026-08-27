@@ -43,6 +43,28 @@ class BulkScenarioAdapter(Protocol):
 EvidenceProvider = Callable[[], Sequence[EvidenceReference]]
 
 
+def capability_unavailable_reason(
+    missing: frozenset[Capability], reasons: object,
+) -> str:
+    """Return one stable adapter-owned reason for missing capabilities."""
+
+    if isinstance(reasons, Mapping):
+        for capability in sorted(missing, key=lambda value: value.value):
+            reason = reasons.get(capability)
+            if isinstance(reason, str) and reason:
+                return reason
+    return "CAPABILITY_UNAVAILABLE"
+
+
+def unavailable_reason(adapter: ScenarioAdapter, missing: frozenset[Capability]) -> str:
+    """Resolve an optional adapter explanation without changing the outcome."""
+
+    return capability_unavailable_reason(
+        missing,
+        getattr(adapter, "capability_unavailable_reasons", {}),
+    )
+
+
 @dataclass(frozen=True)
 class FunctionalEngine:
     """Execute a definition without owning platform commands or evidence."""
@@ -67,7 +89,7 @@ class FunctionalEngine:
                 scenario,
                 provenance,
                 outcome="unavailable",
-                reason_code="CAPABILITY_UNAVAILABLE",
+                reason_code=unavailable_reason(adapter, missing),
                 assertions=(),
                 cleanup={"required": False, "verified": True},
                 metrics={},
@@ -113,7 +135,10 @@ class FunctionalEngine:
                 scenario,
                 provenance,
                 outcome="unavailable",
-                reason_code="CAPABILITY_UNAVAILABLE",
+                reason_code=unavailable_reason(
+                    adapter,
+                    scenario.required_capabilities - adapter.capabilities,
+                ),
                 assertions=(),
                 cleanup={"required": False, "verified": True},
                 metrics={},

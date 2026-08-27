@@ -109,6 +109,13 @@ class FunctionalHostedIntegrationPolicyTest(unittest.TestCase):
                 stage = build.index(stage_marker)
                 self.assertLess(proof, stage)
 
+    def test_linux_only_declares_the_reviewed_expected_unavailable_pair(self) -> None:
+        expected = '--expected-unavailable "functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED"'
+        self.assertEqual(self.texts["linux"].count(expected), 1)
+        for platform in ("windows", "macos", "android"):
+            with self.subTest(platform=platform):
+                self.assertNotIn("--expected-unavailable", self.texts[platform])
+
     def test_public_workflows_never_echo_raw_diagnostics(self) -> None:
         workflow_root = ROOT / ".github" / "workflows"
         forbidden = (

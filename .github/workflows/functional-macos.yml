@@ -360,12 +360,18 @@ jobs:
           service_log="$DIAGNOSTIC_DIR/preflight-service.raw.log"
           : > "$service_log"
           chmod 600 "$service_log"
+          product_tmp="$DIAGNOSTIC_DIR/preflight-product-tmp"
+          mkdir -p "$product_tmp"
+          chmod 700 "$product_tmp"
+          product_log="$product_tmp/service.jsonl"
+          : > "$product_log"
+          chmod 600 "$product_log"
           service_binary="$GITHUB_WORKSPACE/candidate/macos_grpcvpnserver"
           peer_uid="$(id -u)"
-          service_pid="$(sudo -n sh -c 'set -eu; env DOBBYVPN_CONTROL_SOCKET="$1" DOBBYVPN_CONTROL_PEER_UID="$2" "$3" > "$4" 2>&1 & printf "%s\n" "$!"' dobbyvpn-preflight-service "$control_socket" "$peer_uid" "$service_binary" "$service_log")"
+          service_pid="$(sudo -n sh -c 'set -eu; product_tmp=$1; product_log=$2; control_socket=$3; peer_uid=$4; binary=$5; service_log=$6; env TMPDIR="$product_tmp" DOBBY_LOG_PATH="$product_log" DOBBYVPN_CONTROL_SOCKET="$control_socket" DOBBYVPN_CONTROL_PEER_UID="$peer_uid" "$binary" > "$service_log" 2>&1 & printf "%s\n" "$!"' dobbyvpn-preflight-service "$product_tmp" "$product_log" "$control_socket" "$peer_uid" "$service_binary" "$service_log")"
           case "$service_pid" in ""|*[!0-9]*) printf 'invalid preflight service pid=%s\n' "$service_pid" >&2; exit 1;; esac
           printf '%s\n' "$service_pid" > "$HANDOFF_DIR/preflight-service.pid"
-          printf 'PREFLIGHT_SERVICE_PID=%s\nPREFLIGHT_SERVICE_PID_FILE=%s\nPREFLIGHT_SERVICE_CONTROL_SOCKET=%s\nPREFLIGHT_SERVICE_LOG=%s\n' "$service_pid" "$HANDOFF_DIR/preflight-service.pid" "$control_socket" "$service_log" >> "$GITHUB_ENV"
+          printf 'PREFLIGHT_SERVICE_PID=%s\nPREFLIGHT_SERVICE_PID_FILE=%s\nPREFLIGHT_SERVICE_CONTROL_SOCKET=%s\nPREFLIGHT_SERVICE_LOG=%s\nPREFLIGHT_SERVICE_PRODUCT_LOG=%s\n' "$service_pid" "$HANDOFF_DIR/preflight-service.pid" "$control_socket" "$service_log" "$product_log" >> "$GITHUB_ENV"
           ready=false
           for attempt in $(seq 1 60); do
             printf 'preflight_service_readiness_attempt=%s\n' "$attempt"
@@ -457,6 +463,7 @@ jobs:
           ps -axo pid=,ppid=,command= > "$children_snapshot" 2>&1 || children_status=$?
           children_count="$(awk -v parent="$service_pid" '$2 == parent {count++} END {print count + 0}' "$children_snapshot")"
           emit_private_evidence preflight-service-children "$children_snapshot"
+          emit_private_evidence preflight-service-structured-log "${PREFLIGHT_SERVICE_PRODUCT_LOG:-}"
           printf 'preflight_remaining_service_children_count=%s\n' "$children_count"
           test "$children_count" -eq 0
           test "$children_status" -eq 0
@@ -596,12 +603,18 @@ jobs:
           service_log="$DIAGNOSTIC_DIR/service.raw.log"
           : > "$service_log"
           chmod 600 "$service_log"
+          product_tmp="$DIAGNOSTIC_DIR/product-tmp"
+          mkdir -p "$product_tmp"
+          chmod 700 "$product_tmp"
+          product_log="$product_tmp/service.jsonl"
+          : > "$product_log"
+          chmod 600 "$product_log"
           service_binary="$GITHUB_WORKSPACE/candidate/macos_grpcvpnserver"
           peer_uid="$(id -u)"
-          service_pid="$(sudo -n sh -c 'set -eu; env DOBBYVPN_CONTROL_SOCKET="$1" DOBBYVPN_CONTROL_PEER_UID="$2" "$3" > "$4" 2>&1 & printf "%s\n" "$!"' dobbyvpn-service "$control_socket" "$peer_uid" "$service_binary" "$service_log")"
+          service_pid="$(sudo -n sh -c 'set -eu; product_tmp=$1; product_log=$2; control_socket=$3; peer_uid=$4; binary=$5; service_log=$6; env TMPDIR="$product_tmp" DOBBY_LOG_PATH="$product_log" DOBBYVPN_CONTROL_SOCKET="$control_socket" DOBBYVPN_CONTROL_PEER_UID="$peer_uid" "$binary" > "$service_log" 2>&1 & printf "%s\n" "$!"' dobbyvpn-service "$product_tmp" "$product_log" "$control_socket" "$peer_uid" "$service_binary" "$service_log")"
           case "$service_pid" in ""|*[!0-9]*) printf 'invalid service pid=%s\n' "$service_pid" >&2; exit 1;; esac
           printf '%s\n' "$service_pid" > "$HANDOFF_DIR/service.pid"
-          printf 'SERVICE_PID=%s\nSERVICE_BINARY=%s\nSERVICE_PID_FILE=%s\nSERVICE_CONTROL_SOCKET=%s\nSERVICE_LOG=%s\nDOBBYVPN_CONTROL_SOCKET=%s\n' "$service_pid" "$service_binary" "$HANDOFF_DIR/service.pid" "$control_socket" "$service_log" "$control_socket" >> "$GITHUB_ENV"
+          printf 'SERVICE_PID=%s\nSERVICE_BINARY=%s\nSERVICE_PID_FILE=%s\nSERVICE_CONTROL_SOCKET=%s\nSERVICE_LOG=%s\nSERVICE_PRODUCT_LOG=%s\nDOBBYVPN_CONTROL_SOCKET=%s\n' "$service_pid" "$service_binary" "$HANDOFF_DIR/service.pid" "$control_socket" "$service_log" "$product_log" "$control_socket" >> "$GITHUB_ENV"
           ready=false
           for attempt in $(seq 1 60); do
             printf 'service_readiness_attempt=%s\n' "$attempt"
@@ -658,7 +671,7 @@ jobs:
           }
           baseline="$DIAGNOSTIC_DIR/baseline-default-route.raw.log"
           baseline_status=0
-          route -n get default > "$baseline" 2>&1 || baseline_status=$?
+          timeout --foreground --signal=TERM --kill-after=1s 30s route -n get default > "$baseline" 2>&1 || baseline_status=$?
           emit_private_evidence macos-baseline-default-route "$baseline"
           test "$baseline_status" -eq 0
           baseline_gateway="$(awk -F: '
@@ -689,18 +702,26 @@ jobs:
         working-directory: torturer
         run: |
           set -euo pipefail
+          export TORTURER_HOSTED_DEADLINE_EVIDENCE_DIR="$DIAGNOSTIC_DIR/hosted-deadline"
+          export TORTURER_HOSTED_DEADLINE_SUMMARY_PATH="$HANDOFF_DIR/functional-deadline-summary.json"
+          printf 'TORTURER_HOSTED_DEADLINE_EVIDENCE_DIR=%s\nTORTURER_HOSTED_DEADLINE_SUMMARY_PATH=%s\n' \
+            "$TORTURER_HOSTED_DEADLINE_EVIDENCE_DIR" "$TORTURER_HOSTED_DEADLINE_SUMMARY_PATH" >> "$GITHUB_ENV"
           remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 120))
           if [ "$remaining" -lt 950 ]; then printf 'insufficient full-catalog budget before cleanup reserve: seconds=%s\n' "$remaining" >&2; exit 1; fi
           if [ "$remaining" -gt 1260 ]; then remaining=1260; fi
           printf 'canonical_lane_timeout_seconds=%s\n' "$remaining"
+          functional_status=0
           python3 -m torturer_checks.hosted.deadline --timeout-seconds "$remaining" --kill-grace-seconds 30 \
+            --summary-output "$TORTURER_HOSTED_DEADLINE_SUMMARY_PATH" \
             python3 -m torturer_checks.hosted.run --platform macos --cli "$GITHUB_WORKSPACE/candidate/dobby-cli" \
             --profile "$HANDOFF_DIR/profile.toml" --source-repository "$SOURCE_REPOSITORY" --source-sha "$SOURCE_SHA" \
             --platform-version "macos-15" \
             --candidate-manifest "$GITHUB_WORKSPACE/candidate/manifest.json" --server-image-digest "$SERVER_IMAGE_DIGEST" --output "$RESULT_PATH" \
             --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" --download-url "https://proof.ovh.net/files/1Mb.dat" \
             --upload-url "https://speed.cloudflare.com/__up" --service-pid "$SERVICE_PID" --service-binary "$SERVICE_BINARY" \
-            --service-socket "$SERVICE_CONTROL_SOCKET" --service-pid-file "$SERVICE_PID_FILE"
+            --service-socket "$SERVICE_CONTROL_SOCKET" --service-pid-file "$SERVICE_PID_FILE" || functional_status=$?
+          printf 'FUNCTIONAL_STATUS=%s\n' "$functional_status" >> "$GITHUB_ENV"
+          exit "$functional_status"
 
       - name: Stop exact macOS service and verify cleanup
         if: always()
@@ -723,7 +744,10 @@ jobs:
           }
           service_pid="${SERVICE_PID:-}"
           if [ -f "${SERVICE_PID_FILE:-}" ]; then service_pid="$(cat "$SERVICE_PID_FILE")"; fi
-          case "$service_pid" in "") exit 0;; 0|*[!0-9]*) printf 'invalid cleanup pid=%s\n' "$service_pid" >&2; exit 1;; esac
+          case "$service_pid" in
+            "") printf 'SERVICE_STOP_STATE=not-started\n' >> "$GITHUB_ENV"; exit 0;;
+            0|*[!0-9]*) printf 'invalid cleanup pid=%s\n' "$service_pid" >&2; exit 1;;
+          esac
           if sudo -n kill -0 "$service_pid"; then
             sudo -n kill -TERM "$service_pid"
             stopped=false
@@ -740,17 +764,92 @@ jobs:
               done
             fi
             test "$stopped" = true
-            children_snapshot="$DIAGNOSTIC_DIR/service-children.raw.log"
-            children_status=0
-            ps -axo pid=,ppid=,command= > "$children_snapshot" 2>&1 || children_status=$?
-            children_count="$(awk -v parent="$service_pid" '$2 == parent {count++} END {print count + 0}' "$children_snapshot")"
-            emit_private_evidence service-children "$children_snapshot"
-            printf 'remaining_service_children_count=%s\n' "$children_count"
-            test "$children_count" -eq 0
-            test "$children_status" -eq 0
+            stop_state=verified
           else
             printf 'candidate service was not running at cleanup\n'
+            stop_state=already-dead
           fi
+          children_snapshot="$DIAGNOSTIC_DIR/service-children.raw.log"
+          children_status=0
+          ps -axo pid=,ppid=,command= > "$children_snapshot" 2>&1 || children_status=$?
+          children_count="$(awk -v parent="$service_pid" '$2 == parent {count++} END {print count + 0}' "$children_snapshot")"
+          emit_private_evidence service-children "$children_snapshot"
+          printf 'remaining_service_children_count=%s\n' "$children_count"
+          test "$children_count" -eq 0
+          test "$children_status" -eq 0
+          printf 'SERVICE_STOP_STATE=%s\n' "$stop_state" >> "$GITHUB_ENV"
+
+      - name: Retain opaque macOS functional evidence before route recovery
+        if: always()
+        env:
+          FUNCTIONAL_OUTCOME: ${{ steps.functional.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 - "$HANDOFF_DIR/macos-failure-evidence.json" <<'PY'
+          import os
+          from pathlib import Path
+          import sys
+
+          from torturer_checks.hosted.deadline import (
+              DeadlineError,
+              opaque_file_evidence,
+              write_opaque_manifest,
+          )
+
+          manifest = Path(sys.argv[1])
+          records = []
+          incomplete = False
+          for variable, kind in (
+              ("SERVICE_LOG", "macos-service-stream"),
+              ("SERVICE_PRODUCT_LOG", "macos-service-structured"),
+              ("TORTURER_HOSTED_DEADLINE_SUMMARY_PATH", "macos-deadline-summary"),
+              ("DIAGNOSTIC_DIR", "macos-service-children"),
+          ):
+              value = os.environ.get(variable, "")
+              if variable == "DIAGNOSTIC_DIR":
+                  value = str(Path(value) / "service-children.raw.log") if value else ""
+              if not value:
+                  records.append({"evidence_kind": kind, "state": "missing"})
+                  incomplete = True
+                  continue
+              try:
+                  records.append(opaque_file_evidence(Path(value), evidence_kind=kind))
+              except DeadlineError:
+                  records.append({"evidence_kind": kind, "state": "unavailable"})
+                  incomplete = True
+          status_text = os.environ.get("FUNCTIONAL_STATUS", "")
+          try:
+              return_code = int(status_text) if status_text else None
+          except ValueError:
+              return_code = None
+              incomplete = True
+          outcome = os.environ.get("FUNCTIONAL_OUTCOME", "unknown")
+          if outcome not in {"success", "failure", "cancelled", "skipped", "unknown"}:
+              outcome = "unknown"
+              incomplete = True
+          if incomplete:
+              manifest_status = "incomplete"
+          elif outcome == "success" and return_code == 0:
+              manifest_status = "completed"
+          else:
+              manifest_status = "failed"
+          write_opaque_manifest(
+              manifest,
+              kind="dobbyvpn.macos.functional-evidence",
+              status=manifest_status,
+              return_code=return_code,
+              records=records,
+              fields={
+                  "run_id": os.environ.get("LEASE_RUN_ID", "unknown"),
+                  "platform": "macos",
+                  "functional_outcome": outcome,
+                  "service_stop_state": os.environ.get("SERVICE_STOP_STATE", "unknown"),
+              },
+          )
+          print("macos_opaque_evidence_manifest=retained")
+          PY
 
       - name: Restore macOS default route before evidence upload
         if: always()
@@ -771,79 +870,40 @@ jobs:
               printf 'diagnostic_evidence label=%s state=missing\n' "$label"
             fi
           }
-          baseline_gateway="${MACOS_BASELINE_DEFAULT_GATEWAY:-}"
-          baseline_iface="${MACOS_BASELINE_DEFAULT_INTERFACE:-}"
-          baseline_flags="${MACOS_BASELINE_DEFAULT_FLAGS:-}"
-          if [ -z "$baseline_gateway" ] || [ -z "$baseline_iface" ]; then
-            printf 'macos_default_route_restore=skipped reason=baseline-not-captured\n'
-            exit 0
-          fi
-          case "$baseline_gateway" in ""|*[!A-Za-z0-9.:#_-]*) printf 'missing or invalid macOS route baseline gateway\n' >&2; exit 1;; esac
-          case "$baseline_iface" in ""|*[!A-Za-z0-9._-]*) printf 'missing or invalid macOS route baseline interface\n' >&2; exit 1;; esac
-          case "$baseline_flags" in *[!A-Za-z0-9_,\<\>[:space:]-]*) printf 'invalid macOS route baseline flags\n' >&2; exit 1;; esac
           service_pid="${SERVICE_PID:-}"
           if [ -f "${SERVICE_PID_FILE:-}" ]; then service_pid="$(cat "$SERVICE_PID_FILE")"; fi
           case "$service_pid" in ""|*[!0-9]*) printf 'missing or invalid macOS service pid during route cleanup\n' >&2; exit 1;; esac
-          if sudo -n kill -0 "$service_pid"; then
-            printf 'macos_default_route_restore=refused reason=service-still-running pid=%s\n' "$service_pid" >&2
-            exit 1
+          # macos_route treats the observed "not in table" marker separately
+          # from a malformed or foreign default route and confirms it twice.
+          restore_status=0
+          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.macos_route \
+            --baseline-file "$DIAGNOSTIC_DIR/baseline-default-route.raw.log" \
+            --service-probe-file "$DIAGNOSTIC_DIR/service-death-probe.raw.log" \
+            --current-file "$DIAGNOSTIC_DIR/post-functional-default-route.raw.log" \
+            --confirmation-file "$DIAGNOSTIC_DIR/confirmed-absent-default-route.raw.log" \
+            --restore-file "$DIAGNOSTIC_DIR/restore-default-route.raw.log" \
+            --verified-file "$DIAGNOSTIC_DIR/verified-default-route.raw.log" \
+            --service-pid "$service_pid" --timeout-seconds 10 || restore_status=$?
+          emit_private_evidence macos-service-death-probe "$DIAGNOSTIC_DIR/service-death-probe.raw.log"
+          emit_private_evidence macos-post-functional-default-route "$DIAGNOSTIC_DIR/post-functional-default-route.raw.log"
+          emit_private_evidence macos-confirmed-absent-default-route "$DIAGNOSTIC_DIR/confirmed-absent-default-route.raw.log"
+          emit_private_evidence macos-restore-default-route "$DIAGNOSTIC_DIR/restore-default-route.raw.log"
+          emit_private_evidence macos-verified-default-route "$DIAGNOSTIC_DIR/verified-default-route.raw.log"
+          if [ "$restore_status" -ne 0 ]; then
+            printf 'macos_default_route_restore=failed status=%s\n' "$restore_status" >&2
+            exit "$restore_status"
           fi
 
-          current="$DIAGNOSTIC_DIR/post-functional-default-route.raw.log"
-          current_status=0
-          route -n get default > "$current" 2>&1 || current_status=$?
-          emit_private_evidence macos-post-functional-default-route "$current"
-          if [ "$current_status" -ne 0 ]; then
-            printf 'macos_default_route_restore=failed stage=inspect status=%s\n' "$current_status" >&2
-            exit "$current_status"
-          fi
-          current_iface="$(awk -F: '
-            { key=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
-              if (key == "interface") { value=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value; exit }
-            }
-          ' "$current")"
-          case "$current_iface" in ""|*[!A-Za-z0-9._-]*) printf 'invalid post-functional route interface\n' >&2; exit 1;; esac
-          if [ "$current_iface" = "$baseline_iface" ]; then
-            printf 'macos_default_route_restore=not-needed interface=%s\n' "$current_iface"
-          else
-            case "$current_iface" in
-              utun[0-9]*) ;;
-              *) printf 'macos_default_route_restore=refused baseline_interface=%s current_interface=%s\n' "$baseline_iface" "$current_iface" >&2; exit 1;;
-            esac
-            restore="$DIAGNOSTIC_DIR/restore-default-route.raw.log"
-            restore_status=0
-            if [[ "$baseline_gateway" == link\#* ]]; then
-              sudo -n route -n change default -interface "$baseline_iface" > "$restore" 2>&1 || restore_status=$?
-            elif [[ "$baseline_flags" == *IFSCOPE* ]]; then
-              sudo -n route -n change default "$baseline_gateway" -ifscope "$baseline_iface" > "$restore" 2>&1 || restore_status=$?
-            else
-              sudo -n route -n change default "$baseline_gateway" > "$restore" 2>&1 || restore_status=$?
-            fi
-            emit_private_evidence macos-restore-default-route "$restore"
-            if [ "$restore_status" -ne 0 ]; then
-              printf 'macos_default_route_restore=failed stage=change status=%s\n' "$restore_status" >&2
-              exit "$restore_status"
-            fi
-          fi
-          verified="$DIAGNOSTIC_DIR/verified-default-route.raw.log"
-          verified_status=0
-          route -n get default > "$verified" 2>&1 || verified_status=$?
-          emit_private_evidence macos-verified-default-route "$verified"
-          if [ "$verified_status" -ne 0 ]; then
-            printf 'macos_default_route_restore=failed stage=verify status=%s\n' "$verified_status" >&2
-            exit "$verified_status"
-          fi
-          verified_iface="$(awk -F: '
-            { key=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
-              if (key == "interface") { value=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value; exit }
-            }
-          ' "$verified")"
-          if [ "$verified_iface" != "$baseline_iface" ]; then
-            printf 'macos_default_route_restore=failed stage=verify expected_interface=%s actual_interface=%s\n' \
-              "$baseline_iface" "$verified_iface" >&2
-            exit 1
-          fi
-          printf 'macos_default_route_restore=verified interface=%s\n' "$verified_iface"
+      - name: Upload safe macOS failure evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: macos-failure-evidence-${{ env.LEASE_RUN_ID }}
+          path: |
+            ${{ env.HANDOFF_DIR }}/macos-failure-evidence.json
+            ${{ env.HANDOFF_DIR }}/functional-deadline-summary.json
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Upload safe macOS functional result
         if: always()

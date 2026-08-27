@@ -315,20 +315,77 @@ jobs:
           }
           # These single-quoted commands are interpreted by PowerShell, not Bash.
           # The preflight process is stopped and verified before any token-bearing Render step.
+          # Keep this whole startup lane bounded independently of the job timeout.
+          # A bounded attempt count is not sufficient: every PowerShell child and
+          # the CLI status probe must have its own timeout, otherwise one hung
+          # child can consume the entire workflow and skip useful diagnostics.
+          PREFLIGHT_MAX_SECONDS=300
+          PREFLIGHT_CLEANUP_RESERVE_SECONDS=180
+          PREFLIGHT_PROBE_TIMEOUT_SECONDS=10
+          preflight_started_epoch="$(date +%s)"
+          preflight_deadline_epoch=$((preflight_started_epoch + PREFLIGHT_MAX_SECONDS))
+          cleanup_reserve_deadline=$((RUN_DEADLINE_EPOCH - PREFLIGHT_CLEANUP_RESERVE_SECONDS))
+          if [ "$preflight_deadline_epoch" -gt "$cleanup_reserve_deadline" ]; then
+            preflight_deadline_epoch="$cleanup_reserve_deadline"
+          fi
+          if [ "$preflight_deadline_epoch" -le "$preflight_started_epoch" ]; then
+            printf 'preflight startup has no bounded budget before cleanup reserve\n' >&2
+            exit 1
+          fi
+          printf 'preflight_budget_seconds=%s cleanup_reserve_seconds=%s deadline_epoch=%s\n' \
+            "$((preflight_deadline_epoch - preflight_started_epoch))" \
+            "$PREFLIGHT_CLEANUP_RESERVE_SECONDS" "$preflight_deadline_epoch"
+
+          run_preflight_probe() {
+            label="$1"
+            output="$2"
+            shift 2
+            remaining=$((preflight_deadline_epoch - $(date +%s)))
+            if [ "$remaining" -le 0 ]; then
+              printf 'preflight_probe label=%s status=DEADLINE_EXCEEDED\n' "$label" >&2
+              return 124
+            fi
+            timeout_seconds="$PREFLIGHT_PROBE_TIMEOUT_SECONDS"
+            if [ "$timeout_seconds" -gt "$remaining" ]; then timeout_seconds="$remaining"; fi
+            printf 'preflight_probe_start label=%s timeout_seconds=%s remaining_seconds=%s\n' \
+              "$label" "$timeout_seconds" "$remaining"
+            status=0
+            if timeout --foreground --signal=TERM --kill-after=1s "${timeout_seconds}s" \
+              "$@" > "$output" 2>&1; then
+              status=0
+            else
+              status=$?
+            fi
+            printf 'preflight_probe_result label=%s status=%s\n' "$label" "$status"
+            return "$status"
+          }
+
           # shellcheck disable=SC2016
           programdata_path="$SERVICE_DIR/ProgramData"
           mkdir -p "$programdata_path/DobbyVPN"
           service_log="$SERVICE_DIR/preflight-service.raw.log"
           service_err="$SERVICE_DIR/preflight-service.stderr.raw.log"
+          launch_log="$SERVICE_DIR/preflight-launch.raw.log"
+          probe_log=""
+          network_probe_log=""
+          status_log="$SERVICE_DIR/preflight-control-status.raw.log"
+          preflight_pid_file="$HANDOFF_DIR/preflight-service.pid"
           service_binary="$GITHUB_WORKSPACE/candidate/windows_grpcvpnserver.exe"
           service_binary_windows="$(cygpath -w "$service_binary" | tr -d '\r')"
           service_log_windows="$(cygpath -w "$service_log" | tr -d '\r')"
           service_err_windows="$(cygpath -w "$service_err" | tr -d '\r')"
           programdata_windows="$(cygpath -w "$programdata_path" | tr -d '\r')"
+          preflight_pid_file_windows="$(cygpath -w "$preflight_pid_file" | tr -d '\r')"
           export DOBBYVPN_WINDOWS_SERVICE_BINARY="$service_binary_windows"
           export DOBBYVPN_WINDOWS_SERVICE_LOG="$service_log_windows"
           export DOBBYVPN_WINDOWS_SERVICE_ERR="$service_err_windows"
           export DOBBYVPN_WINDOWS_PROGRAMDATA="$programdata_windows"
+          export DOBBYVPN_WINDOWS_SERVICE_PID_FILE="$preflight_pid_file_windows"
+          # Publish the cleanup path before launch.  The PowerShell launcher
+          # records the PID before returning it, so a launch timeout after
+          # Start-Process cannot strand the candidate without a cleanup handle.
+          printf 'PREFLIGHT_SERVICE_PID_FILE=%s\nPREFLIGHT_SERVICE_LOG=%s\n' \
+            "$preflight_pid_file" "$service_log" >> "$GITHUB_ENV"
           # shellcheck disable=SC2016
           # Do not resolve WindowsIdentity.Name here.  On a hosted runner that
           # account-name lookup can block before Start-Process returns, while
@@ -337,60 +394,196 @@ jobs:
           # identity consumed by the product's LookupSID call.  Keep explicit
           # phase diagnostics on stderr so they remain visible even though the
           # PID itself is captured from stdout.
-          service_pid="$(powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; [Console]::Error.WriteLine("windows_launch_phase=environment"); $env:ProgramData=$env:DOBBYVPN_WINDOWS_PROGRAMDATA; if ([string]::IsNullOrWhiteSpace($env:USERNAME)) { throw "USERNAME is unavailable" }; $account=$env:USERNAME; if (-not [string]::IsNullOrWhiteSpace($env:USERDOMAIN)) { $account="$($env:USERDOMAIN)\$($env:USERNAME)" }; $env:DOBBYVPN_CONTROL_TOKEN_USER=$account; [Console]::Error.WriteLine("windows_launch_phase=account_ready"); $p=Start-Process -FilePath $env:DOBBYVPN_WINDOWS_SERVICE_BINARY -ArgumentList @("-port","50051") -RedirectStandardOutput $env:DOBBYVPN_WINDOWS_SERVICE_LOG -RedirectStandardError $env:DOBBYVPN_WINDOWS_SERVICE_ERR -PassThru; [Console]::Error.WriteLine("windows_launch_phase=process_started"); $p.Id')"
-          unset DOBBYVPN_WINDOWS_SERVICE_BINARY DOBBYVPN_WINDOWS_SERVICE_LOG DOBBYVPN_WINDOWS_SERVICE_ERR DOBBYVPN_WINDOWS_PROGRAMDATA
+          launch_remaining=$((preflight_deadline_epoch - $(date +%s)))
+          if [ "$launch_remaining" -le 0 ]; then
+            printf 'preflight launch reached its bounded deadline\n' >&2
+            exit 1
+          fi
+          launch_timeout="$PREFLIGHT_PROBE_TIMEOUT_SECONDS"
+          if [ "$launch_timeout" -gt "$launch_remaining" ]; then launch_timeout="$launch_remaining"; fi
+          printf 'preflight_probe_start label=service-launch timeout_seconds=%s remaining_seconds=%s\n' \
+            "$launch_timeout" "$launch_remaining"
+          launch_status=0
+          service_pid="$(timeout --foreground --signal=TERM --kill-after=1s "${launch_timeout}s" \
+            powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; [Console]::Error.WriteLine("windows_launch_phase=environment"); $env:ProgramData=$env:DOBBYVPN_WINDOWS_PROGRAMDATA; if ([string]::IsNullOrWhiteSpace($env:USERNAME)) { throw "USERNAME is unavailable" }; $account=$env:USERNAME; if (-not [string]::IsNullOrWhiteSpace($env:USERDOMAIN)) { $account="$($env:USERDOMAIN)\$($env:USERNAME)" }; $env:DOBBYVPN_CONTROL_TOKEN_USER=$account; [Console]::Error.WriteLine("windows_launch_phase=account_ready"); $p=Start-Process -FilePath $env:DOBBYVPN_WINDOWS_SERVICE_BINARY -ArgumentList @("-port","50051") -RedirectStandardOutput $env:DOBBYVPN_WINDOWS_SERVICE_LOG -RedirectStandardError $env:DOBBYVPN_WINDOWS_SERVICE_ERR -PassThru; [System.IO.File]::WriteAllText($env:DOBBYVPN_WINDOWS_SERVICE_PID_FILE, ([string]$p.Id + [Environment]::NewLine)); [Console]::Error.WriteLine("windows_launch_phase=process_started"); [Console]::Error.WriteLine("windows_launch_phase=pid_recorded"); $p.Id' \
+            2> "$launch_log")" || launch_status=$?
+          printf 'preflight_probe_result label=service-launch status=%s\n' "$launch_status"
+          emit_private_evidence preflight-launch "$launch_log"
+          if [ "$launch_status" -ne 0 ]; then
+            if [ -f "$preflight_pid_file" ]; then
+              IFS= read -r service_pid < "$preflight_pid_file" || true
+            fi
+            emit_private_evidence preflight-service-log "$service_log"
+            emit_private_evidence preflight-service-error "$service_err"
+            emit_private_display preflight-launch "$launch_log"
+            emit_private_display preflight-service-error "$service_err"
+            emit_private_classification preflight-launch "$launch_log"
+            emit_private_classification preflight-service-log "$service_log"
+            emit_private_classification preflight-service-error "$service_err"
+            if [ "$launch_status" -eq 124 ]; then
+              printf 'preflight_service_launch=failed code=LAUNCH_TIMEOUT status=%s\n' "$launch_status" >&2
+            else
+              printf 'preflight_service_launch=failed code=LAUNCH status=%s\n' "$launch_status" >&2
+            fi
+            exit 1
+          fi
+          unset DOBBYVPN_WINDOWS_SERVICE_BINARY DOBBYVPN_WINDOWS_SERVICE_LOG DOBBYVPN_WINDOWS_SERVICE_ERR DOBBYVPN_WINDOWS_PROGRAMDATA DOBBYVPN_WINDOWS_SERVICE_PID_FILE
           export PROGRAMDATA="$programdata_path"
           printf 'PROGRAMDATA=%s\n' "$PROGRAMDATA" >> "$GITHUB_ENV"
+          if [ -z "$service_pid" ] && [ -f "$preflight_pid_file" ]; then
+            IFS= read -r service_pid < "$preflight_pid_file" || true
+          fi
           case "$service_pid" in ""|*[!0-9]*) printf 'invalid preflight service pid=%s\n' "$service_pid" >&2; exit 1;; esac
-          printf '%s\n' "$service_pid" > "$HANDOFF_DIR/preflight-service.pid"
-          printf 'PREFLIGHT_SERVICE_PID=%s\nPREFLIGHT_SERVICE_PID_FILE=%s\nPREFLIGHT_SERVICE_LOG=%s\n' "$service_pid" "$HANDOFF_DIR/preflight-service.pid" "$service_log" >> "$GITHUB_ENV"
+          printf '%s\n' "$service_pid" > "$preflight_pid_file"
+          printf 'PREFLIGHT_SERVICE_PID=%s\n' "$service_pid" >> "$GITHUB_ENV"
           ready=false
           for attempt in $(seq 1 60); do
             printf 'preflight_service_readiness_attempt=%s\n' "$attempt"
-            remaining=$((RUN_DEADLINE_EPOCH - $(date +%s)))
-            if [ "$remaining" -le 180 ]; then printf 'preflight readiness reached cleanup reserve: remaining=%s\n' "$remaining" >&2; exit 1; fi
+            remaining=$((preflight_deadline_epoch - $(date +%s)))
+            if [ "$remaining" -le 0 ]; then
+              printf 'preflight readiness reached bounded startup deadline: remaining=%s\n' "$remaining" >&2
+              break
+            fi
             # shellcheck disable=SC2016
             probe_log="$SERVICE_DIR/preflight-service-probe-${attempt}.raw.log"
             probe_status=0
-            powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("preflight_service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid" > "$probe_log" 2>&1 || probe_status=$?
+            if run_preflight_probe "service-process-${attempt}" "$probe_log" \
+              powershell.exe -NoLogo -NoProfile -NonInteractive -Command 'try { $p=Get-Process -Id ([int]$args[0]) -ErrorAction Stop; Write-Output ("preflight_service_probe_pid=" + $p.Id); exit 0 } catch { Write-Error $_; exit 1 }' "$service_pid"; then
+              probe_status=0
+            else
+              probe_status=$?
+            fi
+            emit_private_evidence "preflight-service-probe-${attempt}" "$probe_log"
             if [ "$probe_status" -ne 0 ]; then
-              emit_private_evidence preflight-service-probe "$probe_log"
               emit_private_evidence preflight-service-log "$service_log"
               emit_private_evidence preflight-service-error "$service_err"
+              emit_private_evidence preflight-launch "$launch_log"
+              emit_private_display "preflight-service-probe-${attempt}" "$probe_log"
               emit_private_display preflight-service-error "$service_err"
-              emit_private_classification preflight-service-probe "$probe_log"
+              emit_private_classification "preflight-service-probe-${attempt}" "$probe_log"
               emit_private_classification preflight-service-log "$service_log"
               emit_private_classification preflight-service-error "$service_err"
-              printf 'preflight_service_readiness=failed code=SERVICE_EXITED status=%s\n' "$probe_status" >&2
+              if [ "$probe_status" -eq 124 ]; then
+                printf 'preflight_service_readiness=failed code=SERVICE_PROBE_TIMEOUT status=%s\n' "$probe_status" >&2
+              else
+                printf 'preflight_service_readiness=failed code=SERVICE_EXITED status=%s\n' "$probe_status" >&2
+              fi
               exit 1
             fi
             network_probe_log="$SERVICE_DIR/preflight-network-probe-${attempt}.raw.log"
             network_probe_status=0
-            powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$c=Test-NetConnection -ComputerName 127.0.0.1 -Port 50051; Write-Output $c; if ($c.TcpTestSucceeded) { exit 0 }; exit 1' > "$network_probe_log" 2>&1 || network_probe_status=$?
+            if run_preflight_probe "control-port-${attempt}" "$network_probe_log" \
+              powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$c=Test-NetConnection -ComputerName 127.0.0.1 -Port 50051; Write-Output $c; if ($c.TcpTestSucceeded) { exit 0 }; exit 1'; then
+              network_probe_status=0
+            else
+              network_probe_status=$?
+            fi
+            emit_private_evidence "preflight-network-probe-${attempt}" "$network_probe_log"
+            if [ "$network_probe_status" -eq 124 ]; then
+              emit_private_evidence preflight-service-log "$service_log"
+              emit_private_evidence preflight-service-error "$service_err"
+              emit_private_evidence preflight-launch "$launch_log"
+              emit_private_display "preflight-network-probe-${attempt}" "$network_probe_log"
+              emit_private_display preflight-service-error "$service_err"
+              emit_private_classification "preflight-network-probe-${attempt}" "$network_probe_log"
+              emit_private_classification preflight-service-log "$service_log"
+              emit_private_classification preflight-service-error "$service_err"
+              printf 'preflight_service_readiness=failed code=CONTROL_PORT_PROBE_TIMEOUT status=%s\n' "$network_probe_status" >&2
+              exit 1
+            fi
             if [ "$network_probe_status" -eq 0 ]; then ready=true; break; fi
-            emit_private_evidence preflight-network-probe "$network_probe_log"
+            remaining=$((preflight_deadline_epoch - $(date +%s)))
+            if [ "$remaining" -le 1 ]; then break; fi
             sleep 1
           done
           if [ "$ready" != true ]; then
             emit_private_evidence preflight-service-timeout "$service_log"
             emit_private_evidence preflight-service-error "$service_err"
+            emit_private_evidence preflight-launch "$launch_log"
+            emit_private_evidence preflight-service-probe-last "$probe_log"
+            emit_private_evidence preflight-network-probe-last "$network_probe_log"
             emit_private_display preflight-service-error "$service_err"
+            emit_private_display preflight-service-probe-last "$probe_log"
+            emit_private_display preflight-network-probe-last "$network_probe_log"
             emit_private_classification preflight-service-timeout "$service_log"
             emit_private_classification preflight-service-error "$service_err"
-            printf 'preflight_service_readiness=failed code=CONTROL_PORT_TIMEOUT\n' >&2
+            printf 'preflight_service_readiness=failed code=CONTROL_PORT_TIMEOUT budget_seconds=%s\n' \
+              "$((preflight_deadline_epoch - preflight_started_epoch))" >&2
             exit 1
           fi
           control_token="$PROGRAMDATA/DobbyVPN/control.token"
-          test -s "$control_token"
-          token_value="$(tr -d '\r\n' < "$control_token")"
-          [[ "$token_value" =~ ^[0-9a-fA-F]{64}$ ]]
+          if [ ! -s "$control_token" ]; then
+            emit_private_evidence preflight-service-log "$service_log"
+            emit_private_evidence preflight-service-error "$service_err"
+            emit_private_evidence preflight-launch "$launch_log"
+            emit_private_display preflight-service-error "$service_err"
+            emit_private_classification preflight-service-log "$service_log"
+            emit_private_classification preflight-service-error "$service_err"
+            printf 'preflight_control_token=failed code=MISSING\n' >&2
+            exit 1
+          fi
+          token_value=""
+          token_read_status=0
+          token_remaining=$((preflight_deadline_epoch - $(date +%s)))
+          if [ "$token_remaining" -le 0 ]; then
+            emit_private_evidence preflight-service-log "$service_log"
+            emit_private_evidence preflight-service-error "$service_err"
+            emit_private_evidence preflight-launch "$launch_log"
+            emit_private_display preflight-service-error "$service_err"
+            emit_private_classification preflight-service-log "$service_log"
+            emit_private_classification preflight-service-error "$service_err"
+            printf 'preflight_control_token=failed code=DEADLINE_EXCEEDED\n' >&2
+            exit 1
+          fi
+          token_timeout=5
+          if [ "$token_timeout" -gt "$token_remaining" ]; then token_timeout="$token_remaining"; fi
+          printf 'preflight_probe_start label=control-token-read timeout_seconds=%s remaining_seconds=%s\n' \
+            "$token_timeout" "$token_remaining"
+          token_value="$(timeout --foreground --signal=TERM --kill-after=1s "${token_timeout}s" tr -d '\r\n' < "$control_token")" || token_read_status=$?
+          printf 'preflight_probe_result label=control-token-read status=%s\n' "$token_read_status"
+          if [ "$token_read_status" -ne 0 ]; then
+            emit_private_evidence preflight-service-log "$service_log"
+            emit_private_evidence preflight-service-error "$service_err"
+            emit_private_evidence preflight-launch "$launch_log"
+            emit_private_display preflight-service-error "$service_err"
+            emit_private_classification preflight-service-log "$service_log"
+            emit_private_classification preflight-service-error "$service_err"
+            printf 'preflight_control_token=failed code=READ_TIMEOUT status=%s\n' "$token_read_status" >&2
+            exit 1
+          fi
+          if [[ ! "$token_value" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            emit_private_evidence preflight-service-log "$service_log"
+            emit_private_evidence preflight-service-error "$service_err"
+            emit_private_evidence preflight-launch "$launch_log"
+            emit_private_display preflight-service-error "$service_err"
+            emit_private_classification preflight-service-log "$service_log"
+            emit_private_classification preflight-service-error "$service_err"
+            printf 'preflight_control_token=failed code=INVALID\n' >&2
+            exit 1
+          fi
           printf 'preflight_control_token_ready=1\n'
-          status_log="$SERVICE_DIR/preflight-control-status.raw.log"
           status_code=0
-          "$GITHUB_WORKSPACE/candidate/dobby-cli.exe" status > "$status_log" 2>&1 || status_code=$?
+          if run_preflight_probe control-status "$status_log" \
+            "$GITHUB_WORKSPACE/candidate/dobby-cli.exe" status; then
+            status_code=0
+          else
+            status_code=$?
+          fi
           emit_private_evidence preflight-control-status "$status_log"
           if [ "$status_code" -ne 0 ]; then
-            printf 'preflight_control_status=failed code=CLI_STATUS status=%s\n' "$status_code" >&2
+            emit_private_evidence preflight-service-log "$service_log"
+            emit_private_evidence preflight-service-error "$service_err"
+            emit_private_evidence preflight-launch "$launch_log"
+            emit_private_display preflight-control-status "$status_log"
+            emit_private_display preflight-service-error "$service_err"
+            emit_private_classification preflight-control-status "$status_log"
+            emit_private_classification preflight-service-log "$service_log"
+            emit_private_classification preflight-service-error "$service_err"
+            if [ "$status_code" -eq 124 ]; then
+              printf 'preflight_control_status=failed code=CLI_STATUS_TIMEOUT status=%s\n' "$status_code" >&2
+            else
+              printf 'preflight_control_status=failed code=CLI_STATUS status=%s\n' "$status_code" >&2
+            fi
             exit "$status_code"
           fi
           printf 'preflight_service_ready=true\n'

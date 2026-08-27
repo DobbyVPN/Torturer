@@ -557,7 +557,8 @@ jobs:
             --service-socket "$SERVICE_SOCKET" \
             --service-library-path "$GITHUB_WORKSPACE/candidate" \
             --service-pid-file "$SERVICE_PID_FILE" \
-            --network-interface "$NETWORK_INTERFACE"
+            --network-interface "$NETWORK_INTERFACE" \
+            --expected-unavailable "functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED"
 
       - name: Stop candidate service and verify process cleanup
         if: always()

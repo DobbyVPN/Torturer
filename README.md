@@ -48,10 +48,18 @@ by its proved capabilities, and reports the remainder explicitly as
 unsupported. Current hosted desktop lanes prove configuration, connection,
 tunnel and routing identity, traffic metrics, disconnect/cleanup, reconnect,
 bounded endurance, and exact product-process recovery. Android proves the
-common connection, traffic, reconnect, disconnect, and cleanup set. Hosted
-network-transition and sleep/wake operations remain unavailable because no
-workflow supplies a safe runner control for them; they are never inferred as
-passes.
+common connection, traffic, reconnect, disconnect, and cleanup set. The Linux
+hosted lane records `functional.sleep-wake` as an explicit, expected
+unavailable result with reason `HOSTED_RUNNER_SUSPEND_UNSUPPORTED`: suspending
+the GitHub runner would destroy the job's control path and cannot prove guest
+sleep/wake. It is not silently skipped or inferred as a pass; the private
+Harness Linux VM must cover it with a real guest suspend/wake boundary.
+
+The Linux hosted result keeps all ten canonical scenario records and reports
+`coverage.status` as
+`supported-subset-with-expected-limitations`, never as complete coverage. The
+workflow pins the exception in its command line, and the runner fails closed
+for any missing, duplicate, failed, or unexpected unavailable scenario.
 
 Each platform workflow has one total 30-minute deadline measured from the
 workflow run start, including source build, client readiness, lease

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from torturer_checks.hosted.deadline import DeadlineError, main, run
 
@@ -26,6 +28,59 @@ class HostedDeadlineTests(unittest.TestCase):
             grace_seconds=1,
         )
         self.assertEqual(code, 0)
+
+    def test_failure_writes_safe_summary_without_child_bytes_or_arguments(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hosted-deadline-summary-") as directory:
+            root = Path(directory)
+            summary = root / "summary.json"
+            raw = root / "raw"
+            secret = "summary-secret-must-not-escape"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "TORTURER_HOSTED_DEADLINE_EVIDENCE_DIR": str(raw),
+                    "TORTURER_HOSTED_DEADLINE_SUMMARY_PATH": str(summary),
+                },
+                clear=False,
+            ):
+                code = run(
+                    [sys.executable, "-c", "raise SystemExit(7)", secret],
+                    timeout_seconds=5,
+                    grace_seconds=1,
+                )
+            self.assertEqual(code, 7)
+            payload = json.loads(summary.read_text(encoding="utf-8"))
+            self.assertEqual(payload["kind"], "dobbyvpn.hosted.deadline-summary")
+            self.assertEqual(payload["status"], "failed")
+            self.assertEqual(payload["return_code"], 7)
+            self.assertTrue(payload["evidence"])
+            rendered = summary.read_text(encoding="utf-8")
+            self.assertNotIn(secret, rendered)
+            self.assertNotIn("SystemExit", rendered)
+            self.assertEqual(summary.stat().st_mode & 0o777, 0o600)
+
+    @unittest.skipIf(os.name == "nt", "POSIX timeout summary test")
+    def test_timeout_writes_timed_out_summary(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hosted-deadline-timeout-summary-") as directory:
+            root = Path(directory)
+            summary = root / "summary.json"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "TORTURER_HOSTED_DEADLINE_EVIDENCE_DIR": str(root / "raw"),
+                    "TORTURER_HOSTED_DEADLINE_SUMMARY_PATH": str(summary),
+                },
+                clear=False,
+            ):
+                code = run(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    timeout_seconds=1,
+                    grace_seconds=1,
+                )
+            self.assertEqual(code, 124)
+            payload = json.loads(summary.read_text(encoding="utf-8"))
+            self.assertEqual(payload["status"], "timed-out")
+            self.assertEqual(payload["return_code"], 124)
 
     def test_module_cli_executes_and_does_not_echo_raw_arguments(self) -> None:
         secret_argument = "profile-token-must-not-be-printed"

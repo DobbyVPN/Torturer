@@ -40,7 +40,7 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         for option in (
             "--download-url", "--upload-url", "--service-pid",
             "--service-binary", "--service-socket", "--service-library-path",
-            "--service-pid-file", "--network-interface",
+            "--service-pid-file", "--network-interface", "--expected-unavailable",
         ):
             self.assertIn(option, block)
         discovery = self.text.index("- name: Discover physical default-route interface for network transition")
@@ -53,6 +53,10 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertNotIn("> /dev/null", discovery_block)
         self.assertNotIn("2> /dev/null", discovery_block)
         self.assertIn('--network-interface "$NETWORK_INTERFACE"', block)
+        self.assertIn(
+            '--expected-unavailable "functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED"',
+            block,
+        )
         self.assertIn('--download-url "https://proof.ovh.net/files/1Mb.dat"', block)
         self.assertNotRegex(block, r'--(?:download|upload)-url\s+"[^"\n]*[?#]')
         self.assertNotIn("speed.cloudflare.com/__down?", block)

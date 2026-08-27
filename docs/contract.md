@@ -258,6 +258,38 @@ Every `verify.yml` helper checkout is pinned to the immutable H1 SHA. DobbyVPN
 may update its immutable Torturer workflow pin only to a reviewed H2-or-later
 commit.
 
+## Hosted capability coverage contract
+
+The Linux hosted workflow selects and emits all ten canonical scenarios. An
+unavailable scenario is not a pass and is never silently removed. This
+workflow has one reviewed platform limitation, declared literally as
+`functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED`. The reason means
+that suspending the GitHub-hosted runner would suspend the job's control host;
+it cannot provide the guest-level suspend/resume proof required by the
+canonical scenario.
+
+The hosted result retains the unavailable per-scenario record and adds a
+top-level coverage envelope with `status` set to
+`supported-subset-with-expected-limitations` and `complete` set to `false`.
+`selected_scenario_count` and `result_scenario_count` must both be ten, with
+unique IDs matching the canonical catalog. The envelope records the declared,
+expected, and observed `(scenario_id, reason_code)` pairs.
+
+The Linux lane exits successfully only when the workflow's explicit
+`--expected-unavailable` declaration exactly matches the reviewed pair, the
+declared and observed pairs match it exactly, all other scenarios pass, and
+every scenario reset succeeds. A missing, duplicate, extra, failed, changed,
+or unexpected unavailable scenario fails closed while preserving the result
+envelope for release reporting. The exception is hosted-only: the private
+Harness Linux VM must execute and pass `functional.sleep-wake`; local
+unavailability is never accepted as the equivalent.
+
+The workflow checks out the exact `$GITHUB_SHA` and records it as
+`TORTURER_SHA`; the literal command-line declaration and this contract are
+therefore pinned to the reviewed Torturer revision. A future implementation of
+hosted suspend/wake must remove the exception and update the contract rather
+than leave a stale allowlist.
+
 ## Trusted hosted adapter boundary
 
 The hosted functional entry point is `python3 -m
@@ -348,7 +380,9 @@ socket or address, PID file, and fixed query-free HTTPS measurement endpoints,
 so process-loss recovery and bounded endurance are real capabilities. The
 optional network-transition seam is not enabled because interrupting the whole
 runner interface would also destroy the job's control path. Sleep/wake is not
-advertised on hosted runners.
+advertised as a hosted capability; Linux records its one documented
+`HOSTED_RUNNER_SUSPEND_UNSUPPORTED` limitation through the coverage contract
+above rather than pretending to execute it.
 
 Android requires usable `/dev/kvm`, starts an API-35 x86_64 emulator with
 `-no-window` and hardware acceleration, installs the exact staged application

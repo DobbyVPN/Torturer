@@ -112,6 +112,55 @@ class FunctionalWindowsWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("--download-url \"https://proof.ovh.net/files/1Mb.dat\"", functional)
         self.assertNotIn("speed.cloudflare.com/__down?", functional)
 
+    def test_preflight_startup_bounds_every_candidate_probe_and_preserves_cleanup(self) -> None:
+        client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
+        start = client.index("- name: Start exact Windows preflight candidate")
+        stop = client.index("- name: Stop Windows preflight candidate before Render handoff")
+        preflight = client[start:stop]
+
+        self.assertIn("PREFLIGHT_MAX_SECONDS=300", preflight)
+        self.assertIn("PREFLIGHT_CLEANUP_RESERVE_SECONDS=180", preflight)
+        self.assertIn("PREFLIGHT_PROBE_TIMEOUT_SECONDS=10", preflight)
+        self.assertIn("preflight_deadline_epoch", preflight)
+        self.assertIn("run_preflight_probe()", preflight)
+        self.assertGreaterEqual(
+            preflight.count("timeout --foreground --signal=TERM --kill-after=1s"),
+            3,
+        )
+        self.assertRegex(
+            preflight,
+            r'run_preflight_probe "service-process-\$\{attempt\}" "\$probe_log" \\\n'
+            r'\s+powershell\.exe .*Get-Process',
+        )
+        self.assertRegex(
+            preflight,
+            r'run_preflight_probe "control-port-\$\{attempt\}" "\$network_probe_log" \\\n'
+            r'\s+powershell\.exe .*Test-NetConnection',
+        )
+        self.assertRegex(
+            preflight,
+            r'run_preflight_probe control-status "\$status_log" \\\n'
+            r'\s+"\$GITHUB_WORKSPACE/candidate/dobby-cli\.exe" status',
+        )
+        self.assertIn(
+            "preflight_service_readiness=failed code=SERVICE_PROBE_TIMEOUT",
+            preflight,
+        )
+        self.assertIn(
+            "preflight_service_readiness=failed code=CONTROL_PORT_PROBE_TIMEOUT",
+            preflight,
+        )
+        self.assertIn(
+            "preflight_control_status=failed code=CLI_STATUS_TIMEOUT",
+            preflight,
+        )
+        self.assertIn("PREFLIGHT_SERVICE_PID_FILE", preflight)
+        self.assertIn(
+            "WriteAllText($env:DOBBYVPN_WINDOWS_SERVICE_PID_FILE",
+            preflight,
+        )
+        self.assertIn("emit_private_evidence preflight-launch", preflight)
+
     def test_render_handoff_is_opaque_and_bound_to_windows_origin(self) -> None:
         self.assertIn("render-request-${lease_run_id}-${PLATFORM}", self.text)
         self.assertIn("render-lease-${LEASE_RUN_ID}-${PLATFORM}", self.text)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import gc
 import hashlib
 import os
@@ -30,6 +31,9 @@ from torturer_checks.hosted.linux import (
 from torturer_checks.hosted.macos import MacOSHostedAdapter
 from torturer_checks.hosted.windows import WindowsHostedAdapter
 from torturer_checks.hosted.run import (
+    EXPECTED_UNAVAILABLE_BY_PLATFORM,
+    _coverage_contract,
+    _expected_unavailable,
     _partition_applicable,
     _qualification_exit_code,
     _run_scenarios,
@@ -231,6 +235,61 @@ class HostedCLIAdapterTests(unittest.TestCase):
         )
         self.assertEqual(network_result.outcome, "passed")
 
+    def test_linux_sleep_wake_is_explicitly_unavailable_with_stable_reason(self) -> None:
+        adapter = LinuxHostedAdapter(cli=self.cli, profile=self.profile, runner=self.runner)
+        scenario = get_scenario("functional.sleep-wake")
+        self.assertNotIn(Capability.SLEEP_WAKE, adapter.capabilities)
+        self.assertEqual(
+            adapter.capability_unavailable_reasons,
+            {Capability.SLEEP_WAKE: "HOSTED_RUNNER_SUSPEND_UNSUPPORTED"},
+        )
+        result = FunctionalEngine("1" * 64).run(
+            scenario,
+            adapter,
+            _provenance(adapter),
+        )
+        self.assertEqual(result.outcome, "unavailable")
+        self.assertEqual(result.reason_code, "HOSTED_RUNNER_SUSPEND_UNSUPPORTED")
+
+    def test_linux_partition_uses_capability_reason_without_string_key_mismatch(self) -> None:
+        adapter = LinuxHostedAdapter(cli=self.cli, profile=self.profile, runner=self.runner)
+        _, unsupported = _partition_applicable(
+            (get_scenario("functional.sleep-wake"),),
+            adapter.capabilities,
+            adapter.capability_unavailable_reasons,
+        )
+        self.assertEqual(
+            unsupported,
+            [{
+                "scenario_id": "functional.sleep-wake",
+                "missing_capabilities": ["sleep_wake"],
+                "reason_code": "HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
+            }],
+        )
+
+    def test_engine_keeps_runtime_unavailability_generic_when_capability_was_advertised(self) -> None:
+        scenario = get_scenario("functional.sleep-wake")
+
+        class RuntimeUnavailableAdapter:
+            adapter_id = "runtime-unavailable"
+            adapter_version = "v1"
+            capabilities = scenario.required_capabilities
+            capability_unavailable_reasons = {
+                Capability.SLEEP_WAKE: "HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
+            }
+
+            def execute(self, step):
+                raise CapabilityUnavailable()
+
+        adapter = RuntimeUnavailableAdapter()
+        result = FunctionalEngine("1" * 64).run(
+            scenario,
+            adapter,
+            _provenance(adapter),
+        )
+        self.assertEqual(result.outcome, "unavailable")
+        self.assertEqual(result.reason_code, "CAPABILITY_UNAVAILABLE")
+
     def test_shared_desktop_endurance_is_url_gated_and_bounded(self) -> None:
         adapter = HostedCLIAdapter(
             cli=self.cli, profile=self.profile, runner=self.runner,
@@ -293,8 +352,14 @@ class HostedCLIAdapterTests(unittest.TestCase):
             "--candidate-manifest", str(self.cli), "--server-image-digest", "sha256:" + "b" * 64,
             "--output", str(self.directory.name + "/result.json"), "--scenario-id",
             "functional.configure", "--scenario-id", "functional.disconnect-cleanup",
+            "--expected-unavailable",
+            "functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
         ])
         self.assertEqual(parsed.scenario_ids, ["functional.configure", "functional.disconnect-cleanup"])
+        self.assertEqual(
+            parsed.expected_unavailable,
+            ["functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED"],
+        )
 
     def test_hosted_runner_accounts_for_one_reset_after_every_selected_scenario(self) -> None:
         scenarios = _select_scenarios([
@@ -332,6 +397,151 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertTrue(
             all(item["reason_code"] == "CAPABILITY_UNAVAILABLE" for item in unsupported)
         )
+
+    def _linux_coverage_fixture(self):
+        selected = scenario_catalog()
+        sleep_id = "functional.sleep-wake"
+        results = [
+            {"scenario_id": scenario.id, "outcome": "passed"}
+            for scenario in selected
+        ]
+        sleep_result = next(item for item in results if item["scenario_id"] == sleep_id)
+        sleep_result.update({
+            "outcome": "unavailable",
+            "reason_code": "HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
+        })
+        unsupported = [{
+            "scenario_id": sleep_id,
+            "missing_capabilities": ["sleep_wake"],
+            "reason_code": "HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
+        }]
+        expected = EXPECTED_UNAVAILABLE_BY_PLATFORM["linux"]
+        coverage = _coverage_contract(
+            "linux",
+            selected,
+            results,
+            unsupported,
+            expected,
+            reset_count=10,
+            reset_failures=0,
+        )
+        return selected, results, unsupported, expected, coverage
+
+    def test_linux_expected_unavailable_contract_allows_only_exact_complete_subset(self) -> None:
+        selected, results, unsupported, expected, coverage = self._linux_coverage_fixture()
+        self.assertEqual(coverage["status"], "supported-subset-with-expected-limitations")
+        self.assertFalse(coverage["complete"])
+        self.assertEqual(coverage["catalog_scenario_count"], 10)
+        self.assertEqual(coverage["selected_scenario_count"], 10)
+        self.assertEqual(coverage["result_scenario_count"], 10)
+        self.assertEqual(
+            coverage["actual_unavailable"],
+            [{
+                "scenario_id": "functional.sleep-wake",
+                "reason_code": "HOSTED_RUNNER_SUSPEND_UNSUPPORTED",
+            }],
+        )
+        self.assertEqual(
+            _qualification_exit_code(
+                results,
+                unsupported,
+                [],
+                coverage=coverage,
+            ),
+            0,
+        )
+
+    def test_linux_expected_unavailable_contract_rejects_catalog_and_result_drift(self) -> None:
+        _, results, unsupported, expected, _ = self._linux_coverage_fixture()
+        cases = {}
+
+        missing = results[:-1]
+        cases["missing result"] = (scenario_catalog(), missing, unsupported, 10, 0)
+
+        duplicate = results + [copy.deepcopy(results[0])]
+        cases["duplicate result"] = (scenario_catalog(), duplicate, unsupported, 11, 0)
+
+        unexpected = copy.deepcopy(results)
+        unexpected[0] = {"scenario_id": "functional.configure", "outcome": "unavailable", "reason_code": "NEW_GAP"}
+        cases["unexpected unavailable"] = (scenario_catalog(), unexpected, unsupported, 10, 0)
+
+        failed = copy.deepcopy(results)
+        failed[0] = {"scenario_id": "functional.configure", "outcome": "failed", "reason_code": "ASSERTION_FAILED"}
+        cases["failed result"] = (scenario_catalog(), failed, unsupported, 10, 0)
+
+        reset_failed = (scenario_catalog(), results, unsupported, 10, 1)
+        cases["reset failure"] = reset_failed
+
+        cases["missing declaration"] = (scenario_catalog(), results, [], 10, 0)
+
+        stale_declaration = [{
+            "scenario_id": "functional.sleep-wake",
+            "missing_capabilities": ["sleep_wake"],
+            "reason_code": "CAPABILITY_UNAVAILABLE",
+        }]
+        cases["changed declaration reason"] = (scenario_catalog(), results, stale_declaration, 10, 0)
+
+        duplicate_declaration = unsupported + [copy.deepcopy(unsupported[0])]
+        cases["duplicate declaration"] = (scenario_catalog(), results, duplicate_declaration, 10, 0)
+
+        for name, (selected, case_results, case_unsupported, reset_count, reset_failures) in cases.items():
+            with self.subTest(case=name):
+                coverage = _coverage_contract(
+                    "linux",
+                    selected,
+                    case_results,
+                    case_unsupported,
+                    expected,
+                    reset_count=reset_count,
+                    reset_failures=reset_failures,
+                )
+                self.assertEqual(coverage["status"], "coverage-contract-failed")
+                self.assertEqual(
+                    _qualification_exit_code(
+                        case_results,
+                        case_unsupported,
+                        ["ResetError"] if reset_failures else [],
+                        coverage=coverage,
+                    ),
+                    2,
+                )
+
+        subset = scenario_catalog()[:-1]
+        coverage = _coverage_contract(
+            "linux",
+            subset,
+            results[:-1],
+            unsupported,
+            expected,
+            reset_count=9,
+            reset_failures=0,
+        )
+        self.assertEqual(coverage["status"], "coverage-contract-failed")
+
+        _, results, unsupported, _, _ = self._linux_coverage_fixture()
+        coverage = _coverage_contract(
+            "linux",
+            scenario_catalog(),
+            results,
+            unsupported,
+            frozenset({
+                ("functional.network-transition", "UNREVIEWED_GAP"),
+                ("functional.sleep-wake", "HOSTED_RUNNER_SUSPEND_UNSUPPORTED"),
+            }),
+            reset_count=10,
+            reset_failures=0,
+        )
+        self.assertEqual(coverage["status"], "coverage-contract-failed")
+
+    def test_linux_expected_unavailable_parser_requires_unique_stable_pairs(self) -> None:
+        value = "functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED"
+        self.assertEqual(_expected_unavailable([value]), {
+            ("functional.sleep-wake", "HOSTED_RUNNER_SUSPEND_UNSUPPORTED"),
+        })
+        with self.assertRaisesRegex(ValueError, "must be unique"):
+            _expected_unavailable([value, value])
+        with self.assertRaisesRegex(ValueError, "scenario-id=REASON_CODE"):
+            _expected_unavailable(["functional.sleep-wake=not-stable"])
 
     def test_unsupported_scenarios_are_unavailable_results_and_fail_gate(self) -> None:
         scenario = get_scenario("functional.sleep-wake")
