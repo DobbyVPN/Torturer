@@ -13,6 +13,7 @@ EXPECTED_ACTIONS = {
     "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
     "actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16",
     "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f",
+    "docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435",
 }
 
 
@@ -53,6 +54,10 @@ class UploadSinkPublishWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("--provenance=mode=max", self.text)
         self.assertIn("--sbom=true", self.text)
         self.assertIn("--metadata-file", self.text)
+        setup = self.text.index("Set up attestation-capable Buildx")
+        build = self.text.index("Build and push immutable image with provenance")
+        self.assertLess(setup, build)
+        self.assertIn("driver: docker-container", self.text[setup:build])
         self.assertIn('metadata.get("containerimage.digest")', self.text)
         self.assertIn('metadata.get("buildx.build.provenance")', self.text)
         self.assertRegex(self.text, r"sha256:\[0-9a-f\]\{64\}")
