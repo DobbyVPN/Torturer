@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 import os
 import sys
@@ -17,6 +19,7 @@ from torturer_checks.android import (
     INTERNAL_LIFECYCLE_TEST,
     MAX_RUN_SECONDS,
     RunBudget,
+    _public_command_stage,
     _contains_enabled_package,
     _run,
     build_command,
@@ -96,6 +99,65 @@ class AndroidDeviceQueryTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, "")
+
+    def test_timeout_reports_known_internal_stage_without_command_text(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="android-command-stage-") as directory:
+            stderr = StringIO()
+            with redirect_stderr(stderr):
+                with self.assertRaisesRegex(
+                    AndroidContractError,
+                    r"Android command timed out \(stage=adb-install-application\)",
+                ) as context:
+                    _run(
+                        [sys.executable, "-c", "import time; time.sleep(60)"],
+                        timeout=0.1,
+                        evidence_directory=Path(directory),
+                        evidence_label="adb-install-application",
+                    )
+
+            self.assertIn("stage=adb-install-application", stderr.getvalue())
+            self.assertNotIn("time.sleep", str(context.exception))
+            self.assertNotIn("time.sleep", stderr.getvalue())
+
+    def test_command_stage_mapper_fails_closed_for_adversarial_labels(self) -> None:
+        self.assertEqual(_public_command_stage("adb-install-application"), "adb-install-application")
+        self.assertEqual(_public_command_stage("adb-boot-state-001"), "adb-boot-state")
+        for label in (
+            "adb-install-application; token=private",
+            "/private/path/with-secret",
+            "private-label=https://user:password@example.invalid/config",
+            "adb-boot-state-001-secret",
+            object(),
+        ):
+            with self.subTest(label=repr(label)):
+                self.assertEqual(_public_command_stage(label), "unclassified")
+
+    def test_start_and_nonzero_failures_report_only_fixed_or_unclassified_stage(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="android-command-stage-") as directory:
+            with self.assertRaisesRegex(
+                AndroidContractError,
+                r"Android command could not start \(stage=adb-install-application; FileNotFoundError\)",
+            ):
+                _run(
+                    [Path(directory) / "missing-adb"],
+                    timeout=1,
+                    evidence_directory=Path(directory) / "start-evidence",
+                    evidence_label="adb-install-application",
+                )
+
+            private_label = "private-evidence=https://user:password@example.invalid/config"
+            with self.assertRaisesRegex(
+                AndroidContractError,
+                r"Android command failed \(stage=unclassified; code=7\)",
+            ) as context:
+                _run(
+                    [sys.executable, "-c", "import sys; sys.exit(7)"],
+                    timeout=1,
+                    evidence_directory=Path(directory) / "failure-evidence",
+                    evidence_label=private_label,
+                )
+            self.assertNotIn(private_label, str(context.exception))
+            self.assertNotIn("user:password", str(context.exception))
 
     @unittest.skipUnless(
         os.name == "posix" and Path("/proc").is_dir(),

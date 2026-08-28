@@ -44,7 +44,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 import uuid
 
 from torturer_checks.cli_status import CLIStatusError, parse_public_status
@@ -97,6 +97,14 @@ class SliceFailure(RuntimeError):
     """One required public-contract assertion did not hold."""
 
 
+SERVICE_STARTUP_CONTROL_AUTH_IDENTITY_FAILED = "CONTROL_AUTH_IDENTITY_FAILED"
+SERVICE_STARTUP_CONTROL_AUTH_TOKEN_IO_FAILED = "CONTROL_AUTH_TOKEN_IO_FAILED"
+SERVICE_STARTUP_CONTROL_AUTH_ACL_APPLY_FAILED = "CONTROL_AUTH_ACL_APPLY_FAILED"
+SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED = "CONTROL_AUTH_ACL_VERIFY_FAILED"
+SERVICE_STARTUP_CONTROL_AUTH_INVALID_TOKEN = "CONTROL_AUTH_INVALID_TOKEN"
+SERVICE_STARTUP_CONTROL_AUTH_OTHER = "CONTROL_AUTH_OTHER"
+# Keep the previous name and value source-compatible.  New output uses the
+# more precise OTHER bucket for the generic marker.
 SERVICE_STARTUP_CONTROL_AUTH_FAILED = "CONTROL_AUTH_INIT_FAILED"
 SERVICE_STARTUP_LOOPBACK_LISTEN_FAILED = "LOOPBACK_LISTEN_FAILED"
 SERVICE_STARTUP_INTERRUPTED_STATE_RECOVERY_FAILED = "INTERRUPTED_STATE_RECOVERY_FAILED"
@@ -107,14 +115,60 @@ SERVICE_STARTUP_UNCLASSIFIED = "UNCLASSIFIED"
 
 # These are exact, stable fragments emitted by DobbyVPN's public Go desktop
 # startup paths.  The classifier returns only the fixed values above; it never
-# returns a service-log fragment.  Keep the order aligned with startup so a
-# single malformed log cannot make the public reason depend on arbitrary text.
+# returns a service-log fragment.  The nested control-auth markers come from
+# controlplane/token*.go.  They must precede the outer panic marker because
+# DobbyVPN wraps each one as "failed to prepare control authentication: %w".
+# Keep this list fixed and explicit: an unknown or private error is always
+# classified as CONTROL_AUTH_OTHER/UNCLASSIFIED, never echoed publicly.
 _SERVICE_STARTUP_RULES = (
     (b"failed to initialize secure local logging", SERVICE_STARTUP_SECURE_LOCAL_LOGGING_FAILED),
     (b"failed to recover interrupted product state", SERVICE_STARTUP_INTERRUPTED_STATE_RECOVERY_FAILED),
-    (b"failed to prepare control authentication", SERVICE_STARTUP_CONTROL_AUTH_FAILED),
     (b"failed to listen", SERVICE_STARTUP_LOOPBACK_LISTEN_FAILED),
     (b"failed to serve", SERVICE_STARTUP_GRPC_SERVE_FAILED),
+)
+
+_SERVICE_STARTUP_CONTROL_AUTH_RULES = (
+    # Identity/current-user/SID resolution reachable from
+    # LoadOrCreateControlToken -> controlTokenUser/LookupSID.
+    (b"resolve installed-user sid", SERVICE_STARTUP_CONTROL_AUTH_IDENTITY_FAILED),
+    (b"resolve current windows user", SERVICE_STARTUP_CONTROL_AUTH_IDENTITY_FAILED),
+    (
+        b"windows installed-user identity is unavailable for the control token acl",
+        SERVICE_STARTUP_CONTROL_AUTH_IDENTITY_FAILED,
+    ),
+    # Token path or I/O.  Most raw os.File errors intentionally have no stable
+    # product prefix and therefore remain in the fixed OTHER bucket.
+    (
+        b"programdata is required for the installation control token",
+        SERVICE_STARTUP_CONTROL_AUTH_TOKEN_IO_FAILED,
+    ),
+    # Invalid token content is checked before ACL verification.
+    (b"invalid desktop control token", SERVICE_STARTUP_CONTROL_AUTH_INVALID_TOKEN),
+    # ACL construction/application.
+    (b"build explicit runtime path acl", SERVICE_STARTUP_CONTROL_AUTH_ACL_APPLY_FAILED),
+    (b"set explicit runtime path acl", SERVICE_STARTUP_CONTROL_AUTH_ACL_APPLY_FAILED),
+    # ACL verification/owner/inheritance/entries.  The concrete descriptions
+    # below are the values passed to verifyExactACL in token_windows.go; using
+    # their stable wording avoids matching arbitrary private text.
+    (b"read control token acl:", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
+    (b"control token has no security descriptor", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
+    (b"control token security descriptor is invalid", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
+    (b"read control token security descriptor control:", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
+    (b"control token owner is defaulted", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
+    (b"control token dacl is defaulted", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
+    (b"control token has no dacl", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
+    (b"read control token owner:", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
+    (b"control token owner is not the expected identity", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
+    (b"control token acl inheritance is not disabled", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
+    (b"read control token dacl:", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
+    (b"control token acl contains", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
+    (b"control token acl repeats an identity", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
+    (b"control token acl grants access to an unexpected identity", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
+    (b"control token acl is missing an expected identity", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
+    (b"inspect control token type:", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
+    (b"control token is a reparse point", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
+    # The outer marker is intentionally last among control-auth rules.
+    (b"failed to prepare control authentication", SERVICE_STARTUP_CONTROL_AUTH_OTHER),
 )
 
 
@@ -132,6 +186,9 @@ def classify_service_startup_log(payload: bytes) -> str:
     if not isinstance(payload, bytes):
         return SERVICE_STARTUP_UNCLASSIFIED
     lowered = payload.lower()
+    for needle, classification in _SERVICE_STARTUP_CONTROL_AUTH_RULES:
+        if needle in lowered:
+            return classification
     for needle, classification in _SERVICE_STARTUP_RULES:
         if needle in lowered:
             return classification
@@ -1424,6 +1481,40 @@ def build_runtime_paths(root: Path, target_platform: str) -> RuntimePaths:
     return RuntimePaths(root, fixture, None, root / "ProgramData" / "DobbyVPN" / "control.token")
 
 
+_WINDOWS_ACCOUNT_FORBIDDEN = frozenset('\\/:*?"<>|@')
+
+
+def derive_windows_control_token_user(environment: Mapping[str, str]) -> str:
+    """Derive the installed-user account without exposing its value on error.
+
+    DobbyVPN's Windows token ACL must resolve the same account that launched
+    the hosted service.  The runner-provided ``USERNAME`` is required and the
+    optional ``USERDOMAIN`` is prepended in the canonical ``DOMAIN\\USER``
+    form.  Values are validated before they cross the subprocess boundary;
+    inherited control-token overrides never participate in this decision.
+    """
+
+    def valid_component(value: object) -> str:
+        if not isinstance(value, str) or not value or value != value.strip():
+            raise SliceFailure("Windows control-token identity is unavailable or unsafe")
+        if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+            raise SliceFailure("Windows control-token identity is unavailable or unsafe")
+        if any(character in _WINDOWS_ACCOUNT_FORBIDDEN for character in value):
+            raise SliceFailure("Windows control-token identity is unavailable or unsafe")
+        return value
+
+    username = valid_component(environment.get("USERNAME"))
+    raw_domain = environment.get("USERDOMAIN")
+    if raw_domain is None:
+        account = username
+    else:
+        domain = valid_component(raw_domain)
+        account = f"{domain}\\{username}"
+    if account.upper() in {"SYSTEM", "NT AUTHORITY\\SYSTEM"}:
+        raise SliceFailure("Windows control-token identity is unavailable or unsafe")
+    return account
+
+
 def service_environment(target_platform: str, runtime: RuntimePaths, port: int | None) -> dict[str, str]:
     """Constrain public control transport state to the per-run temporary root."""
 
@@ -1442,6 +1533,10 @@ def service_environment(target_platform: str, runtime: RuntimePaths, port: int |
         raise SliceFailure("Windows runtime has no loopback TCP port")
     environment["PROGRAMDATA"] = str(runtime.root / "ProgramData")
     environment["PORT"] = str(port)
+    # The public Windows service must not fall back to an account lookup that
+    # can differ across hosted launch contexts.  Derive it from the copied
+    # runner environment only after removing any inherited override.
+    environment["DOBBYVPN_CONTROL_TOKEN_USER"] = derive_windows_control_token_user(environment)
     return environment
 
 

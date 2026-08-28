@@ -47,7 +47,13 @@ from torturer_checks.desktop_slice import (
     service_environment,
     safe_failure_reason,
     classify_service_startup_log,
+    SERVICE_STARTUP_CONTROL_AUTH_ACL_APPLY_FAILED,
+    SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
     SERVICE_STARTUP_CONTROL_AUTH_FAILED,
+    SERVICE_STARTUP_CONTROL_AUTH_IDENTITY_FAILED,
+    SERVICE_STARTUP_CONTROL_AUTH_INVALID_TOKEN,
+    SERVICE_STARTUP_CONTROL_AUTH_OTHER,
+    SERVICE_STARTUP_CONTROL_AUTH_TOKEN_IO_FAILED,
     SERVICE_STARTUP_EMPTY,
     SERVICE_STARTUP_GRPC_SERVE_FAILED,
     SERVICE_STARTUP_INTERRUPTED_STATE_RECOVERY_FAILED,
@@ -55,6 +61,7 @@ from torturer_checks.desktop_slice import (
     SERVICE_STARTUP_SECURE_LOCAL_LOGGING_FAILED,
     SERVICE_STARTUP_UNCLASSIFIED,
     stop_service,
+    derive_windows_control_token_user,
     _prepare_evidence_directory,
     _validate_evidence_directory,
     validate_target,
@@ -69,8 +76,120 @@ class DesktopSliceHelperTest(unittest.TestCase):
     def test_service_startup_classifier_maps_known_dobby_messages_to_fixed_classes(self) -> None:
         cases = (
             (
+                b"panic: failed to prepare control authentication: resolve installed-user SID: private-value",
+                SERVICE_STARTUP_CONTROL_AUTH_IDENTITY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: resolve current Windows user: private-value",
+                SERVICE_STARTUP_CONTROL_AUTH_IDENTITY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: Windows installed-user identity is unavailable for the control token ACL",
+                SERVICE_STARTUP_CONTROL_AUTH_IDENTITY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: PROGRAMDATA is required for the installation control token",
+                SERVICE_STARTUP_CONTROL_AUTH_TOKEN_IO_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: invalid desktop control token",
+                SERVICE_STARTUP_CONTROL_AUTH_INVALID_TOKEN,
+            ),
+            (
+                b"panic: failed to prepare control authentication: build explicit runtime path ACL: private-value",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_APPLY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: set explicit runtime path ACL: private-value",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_APPLY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: read control token ACL: private-value",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: control token has no security descriptor",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: control token security descriptor is invalid",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: read control token security descriptor control: private-value",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: control token owner is defaulted",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: control token DACL is defaulted",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: control token has no DACL",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: read control token owner: private-value",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: control token owner is not the expected identity",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: read control token DACL: private-value",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: inspect control token type: private-value",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: control token is a reparse point",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: control token ACL contains an unsupported entry",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: control token ACL contains 3 entries; expected 2",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: control token ACL contains unsupported inheritance flags",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: control token ACL contains an entry with unexpected access mask or inheritance",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: control token ACL inheritance is not disabled",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: control token ACL contains an invalid identity",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: control token ACL repeats an identity",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: control token ACL grants access to an unexpected identity",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
+                b"panic: failed to prepare control authentication: control token ACL is missing an expected identity",
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            ),
+            (
                 b"panic: failed to prepare control authentication: token=private-value",
-                SERVICE_STARTUP_CONTROL_AUTH_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_OTHER,
             ),
             (
                 b"[ERROR] failed to listen: listen tcp 127.0.0.1:50151: address already in use",
@@ -90,6 +209,12 @@ class DesktopSliceHelperTest(unittest.TestCase):
             ),
         )
         allowed = {
+            SERVICE_STARTUP_CONTROL_AUTH_IDENTITY_FAILED,
+            SERVICE_STARTUP_CONTROL_AUTH_TOKEN_IO_FAILED,
+            SERVICE_STARTUP_CONTROL_AUTH_ACL_APPLY_FAILED,
+            SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+            SERVICE_STARTUP_CONTROL_AUTH_INVALID_TOKEN,
+            SERVICE_STARTUP_CONTROL_AUTH_OTHER,
             SERVICE_STARTUP_CONTROL_AUTH_FAILED,
             SERVICE_STARTUP_LOOPBACK_LISTEN_FAILED,
             SERVICE_STARTUP_INTERRUPTED_STATE_RECOVERY_FAILED,
@@ -125,12 +250,28 @@ class DesktopSliceHelperTest(unittest.TestCase):
             with self.subTest(private_value=private_value):
                 result = classify_service_startup_log(private_value)
                 self.assertEqual(result, SERVICE_STARTUP_UNCLASSIFIED)
-                self.assertRegex(result, r"^(?:CONTROL_AUTH_INIT_FAILED|LOOPBACK_LISTEN_FAILED|INTERRUPTED_STATE_RECOVERY_FAILED|SECURE_LOCAL_LOGGING_FAILED|GRPC_SERVE_FAILED|EMPTY|UNCLASSIFIED)$")
+                self.assertRegex(result, r"^(?:CONTROL_AUTH_(?:IDENTITY_FAILED|TOKEN_IO_FAILED|ACL_APPLY_FAILED|ACL_VERIFY_FAILED|INVALID_TOKEN|OTHER)|LOOPBACK_LISTEN_FAILED|INTERRUPTED_STATE_RECOVERY_FAILED|SECURE_LOCAL_LOGGING_FAILED|GRPC_SERVE_FAILED|EMPTY|UNCLASSIFIED)$")
                 self.assertNotIn(private_value.decode("utf-8", "replace"), result)
 
     def test_service_startup_classifier_is_case_insensitive_and_does_not_return_log_bytes(self) -> None:
         payload = b"FAILED TO SERVE: url=https://private.example.test token=secret"
         self.assertEqual(classify_service_startup_log(payload), SERVICE_STARTUP_GRPC_SERVE_FAILED)
+
+    def test_service_startup_classifier_keeps_unknown_control_auth_private(self) -> None:
+        private_values = (
+            b"panic: failed to prepare control authentication: open C:\\private\\control.token: access denied",
+            b"panic: failed to prepare control authentication: arbitrary nested error https://private.example.test/token",
+            b"panic: failed to prepare control authentication: account=private-user SID=S-1-5-21-private",
+            # This is a stable token fragment used only by an unrelated
+            # explicit-path verifier, not by LoadOrCreateControlToken.
+            b"panic: failed to prepare control authentication: resolve current process SID: private-value",
+            b"panic: failed to prepare control authentication: user config base owner is not a trusted writer",
+        )
+        for private_value in private_values:
+            with self.subTest(private_value=private_value):
+                result = classify_service_startup_log(private_value)
+                self.assertEqual(result, SERVICE_STARTUP_CONTROL_AUTH_OTHER)
+                self.assertNotIn(private_value.decode("utf-8", "replace"), result)
 
     def test_service_exit_summary_exposes_only_fixed_startup_class(self) -> None:
         with tempfile.TemporaryDirectory(prefix="desktop-startup-class-") as temporary:
@@ -327,15 +468,23 @@ class DesktopSliceHelperTest(unittest.TestCase):
     def test_runtime_environment_is_private_and_does_not_accept_token_overrides(self) -> None:
         old_path = os.environ.get("DOBBYVPN_CONTROL_TOKEN_PATH")
         old_user = os.environ.get("DOBBYVPN_CONTROL_TOKEN_USER")
+        old_username = os.environ.get("USERNAME")
+        old_userdomain = os.environ.get("USERDOMAIN")
         os.environ["DOBBYVPN_CONTROL_TOKEN_PATH"] = "should-not-survive"
-        os.environ["DOBBYVPN_CONTROL_TOKEN_USER"] = "should-not-survive"
+        os.environ["DOBBYVPN_CONTROL_TOKEN_USER"] = "inherited-private-user"
+        os.environ["USERNAME"] = "runner-test-user"
+        os.environ["USERDOMAIN"] = "runner-test-domain"
         try:
             runtime = build_runtime_paths(Path("/tmp/runtime"), "windows")
             environment = service_environment("windows", runtime, 50151)
             self.assertEqual(environment["PROGRAMDATA"], "/tmp/runtime/ProgramData")
             self.assertEqual(environment["PORT"], "50151")
             self.assertNotIn("DOBBYVPN_CONTROL_TOKEN_PATH", environment)
-            self.assertNotIn("DOBBYVPN_CONTROL_TOKEN_USER", environment)
+            self.assertEqual(
+                environment["DOBBYVPN_CONTROL_TOKEN_USER"],
+                "runner-test-domain\\runner-test-user",
+            )
+            self.assertNotIn("inherited-private-user", environment["DOBBYVPN_CONTROL_TOKEN_USER"])
 
             mac_runtime = build_runtime_paths(Path("/tmp/mac-runtime"), "macos")
             mac_environment = service_environment("macos", mac_runtime, None)
@@ -350,6 +499,46 @@ class DesktopSliceHelperTest(unittest.TestCase):
                 os.environ.pop("DOBBYVPN_CONTROL_TOKEN_USER", None)
             else:
                 os.environ["DOBBYVPN_CONTROL_TOKEN_USER"] = old_user
+            if old_username is None:
+                os.environ.pop("USERNAME", None)
+            else:
+                os.environ["USERNAME"] = old_username
+            if old_userdomain is None:
+                os.environ.pop("USERDOMAIN", None)
+            else:
+                os.environ["USERDOMAIN"] = old_userdomain
+
+    def test_windows_control_token_user_derivation_is_canonical_and_fail_closed(self) -> None:
+        self.assertEqual(
+            derive_windows_control_token_user(
+                {"USERNAME": "runner-user", "USERDOMAIN": "runner-domain"}
+            ),
+            "runner-domain\\runner-user",
+        )
+        self.assertEqual(
+            derive_windows_control_token_user({"USERNAME": "runner-user"}),
+            "runner-user",
+        )
+        invalid_environments = (
+            {},
+            {"USERNAME": ""},
+            {"USERNAME": "   "},
+            {"USERNAME": "runner\x00user"},
+            {"USERNAME": "runner/user"},
+            {"USERNAME": "runner-user", "USERDOMAIN": ""},
+            {"USERNAME": "runner-user", "USERDOMAIN": "domain\\nested"},
+            {"USERNAME": "runner-user", "USERDOMAIN": "domain\nname"},
+            {"USERNAME": "SYSTEM"},
+        )
+        for environment in invalid_environments:
+            with self.subTest(environment=environment):
+                with self.assertRaisesRegex(
+                    SliceFailure,
+                    "Windows control-token identity is unavailable or unsafe",
+                ) as context:
+                    derive_windows_control_token_user(environment)
+                self.assertNotIn("runner", str(context.exception))
+                self.assertNotIn("domain", str(context.exception))
 
     def test_readiness_helpers_run_on_linux_with_fakes(self) -> None:
         wait_for_tcp(50151, _FakeProcess(), 1, connector=lambda address, timeout: _FakeConnection())

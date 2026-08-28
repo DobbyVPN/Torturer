@@ -46,6 +46,52 @@ DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
 COMMAND_TERMINATION_GRACE_SECONDS = 15
 
 
+# Public command failures may identify the fixed internal stage that failed,
+# but must never echo an arbitrary evidence label.  Keep this map aligned with
+# the labels used by the production Android checks below.  The boot-state
+# probe includes a bounded sequence number in its private evidence filename;
+# expose only its fixed stage name.
+_ANDROID_COMMAND_STAGES = frozenset(
+    {
+        "source-rev-parse",
+        "source-status",
+        "gradle-build",
+        "apkanalyzer",
+        "apkanalyzer-application",
+        "apkanalyzer-instrumentation",
+        "sdkmanager-licenses",
+        "sdkmanager-install",
+        "avdmanager-create",
+        "adb-wait-for-device",
+        "adb-window-animation",
+        "adb-transition-animation",
+        "adb-animator-duration",
+        "adb-install-application",
+        "adb-install-instrumentation",
+        "adb-enabled-packages",
+        "adb-package-dump",
+        "adb-launch-application",
+        "adb-application-pid",
+        "adb-force-stop",
+        "adb-stopped-pid",
+        "gradle-lifecycle-test",
+    }
+)
+_ANDROID_BOOT_STATE_STAGE = re.compile(r"adb-boot-state-[0-9]{3}\Z")
+_ANDROID_UNCLASSIFIED_STAGE = "unclassified"
+
+
+def _public_command_stage(evidence_label: object) -> str:
+    """Return only a fixed public stage for a production evidence label."""
+
+    if isinstance(evidence_label, str):
+        if evidence_label in _ANDROID_COMMAND_STAGES:
+            return evidence_label
+        if _ANDROID_BOOT_STATE_STAGE.fullmatch(evidence_label):
+            return "adb-boot-state"
+    return _ANDROID_UNCLASSIFIED_STAGE
+
+
 class AndroidContractError(RuntimeError):
     """An artifact or public Android contract does not match the expected shape."""
 
@@ -310,6 +356,7 @@ def _run(
     """Run a bounded argument-vector command and retain complete original output."""
 
     rendered = [str(item) for item in command]
+    command_stage = _public_command_stage(evidence_label)
     requested_timeout = timeout if timeout is not None else DEFAULT_COMMAND_TIMEOUT_SECONDS
     command_timeout = budget.operation_timeout(requested_timeout) if budget else requested_timeout
     evidence_directory = _evidence_directory(evidence_directory)
@@ -327,7 +374,8 @@ def _run(
     except OSError as error:
         _retain_bytes(evidence_directory, f"{evidence_label}.exception", str(error).encode())
         raise AndroidContractError(
-            f"Android command could not start ({type(error).__name__}); diagnostics retained privately"
+            f"Android command could not start (stage={command_stage}; {type(error).__name__}); "
+            "diagnostics retained privately"
         ) from error
     tracked: set[int] = {process.pid}
     timed_out = False
@@ -342,7 +390,8 @@ def _run(
         timed_out = True
         output = error.output or b""
         print(
-            f"[android-contract-command] timeout after {command_timeout:g}s; terminating process tree",
+            f"[android-contract-command] stage={command_stage} timeout after {command_timeout:g}s; "
+            "terminating process tree",
             file=sys.stderr,
         )
         try:
@@ -378,12 +427,13 @@ def _run(
     if timed_out:
         cleanup_detail = f"; cleanup={termination_error}" if termination_error is not None else ""
         raise AndroidContractError(
-            f"command timed out after {command_timeout:g}s{cleanup_detail}; "
+            f"Android command timed out (stage={command_stage}) after {command_timeout:g}s{cleanup_detail}; "
             "complete diagnostics retained privately"
         )
     if process.returncode and not allow_nonzero:
         raise AndroidContractError(
-            f"Android command failed ({process.returncode}); complete diagnostics retained privately"
+            f"Android command failed (stage={command_stage}; code={process.returncode}); "
+            "complete diagnostics retained privately"
         )
     return subprocess.CompletedProcess(rendered, process.returncode, output.decode("utf-8", errors="replace"))
 
