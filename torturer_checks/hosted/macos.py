@@ -54,14 +54,57 @@ printf '%s\\n' "$!"
 _MACOS_SOCKET_PROBE = """import socket
 import sys
 
-with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-    connection.settimeout(0.5)
-    connection.connect(sys.argv[1])
+def _emit_probe_error(error):
+    exception_type = type(error).__name__
+    if not exception_type.isidentifier():
+        exception_type = "Exception"
+    errno = getattr(error, "errno", 0)
+    if isinstance(errno, bool) or not isinstance(errno, int):
+        errno = 0
+    print("service_control_probe_error")
+    print(
+        "service_control_probe_exception type=%s detail=socket-connect errno=%d" %
+        (exception_type, errno),
+        file=sys.stderr,
+    )
+
+try:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(0.5)
+        connection.connect(sys.argv[1])
+except Exception as error:
+    _emit_probe_error(error)
+    raise SystemExit(1)
 """
 _MACOS_PROCESS_CENSUS = ("sudo", "-n", "ps", "-axo", "pid=,ppid=,pgid=,state=")
 _MACOS_PROCESS_ALIVE_SCRIPT = r'''
 import subprocess
 import sys
+
+def _emit_probe_error(error, detail, stdout="", stderr=""):
+    # The command runner retains both streams privately.  Publish only a
+    # fixed stage detail plus the builtin exception type/errno; exception
+    # messages can contain paths or other host-owned identities.
+    exception_type = type(error).__name__
+    if not exception_type.isidentifier():
+        exception_type = "Exception"
+    errno = getattr(error, "errno", 0)
+    if isinstance(errno, bool) or not isinstance(errno, int):
+        errno = 0
+    print("service_probe_error")
+    if stdout:
+        sys.stdout.write(str(stdout))
+        if not str(stdout).endswith("\n"):
+            sys.stdout.write("\n")
+    if stderr:
+        sys.stderr.write(str(stderr))
+        if not str(stderr).endswith("\n"):
+            sys.stderr.write("\n")
+    print(
+        "service_probe_exception type=%s detail=%s errno=%d" %
+        (exception_type, detail, errno),
+        file=sys.stderr,
+    )
 
 pid = sys.argv[1]
 try:
@@ -71,16 +114,22 @@ try:
         text=True,
         check=False,
     )
-except Exception:
-    print("service_probe_error")
+except Exception as error:
+    _emit_probe_error(error, "ps-invocation")
     raise SystemExit(1)
-if result.returncode == 0 and result.stdout.strip() == pid:
-    print("service_probe_pid=" + pid)
-    raise SystemExit(0)
-if result.returncode != 0 and not result.stdout.strip() and not result.stderr.strip():
-    print("service_probe_absent")
-    raise SystemExit(2)
-print("service_probe_error")
+try:
+    if result.returncode == 0 and result.stdout.strip() == pid:
+        print("service_probe_pid=" + pid)
+        raise SystemExit(0)
+    if result.returncode != 0 and not result.stdout.strip() and not result.stderr.strip():
+        print("service_probe_absent")
+        raise SystemExit(2)
+except SystemExit:
+    raise
+except Exception as error:
+    _emit_probe_error(error, "ps-classification")
+    raise SystemExit(1)
+_emit_probe_error(RuntimeError(), "ps-returncode", result.stdout, result.stderr)
 raise SystemExit(1)
 '''
 _MACOS_PROCESS_ALIVE = (
@@ -91,6 +140,22 @@ import ctypes
 import ctypes.util
 import os
 import sys
+
+def _emit_probe_error(error, detail):
+    # Keep native probe failures useful without forwarding exception text,
+    # executable paths, or other private host identities.
+    exception_type = type(error).__name__
+    if not exception_type.isidentifier():
+        exception_type = "Exception"
+    errno = getattr(error, "errno", 0)
+    if isinstance(errno, bool) or not isinstance(errno, int):
+        errno = 0
+    print("service_probe_error")
+    print(
+        "service_probe_exception type=%s detail=%s errno=%d" %
+        (exception_type, detail, errno),
+        file=sys.stderr,
+    )
 
 class ProcBsdInfo(ctypes.Structure):
     _fields_ = [
@@ -118,61 +183,71 @@ class ProcBsdInfo(ctypes.Structure):
         ("pbi_start_tvusec", ctypes.c_uint64),
     ]
 
-pid = int(sys.argv[1])
+try:
+    pid = int(sys.argv[1])
+except (ValueError, TypeError) as error:
+    _emit_probe_error(error, "pid-argument")
+    raise SystemExit(1)
 try:
     os.kill(pid, 0)
 except ProcessLookupError:
     print("service_probe_absent")
     raise SystemExit(2)
-except OSError:
-    print("service_probe_error")
+except OSError as error:
+    _emit_probe_error(error, "kill-probe")
     raise SystemExit(1)
-library_name = ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib"
-if not library_name:
-    print("service_probe_error")
-    raise SystemExit(1)
-libproc = ctypes.CDLL(library_name, use_errno=True)
-libproc.proc_pidinfo.argtypes = [
-    ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
-    ctypes.c_void_p, ctypes.c_int,
-]
-libproc.proc_pidinfo.restype = ctypes.c_int
-info = ProcBsdInfo()
-size = libproc.proc_pidinfo(
-    pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)
-)
-path = ctypes.create_string_buffer(4096)
-libproc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
-libproc.proc_pidpath.restype = ctypes.c_int
-path_size = libproc.proc_pidpath(pid, path, ctypes.sizeof(path))
-if size == 0 or path_size == 0:
-    # A zero libproc result is not by itself an absence proof: permissions,
-    # a transient API failure, and an exited process all produce zero.  The
-    # second kill(2) probe is the explicit absence discriminator; if the
-    # process is still signal-visible, fail closed as a probe error.
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        print("service_probe_absent")
-        raise SystemExit(2)
-    except OSError:
-        print("service_probe_error")
+try:
+    library_name = ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib"
+    if not library_name:
+        _emit_probe_error(RuntimeError(), "proc-library-unavailable")
         raise SystemExit(1)
-    print("service_probe_error")
+    libproc = ctypes.CDLL(library_name, use_errno=True)
+    libproc.proc_pidinfo.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+        ctypes.c_void_p, ctypes.c_int,
+    ]
+    libproc.proc_pidinfo.restype = ctypes.c_int
+    info = ProcBsdInfo()
+    size = libproc.proc_pidinfo(
+        pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)
+    )
+    path = ctypes.create_string_buffer(4096)
+    libproc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    libproc.proc_pidpath.restype = ctypes.c_int
+    path_size = libproc.proc_pidpath(pid, path, ctypes.sizeof(path))
+    if size == 0 or path_size == 0:
+        # A zero libproc result is not by itself an absence proof: permissions,
+        # a transient API failure, and an exited process all produce zero.  The
+        # second kill(2) probe is the explicit absence discriminator; if the
+        # process is still signal-visible, fail closed as a probe error.
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            print("service_probe_absent")
+            raise SystemExit(2)
+        except OSError as error:
+            _emit_probe_error(error, "native-absence-probe")
+            raise SystemExit(1)
+        _emit_probe_error(RuntimeError(), "native-result-empty")
+        raise SystemExit(1)
+    if (
+        size != ctypes.sizeof(info)
+        or info.pbi_pid != pid
+        or info.pbi_start_tvsec <= 0
+        or info.pbi_start_tvusec >= 1000000
+        or path_size < 0
+    ):
+        _emit_probe_error(RuntimeError(), "native-result-invalid")
+        raise SystemExit(1)
+    print("service_identity=%d|%d.%06d" % (
+        pid, info.pbi_start_tvsec, info.pbi_start_tvusec,
+    ))
+    print("service_path=" + path.value.decode("utf-8", errors="replace"))
+except SystemExit:
+    raise
+except Exception as error:
+    _emit_probe_error(error, "native-identity")
     raise SystemExit(1)
-if (
-    size != ctypes.sizeof(info)
-    or info.pbi_pid != pid
-    or info.pbi_start_tvsec <= 0
-    or info.pbi_start_tvusec >= 1000000
-    or path_size < 0
-):
-    print("service_probe_error")
-    raise SystemExit(1)
-print("service_identity=%d|%d.%06d" % (
-    pid, info.pbi_start_tvsec, info.pbi_start_tvusec,
-))
-print("service_path=" + path.value.decode("utf-8", errors="replace"))
 """
 _MACOS_PROCESS_IDENTITY = (
     "sudo", "-n", "python3", "-c", _MACOS_PROCESS_IDENTITY_SCRIPT, "{pid}"

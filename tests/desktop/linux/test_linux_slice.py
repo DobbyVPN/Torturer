@@ -4,6 +4,7 @@ import io
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -516,6 +517,87 @@ class LinuxSliceHelperTest(unittest.TestCase):
         self.assertIn('dir=results_root', source)
         self.assertIn('description="command-final-drain"', source)
         self.assertIn("_wait_for_process_tree(process, tracked, 0.0)", source)
+
+    def test_timeout_and_oserror_drains_merge_each_partial_stream_once(self) -> None:
+        class FakeProcess:
+            pid = 1234
+            returncode = 0
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired(
+                        ("safe-command",), timeout,
+                        output=b"partial-out", stderr=b"partial-err",
+                    )
+                if self.calls == 2:
+                    error = OSError(5, "pipe failed")
+                    error.stdout = b"partial-out"  # type: ignore[attr-defined]
+                    error.stderr = b"partial-err"  # type: ignore[attr-defined]
+                    raise error
+                return b"partial-out-final", b"partial-err-final"
+
+            def wait(self, *, timeout: float) -> int:
+                return 0
+
+            def poll(self) -> int:
+                return self.returncode
+
+        process = FakeProcess()
+        with patch.object(
+            linux_slice,
+            "_terminate_process_tree",
+            return_value={process.pid},
+        ):
+            stdout, stderr, diagnostics, complete = linux_slice._drain_after_failure(
+                process,
+                b"partial-out",
+                b"partial-err",
+                timeout_seconds=1.0,
+                description="command",
+                tracked={process.pid},
+            )
+        self.assertEqual(stdout, b"partial-out-final")
+        self.assertEqual(stderr, b"partial-err-final")
+        self.assertTrue(complete)
+        # A pipe exception occurred even though a later retry reached EOF;
+        # preserve that uncertainty in the diagnostic record.
+        self.assertIn(b"EVIDENCE_INCOMPLETE=1", diagnostics)
+
+    def test_unproven_linux_drain_retains_partial_bytes_and_marks_incomplete(self) -> None:
+        class FakeProcess:
+            pid = 1235
+            returncode = None
+
+            def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+                error = OSError(5, "pipe failed")
+                error.stdout = b"partial-out"  # type: ignore[attr-defined]
+                error.stderr = b"partial-err"  # type: ignore[attr-defined]
+                raise error
+
+            def wait(self, *, timeout: float) -> int:
+                raise subprocess.TimeoutExpired(("safe-command",), timeout)
+
+            def poll(self) -> None:
+                return None
+
+        process = FakeProcess()
+        with patch.object(linux_slice, "_terminate_process_tree", return_value={process.pid}):
+            stdout, stderr, diagnostics, complete = linux_slice._drain_after_failure(
+                process,
+                b"partial-out",
+                b"partial-err",
+                timeout_seconds=0.01,
+                description="command",
+                tracked={process.pid},
+            )
+        self.assertEqual(stdout, b"partial-out")
+        self.assertEqual(stderr, b"partial-err")
+        self.assertFalse(complete)
+        self.assertIn(b"EVIDENCE_INCOMPLETE=1", diagnostics)
 
     def test_result_assertions_report_output(self) -> None:
         failure = CommandResult(("tool",), 1, "out", "err")

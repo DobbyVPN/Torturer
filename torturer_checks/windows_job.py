@@ -884,11 +884,29 @@ def popen_with_windows_job(
             captured_stdout = _merge_output(captured_stdout, _output_bytes(getattr(wait_error, "output", None)))
             captured_stderr = _merge_output(captured_stderr, _output_bytes(getattr(wait_error, "stderr", None)))
             diagnostics.append(f"api=ProcessWait winerror={ERROR_TIMEOUT} detail=setup-failure")
+            diagnostics.append(f"api=ProcessCommunicate winerror={ERROR_TIMEOUT} detail=setup-failure")
+            diagnostics.append("EVIDENCE_INCOMPLETE=1 reason=setup-communicate-timeout")
         except (AttributeError, OSError, ValueError, TypeError) as wait_error:
+            # communicate() may expose bytes read before a non-timeout pipe
+            # failure on either ``output`` or ``stdout``.  Keep the partial
+            # buffers on the native error so the hosted adapter can retain
+            # them before classifying the setup failure.
+            captured_stdout = _merge_output(
+                captured_stdout,
+                _merge_output(
+                    _output_bytes(getattr(wait_error, "output", None)),
+                    _output_bytes(getattr(wait_error, "stdout", None)),
+                ),
+            )
+            captured_stderr = _merge_output(
+                captured_stderr,
+                _output_bytes(getattr(wait_error, "stderr", None)),
+            )
             diagnostics.append(
                 f"api=ProcessCommunicate winerror={_exception_error_code(wait_error)} "
                 f"detail={type(wait_error).__name__}"
             )
+            diagnostics.append("EVIDENCE_INCOMPLETE=1 reason=setup-communicate-error")
         try:
             process.wait(timeout=0)
         except subprocess.TimeoutExpired:

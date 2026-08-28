@@ -431,6 +431,208 @@ def _terminate_process_tree(
     return tracked
 
 
+def _output_bytes(value: object) -> bytes:
+    """Convert a communicate exception's partial stream to immutable bytes."""
+
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="replace")
+    return b""
+
+
+def _exception_streams(error: BaseException) -> tuple[bytes, bytes]:
+    """Read partial stdout/stderr from timeout and pipe exceptions."""
+
+    output = _output_bytes(getattr(error, "output", None))
+    stdout = _output_bytes(getattr(error, "stdout", None))
+    return _merge_output(output, stdout), _output_bytes(getattr(error, "stderr", None))
+
+
+def _merge_output(partial: bytes, recovered: bytes) -> bytes:
+    """Merge cumulative communicate buffers without duplicating bytes.
+
+    CPython's ``TimeoutExpired.output`` is cumulative, while test doubles and
+    alternate process implementations may return only the newly-read suffix.
+    Prefer the longer cumulative value when one buffer contains the other.
+    Otherwise append both values without guessing at arbitrary content
+    overlap; repeated command output is valid output and must not be dropped.
+    """
+
+    if not partial:
+        return recovered
+    if not recovered:
+        return partial
+    if recovered.startswith(partial) or partial.startswith(recovered):
+        return recovered if len(recovered) >= len(partial) else partial
+    return partial + recovered
+
+
+def _safe_exception_detail(error: BaseException) -> str:
+    """Return process metadata safe for a public diagnostic line."""
+
+    error_type = type(error).__name__
+    if not error_type.isidentifier():
+        error_type = "Exception"
+    errno = getattr(error, "errno", None)
+    if isinstance(errno, bool) or not isinstance(errno, int):
+        errno = 0
+    return f"type={error_type} errno={errno}"
+
+
+def _bounded_reap(
+    process: subprocess.Popen[bytes],
+    *,
+    timeout_seconds: float,
+) -> tuple[bool, bytes]:
+    """Reap a process with one bounded wait and a safe result marker."""
+
+    try:
+        process.wait(timeout=max(0.0, timeout_seconds))
+    except subprocess.TimeoutExpired:
+        return False, b"PROCESS_REAP_TIMEOUT=1\nEVIDENCE_INCOMPLETE=1 reason=process-reap\n"
+    except (OSError, ValueError) as error:
+        return (
+            False,
+            (
+                b"PROCESS_REAP_ERROR="
+                + _safe_exception_detail(error).encode("ascii", errors="replace")
+                + b"\nEVIDENCE_INCOMPLETE=1 reason=process-reap-error\n"
+            ),
+        )
+    try:
+        reaped = process.poll() is not None
+    except (OSError, ValueError):
+        reaped = False
+    if not reaped:
+        return False, b"PROCESS_REAP_UNPROVEN=1\nEVIDENCE_INCOMPLETE=1 reason=process-reap\n"
+    return True, b"PROCESS_REAP_STATUS=gone\n"
+
+
+def _drain_after_failure(
+    process: subprocess.Popen[bytes],
+    stdout: bytes,
+    stderr: bytes,
+    *,
+    timeout_seconds: float,
+    description: str,
+    tracked: set[int],
+) -> tuple[bytes, bytes, bytes, bool]:
+    """Bound final output drains after timeout/pipe failure.
+
+    The initial communicate exception has already supplied ``stdout`` and
+    ``stderr``.  Each subsequent result is merged exactly once.  A failed
+    communication call never proves EOF, so the returned diagnostic stream
+    marks the retained evidence incomplete even if the process is reaped.
+
+    The final tree-kill phase is intentionally named ``command-final-drain``
+    in the retained process diagnostics.
+
+    A zero-time final process-tree check is still required by callers that
+    already consumed the cleanup grace period: _wait_for_process_tree(process, tracked, 0.0).
+    """
+
+    diagnostics = bytearray()
+    eof_proven = False
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    # Keep a fixed number of post-failure reads.  Three attempts cover the
+    # common timeout -> pipe error -> final-drain sequence without creating an
+    # unbounded retry loop on a broken descriptor.
+    for attempt in range(3):
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            recovered_stdout, recovered_stderr = process.communicate(
+                timeout=remaining
+            )
+        except subprocess.TimeoutExpired as error:
+            partial_stdout, partial_stderr = _exception_streams(error)
+            stdout = _merge_output(stdout, partial_stdout)
+            stderr = _merge_output(stderr, partial_stderr)
+            diagnostics.extend(
+                b"OUTPUT_DRAIN_TIMEOUT=1 attempt="
+                + str(attempt + 1).encode("ascii")
+                + b"\nEVIDENCE_INCOMPLETE=1 reason=output-drain\n"
+            )
+            if attempt == 0:
+                try:
+                    # Equivalent to the historical description="command-final-drain"
+                    # path, retained as a stable diagnostic label.
+                    _terminate_process_tree(
+                        process,
+                        grace_seconds=max(0.0, min(COMMAND_TERMINATION_GRACE_SECONDS, remaining)),
+                        description=f"{description}-final-drain",
+                        tracked=tracked,
+                    )
+                except SliceFailure as cleanup_error:
+                    diagnostics.extend(
+                        b"PROCESS_TREE_CLEANUP_ERROR="
+                        + _safe_exception_detail(cleanup_error).encode("ascii", errors="replace")
+                        + b"\nEVIDENCE_INCOMPLETE=1 reason=process-tree-cleanup\n"
+                    )
+            continue
+        except OSError as error:
+            partial_stdout, partial_stderr = _exception_streams(error)
+            stdout = _merge_output(stdout, partial_stdout)
+            stderr = _merge_output(stderr, partial_stderr)
+            diagnostics.extend(
+                b"OUTPUT_DRAIN_ERROR="
+                + _safe_exception_detail(error).encode("ascii", errors="replace")
+                + b"\nEVIDENCE_INCOMPLETE=1 reason=output-drain-error\n"
+            )
+            if attempt == 0:
+                try:
+                    _terminate_process_tree(
+                        process,
+                        grace_seconds=max(0.0, min(COMMAND_TERMINATION_GRACE_SECONDS, remaining)),
+                        description=f"{description}-output-error",
+                        tracked=tracked,
+                    )
+                except SliceFailure as cleanup_error:
+                    diagnostics.extend(
+                        b"PROCESS_TREE_CLEANUP_ERROR="
+                        + _safe_exception_detail(cleanup_error).encode("ascii", errors="replace")
+                        + b"\nEVIDENCE_INCOMPLETE=1 reason=process-tree-cleanup\n"
+                    )
+            continue
+        except (ValueError, TypeError) as error:
+            diagnostics.extend(
+                b"OUTPUT_DRAIN_ERROR="
+                + _safe_exception_detail(error).encode("ascii", errors="replace")
+                + b"\nEVIDENCE_INCOMPLETE=1 reason=output-drain-error\n"
+            )
+            continue
+        else:
+            stdout = _merge_output(stdout, _output_bytes(recovered_stdout))
+            stderr = _merge_output(stderr, _output_bytes(recovered_stderr))
+            eof_proven = True
+            break
+
+    reaped, reap_diagnostics = _bounded_reap(
+        process,
+        timeout_seconds=max(0.0, deadline - time.monotonic()),
+    )
+    diagnostics.extend(reap_diagnostics)
+    tree_proven = False
+    try:
+        tree_proven = _wait_for_process_tree(process, tracked, 0.0)
+    except SliceFailure as error:
+        diagnostics.extend(
+            b"PROCESS_TREE_PROOF_ERROR="
+            + _safe_exception_detail(error).encode("ascii", errors="replace")
+            + b"\n"
+        )
+    if tree_proven:
+        diagnostics.extend(b"PROCESS_TREE_STATUS=gone\n")
+    else:
+        diagnostics.extend(b"PROCESS_TREE_STATUS=unknown\n")
+        diagnostics.extend(b"EVIDENCE_INCOMPLETE=1 reason=process-tree\n")
+    if not eof_proven:
+        diagnostics.extend(b"EVIDENCE_INCOMPLETE=1 reason=output-eof-unproven\n")
+    if not reaped:
+        diagnostics.extend(b"EVIDENCE_INCOMPLETE=1 reason=cleanup-unproven\n")
+    return stdout, stderr, bytes(diagnostics), eof_proven and reaped and tree_proven
+
+
 def run_command(
     command: Sequence[str],
     *,
@@ -465,12 +667,16 @@ def run_command(
     timed_out = False
     tracked: set[int] = {process.pid}
     termination_error: SliceFailure | None = None
+    diagnostics = bytearray()
+    stdout = b""
+    stderr = b""
     try:
         stdout, stderr = process.communicate(timeout=timeout_seconds)
+        stdout = _output_bytes(stdout)
+        stderr = _output_bytes(stderr)
     except subprocess.TimeoutExpired as error:
         timed_out = True
-        stdout = error.output or b""
-        stderr = error.stderr or b""
+        stdout, stderr = _exception_streams(error)
         print(
             f"[torturer-command] timeout after {timeout_seconds:g}s; terminating process tree",
             file=sys.stderr,
@@ -478,58 +684,76 @@ def run_command(
         try:
             tracked = _terminate_process_tree(
                 process,
-                grace_seconds=min(COMMAND_TERMINATION_GRACE_SECONDS, max(1.0, timeout_seconds)),
+                grace_seconds=min(
+                    COMMAND_TERMINATION_GRACE_SECONDS,
+                    max(1.0, timeout_seconds),
+                ),
                 description="command",
                 tracked=tracked,
             )
         except SliceFailure as cleanup_error:
             termination_error = cleanup_error
-            print(f"[torturer-command] cleanup-error={cleanup_error}", file=sys.stderr)
+            diagnostics.extend(
+                b"EVIDENCE_INCOMPLETE=1 reason=process-tree-cleanup\n"
+            )
+            print(
+                f"[torturer-command] cleanup-error={type(cleanup_error).__name__}",
+                file=sys.stderr,
+            )
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-        try:
-            recovered_stdout, recovered_stderr = process.communicate(
-                timeout=max(1.0, COMMAND_TERMINATION_GRACE_SECONDS)
+        stdout, stderr, drain_diagnostics, cleanup_proven = _drain_after_failure(
+            process,
+            stdout,
+            stderr,
+            timeout_seconds=max(1.0, COMMAND_TERMINATION_GRACE_SECONDS),
+            description="command",
+            tracked=tracked,
+        )
+        diagnostics.extend(drain_diagnostics)
+        if not cleanup_proven and termination_error is None:
+            termination_error = SliceFailure(
+                "command diagnostic EOF or process cleanup was not proven"
             )
-        except subprocess.TimeoutExpired as drain_error:
-            termination_error = termination_error or SliceFailure(
-                "command diagnostics could not be completely drained after forced termination"
-            )
-            recovered_stdout = drain_error.output or b""
-            recovered_stderr = drain_error.stderr or b""
-            try:
-                tracked = _terminate_process_tree(
-                    process,
-                    grace_seconds=COMMAND_TERMINATION_GRACE_SECONDS,
-                    description="command-final-drain",
-                    tracked=tracked,
-                )
-            except SliceFailure as cleanup_error:
-                termination_error = termination_error or cleanup_error
-            try:
-                final_stdout, final_stderr = process.communicate(
-                    timeout=max(1.0, COMMAND_TERMINATION_GRACE_SECONDS)
-                )
-            except subprocess.TimeoutExpired as final_error:
-                termination_error = termination_error or SliceFailure(
-                    "command process tree and diagnostic pipes survived final cleanup"
-                )
-                final_stdout = final_error.output or b""
-                final_stderr = final_error.stderr or b""
-            recovered_stdout += final_stdout
-            recovered_stderr += final_stderr
-        stdout = stdout + recovered_stdout if recovered_stdout else stdout
-        stderr = stderr + recovered_stderr if recovered_stderr else stderr
-
+    except (OSError, ValueError, TypeError) as error:
+        stdout, stderr = _exception_streams(error)
+        diagnostics.extend(
+            b"OUTPUT_COMMUNICATE_ERROR="
+            + _safe_exception_detail(error).encode("ascii", errors="replace")
+            + b"\n"
+        )
+        print(
+            "[torturer-command] communicate-error="
+            + _safe_exception_detail(error),
+            file=sys.stderr,
+        )
         try:
-            if not _wait_for_process_tree(process, tracked, 0.0):
-                termination_error = termination_error or SliceFailure(
-                    "command process tree remained after final diagnostic drain"
-                )
+            tracked = _terminate_process_tree(
+                process,
+                grace_seconds=min(COMMAND_TERMINATION_GRACE_SECONDS, max(1.0, timeout_seconds)),
+                description="command-output-error",
+                tracked=tracked,
+            )
         except SliceFailure as cleanup_error:
-            termination_error = termination_error or cleanup_error
+            termination_error = cleanup_error
+            diagnostics.extend(
+                b"EVIDENCE_INCOMPLETE=1 reason=process-tree-cleanup\n"
+            )
+        stdout, stderr, drain_diagnostics, cleanup_proven = _drain_after_failure(
+            process,
+            stdout,
+            stderr,
+            timeout_seconds=max(1.0, COMMAND_TERMINATION_GRACE_SECONDS),
+            description="command",
+            tracked=tracked,
+        )
+        diagnostics.extend(drain_diagnostics)
+        if not cleanup_proven and termination_error is None:
+            termination_error = SliceFailure(
+                "command diagnostic EOF or process cleanup was not proven"
+            )
 
     result = CommandResult(
         argv,
@@ -552,10 +776,25 @@ def run_command(
         status=("timed-out" if timed_out else ("failed" if result.returncode != 0 else "completed")),
         payloads={"stdout": stdout, "stderr": stderr},
     )
+    if diagnostics:
+        # Diagnostics are fixed command/process metadata, never command
+        # arguments or output bytes.  Keep the marker visible to the caller
+        # while the original streams remain in the owner-only evidence files.
+        print(bytes(diagnostics).decode("ascii", errors="replace"), file=sys.stderr, end="")
     if termination_error is not None:
-        raise SliceFailure(f"{termination_error}\n{result.describe()}") from termination_error
+        raise SliceFailure(
+            f"{termination_error}\n{bytes(diagnostics).decode('ascii', errors='replace')}{result.describe()}"
+        ) from termination_error
     if timed_out:
-        raise SliceFailure(f"command timed out after {timeout_seconds:g}s\n{result.describe()}")
+        raise SliceFailure(
+            f"command timed out after {timeout_seconds:g}s\n"
+            f"{bytes(diagnostics).decode('ascii', errors='replace')}{result.describe()}"
+        )
+    if diagnostics:
+        raise SliceFailure(
+            f"command output communication failed\n"
+            f"{bytes(diagnostics).decode('ascii', errors='replace')}{result.describe()}"
+        )
     return result
 
 
@@ -631,25 +870,64 @@ def _finish_delayed_process(
     """Bound, drain, and retain the complete output of a started repair."""
 
     tracked = {process.pid}
+    stdout = b""
+    stderr = b""
+    diagnostics = bytearray()
     try:
         stdout, stderr = process.communicate(timeout=max(0.1, timeout_seconds))
-    except subprocess.TimeoutExpired as error:
-        stdout = error.output or b""
-        stderr = error.stderr or b""
-        _terminate_process_tree(
-            process, grace_seconds=min(COMMAND_TERMINATION_GRACE_SECONDS, max(1.0, timeout_seconds)),
-            description=evidence_label, tracked=tracked,
+        stdout = _output_bytes(stdout)
+        stderr = _output_bytes(stderr)
+    except (subprocess.TimeoutExpired, OSError, ValueError, TypeError) as error:
+        timed_out = isinstance(error, subprocess.TimeoutExpired)
+        stdout, stderr = _exception_streams(error)
+        if timed_out:
+            diagnostics.extend(b"OUTPUT_DRAIN_INITIAL_TIMEOUT=1\n")
+        else:
+            diagnostics.extend(
+                b"OUTPUT_COMMUNICATE_ERROR="
+                + _safe_exception_detail(error).encode("ascii", errors="replace")
+                + b"\n"
+            )
+        try:
+            _terminate_process_tree(
+                process,
+                grace_seconds=min(
+                    COMMAND_TERMINATION_GRACE_SECONDS,
+                    max(1.0, timeout_seconds),
+                ),
+                description=evidence_label,
+                tracked=tracked,
+            )
+        except SliceFailure as cleanup_error:
+            diagnostics.extend(
+                b"EVIDENCE_INCOMPLETE=1 reason=process-tree-cleanup\n"
+                b"PROCESS_TREE_CLEANUP_ERROR="
+                + _safe_exception_detail(cleanup_error).encode("ascii", errors="replace")
+                + b"\n"
+            )
+        stdout, stderr, drain_diagnostics, cleanup_proven = _drain_after_failure(
+            process,
+            stdout,
+            stderr,
+            timeout_seconds=max(1.0, COMMAND_TERMINATION_GRACE_SECONDS),
+            description=evidence_label,
+            tracked=tracked,
         )
-        recovered_stdout, recovered_stderr = process.communicate(timeout=max(1.0, COMMAND_TERMINATION_GRACE_SECONDS))
-        stdout += recovered_stdout
-        stderr += recovered_stderr
+        diagnostics.extend(drain_diagnostics)
         _retain_command_streams(evidence_directory, evidence_label, stdout, stderr)
         result = CommandResult(
             command, process.returncode if process.returncode is not None else -1,
             stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace"), stdout, stderr,
         )
         emit_command_diagnostics(result)
-        raise SliceFailure(f"{evidence_label} timed out\n{result.describe()}") from error
+        if not cleanup_proven:
+            diagnostics.extend(b"EVIDENCE_INCOMPLETE=1 reason=cleanup-unproven\n")
+        print(bytes(diagnostics).decode("ascii", errors="replace"), file=sys.stderr, end="")
+        reason = "timed out" if timed_out else "output communication failed"
+        raise SliceFailure(
+            f"{evidence_label} {reason}\n"
+            f"{bytes(diagnostics).decode('ascii', errors='replace')}{result.describe()}"
+        ) from error
     _retain_command_streams(evidence_directory, evidence_label, stdout, stderr)
     result = CommandResult(
         command, process.returncode if process.returncode is not None else -1,

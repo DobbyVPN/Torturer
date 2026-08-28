@@ -2251,6 +2251,26 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertIn(b"MAC_PROCESS_CENSUS_PARSE_ERROR=1", provider.diagnostics)
         self.assertIn(b"EVIDENCE_INCOMPLETE=1", provider.diagnostics)
 
+    def test_macos_process_census_oserror_retains_partial_streams_and_safe_detail(self) -> None:
+        error = OSError(13, "private host path must not be emitted")
+        error.stdout = b"partial-ps-stdout\x00"  # type: ignore[attr-defined]
+        error.stderr = b"partial-ps-stderr\xff"  # type: ignore[attr-defined]
+        with (
+            mock.patch.object(Path, "is_dir", return_value=False),
+            mock.patch(
+                "torturer_checks.hosted.cli.subprocess.run",
+                side_effect=error,
+            ),
+        ):
+            provider = _ProcessSnapshotProvider()
+            self.assertIsNone(provider())
+        diagnostics = provider.diagnostics
+        self.assertIn(b"partial-ps-stdout\x00", diagnostics)
+        self.assertIn(b"partial-ps-stderr\xff", diagnostics)
+        self.assertIn(b"MAC_PROCESS_CENSUS_EXCEPTION=type=PermissionError errno=13 detail=ps-invocation", diagnostics)
+        self.assertIn(b"EVIDENCE_INCOMPLETE=1 reason=process-census-probe-error", diagnostics)
+        self.assertNotIn(b"private host path", diagnostics)
+
     def test_subprocess_runner_never_overwrites_another_runner_sequence(self) -> None:
         raw = Path(self.directory.name) / "shared-raw"
         first = SubprocessRunner(raw)

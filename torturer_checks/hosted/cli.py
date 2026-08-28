@@ -1038,6 +1038,18 @@ def _output_bytes(value: bytes | str | None) -> bytes:
     return b""
 
 
+def _safe_exception_detail(error: BaseException) -> str:
+    """Return exception type and numeric errno without private text."""
+
+    exception_type = type(error).__name__
+    if not exception_type.isidentifier():
+        exception_type = "Exception"
+    errno = getattr(error, "errno", 0)
+    if isinstance(errno, bool) or not isinstance(errno, int):
+        errno = 0
+    return f"type={exception_type} errno={errno}"
+
+
 def _merge_output(partial: bytes, recovered: bytes) -> bytes:
     """Merge TimeoutExpired output with the post-kill communicate result."""
 
@@ -1646,6 +1658,7 @@ class _ProcessSnapshotProvider:
             stderr = b""
             returncode: int | None = None
             timed_out = False
+            probe_error: BaseException | None = None
             try:
                 census_timeout = _remaining_until(
                     deadline,
@@ -1669,8 +1682,13 @@ class _ProcessSnapshotProvider:
                 timed_out = True
                 stdout = _output_bytes(error.stdout)
                 stderr = _output_bytes(error.stderr)
-            except OSError as error:
-                stderr = repr(error).encode("utf-8", errors="replace")
+                probe_error = error
+            except Exception as error:
+                stdout = _output_bytes(getattr(error, "output", None))
+                if not stdout:
+                    stdout = _output_bytes(getattr(error, "stdout", None))
+                stderr = _output_bytes(getattr(error, "stderr", None))
+                probe_error = error
             self._diagnostics.extend(
                 b"MAC_PROCESS_CENSUS_BEGIN\n"
                 + b"returncode=" + str(returncode).encode("ascii")
@@ -1688,6 +1706,13 @@ class _ProcessSnapshotProvider:
                 self._diagnostics.extend(
                     b"MAC_PROCESS_CENSUS_PARSE_ERROR=1\n"
                     b"EVIDENCE_INCOMPLETE=1 reason=process-census-parse-error\n"
+                )
+            if probe_error is not None:
+                self._diagnostics.extend(
+                    b"MAC_PROCESS_CENSUS_EXCEPTION="
+                    + _safe_exception_detail(probe_error).encode("ascii", errors="replace")
+                    + b" detail=ps-invocation\n"
+                    b"EVIDENCE_INCOMPLETE=1 reason=process-census-probe-error\n"
                 )
             if deadline is not None and time.monotonic() > deadline:
                 timed_out = True

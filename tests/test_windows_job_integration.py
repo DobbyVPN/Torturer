@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import os
 import stat
 import socket
@@ -11,6 +12,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from torturer_checks.windows_job import (
     close_for,
@@ -24,6 +26,47 @@ from torturer_checks.hosted import finalize_windows_service
 from torturer_checks.hosted.windows import WindowsServiceProcessController
 from torturer_checks.source_checkout import run_bounded_preflight
 from torturer_checks import desktop_slice
+
+
+_WINDOWS_PROCESS_IDENTITY_PROBE_TIMEOUT_SECONDS = 30.0
+
+
+def _exception_stream_bytes(error: BaseException, stream: str) -> bytes:
+    """Keep every stream byte exposed by a failed subprocess call."""
+
+    values = ("output", "stdout") if stream == "stdout" else (stream,)
+    combined = b""
+    for name in values:
+        value = getattr(error, name, None)
+        if isinstance(value, str):
+            value = value.encode("utf-8", errors="replace")
+        if not isinstance(value, bytes) or not value:
+            continue
+        if not combined or combined.startswith(value) or value.startswith(combined):
+            combined = value if len(value) > len(combined) else combined
+        else:
+            combined += value
+    return combined
+
+
+def _identity_probe_failure(error: BaseException) -> str:
+    """Format safe probe metadata while preserving complete output bytes."""
+
+    error_type = type(error).__name__
+    if not error_type.isidentifier():
+        error_type = "Exception"
+    errno = getattr(error, "errno", 0)
+    if isinstance(errno, bool) or not isinstance(errno, int):
+        errno = 0
+    timeout = getattr(error, "timeout", None)
+    stdout = _exception_stream_bytes(error, "stdout")
+    stderr = _exception_stream_bytes(error, "stderr")
+    return (
+        "process identity PowerShell probe failed\n"
+        f"exception_type={error_type} errno={errno} timeout={timeout!r}\n"
+        f"stdout={stdout!r}\n"
+        f"stderr={stderr!r}\n"
+    )
 
 
 @unittest.skipUnless(os.name == "nt", "native Windows Job Objects require Windows")
@@ -45,21 +88,31 @@ class WindowsJobIntegrationTests(unittest.TestCase):
             'Write-Output ([string]$p.ProcessId + "|" + '
             '[string]$p.CreationDate.ToUniversalTime().Ticks)'
         )
-        result = subprocess.run(
-            (
-                "powershell.exe",
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                script,
-            ),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=10.0,
-            check=False,
+        command = (
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
         )
+        try:
+            # WMI can take longer than 10 seconds on a cold Windows hosted
+            # runner.  Keep this bounded at 30 seconds; the integration job
+            # itself has a five-minute limit and all lifecycle assertions stay
+            # unchanged.
+            result = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=_WINDOWS_PROCESS_IDENTITY_PROBE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as error:
+            diagnostics = _identity_probe_failure(error)
+            print(diagnostics, file=sys.stderr, end="")
+            self.fail(diagnostics.rstrip("\n"))
         self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
         identity = result.stdout.decode("ascii").strip()
         self.assertRegex(identity, rf"^{pid}\|[1-9][0-9]+$")
@@ -520,6 +573,51 @@ class WindowsJobIntegrationTests(unittest.TestCase):
                     process.kill()
                     process.wait(timeout=5.0)
                 process.communicate(timeout=1.0)
+
+
+class WindowsJobIdentityDiagnosticsTests(unittest.TestCase):
+    """Keep the direct WMI test helper diagnosable on every host."""
+
+    def _probe_helper(self) -> WindowsJobIntegrationTests:
+        return WindowsJobIntegrationTests("runTest")
+
+    def test_identity_timeout_reports_complete_streams(self) -> None:
+        error = subprocess.TimeoutExpired(
+            ("powershell.exe",),
+            _WINDOWS_PROCESS_IDENTITY_PROBE_TIMEOUT_SECONDS,
+            output=b"identity-partial-stdout\x00\xff",
+            stderr=b"identity-partial-stderr\x00\xfe",
+        )
+        with mock.patch.object(subprocess, "run", side_effect=error), mock.patch.object(
+            sys, "stderr", new_callable=io.StringIO
+        ) as diagnostics:
+            with self.assertRaises(AssertionError) as caught:
+                self._probe_helper()._process_identity(123)
+        message = str(caught.exception)
+        self.assertIn("exception_type=TimeoutExpired", message)
+        self.assertIn("timeout=30.0", message)
+        self.assertIn("identity-partial-stdout", message)
+        self.assertIn("identity-partial-stderr", message)
+        self.assertIn(message + "\n", diagnostics.getvalue())
+
+    def test_identity_oserror_reports_complete_streams(self) -> None:
+        error = OSError(5, "private host path must not be emitted")
+        error.output = b"identity-oserror-output\x00\xff"  # type: ignore[attr-defined]
+        error.stdout = b"identity-oserror-stdout\x00\xff"  # type: ignore[attr-defined]
+        error.stderr = b"identity-oserror-stderr\x00\xfe"  # type: ignore[attr-defined]
+        with mock.patch.object(subprocess, "run", side_effect=error), mock.patch.object(
+            sys, "stderr", new_callable=io.StringIO
+        ) as diagnostics:
+            with self.assertRaises(AssertionError) as caught:
+                self._probe_helper()._process_identity(123)
+        message = str(caught.exception)
+        self.assertIn("exception_type=OSError", message)
+        self.assertIn("errno=5", message)
+        self.assertIn("identity-oserror-output", message)
+        self.assertIn("identity-oserror-stdout", message)
+        self.assertIn("identity-oserror-stderr", message)
+        self.assertNotIn("private host path", message)
+        self.assertIn(message + "\n", diagnostics.getvalue())
 
 
 if __name__ == "__main__":
