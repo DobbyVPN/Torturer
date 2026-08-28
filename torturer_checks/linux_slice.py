@@ -40,6 +40,7 @@ import tempfile
 import time
 from typing import BinaryIO, Callable, Sequence
 
+from torturer_checks.cli_status import CLIStatusError, parse_public_status
 from torturer_checks.public_output import emit_evidence
 
 
@@ -1015,8 +1016,16 @@ def assert_cli_contract(
         evidence_label="cli-status",
     )
     require_success(status_result, "CLI status")
-    if '"state": "Disconnected"' not in status_result.stdout:
-        raise SliceFailure(f"CLI did not report the initial disconnected state\n{status_result.describe()}")
+    try:
+        status = parse_public_status(status_result.stdout)
+    except CLIStatusError as error:
+        raise SliceFailure(
+            f"CLI status JSON was invalid: {error}\n{status_result.describe()}"
+        ) from error
+    if status.state != "Disconnected":
+        raise SliceFailure(
+            f"CLI did not report the initial disconnected state\n{status_result.describe()}"
+        )
 
     malformed_result = run_command(
         cli_command(root, "check-config", str(fixture)),

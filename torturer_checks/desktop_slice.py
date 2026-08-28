@@ -47,6 +47,7 @@ import tempfile
 import time
 from typing import Callable, Sequence
 
+from torturer_checks.cli_status import CLIStatusError, parse_public_status
 from torturer_checks.source_checkout import (
     SourceCheckoutError,
     _finalize_process,
@@ -313,8 +314,14 @@ def service_build_command(root: Path, target_platform: str, architecture: str, *
     return command
 
 
-def app_build_command(root: Path, target_platform: str, *, skip_dependencies: bool) -> list[str]:
-    """Build the desktop app and native CLI without rebuilding the service."""
+def app_build_command(
+    root: Path,
+    target_platform: str,
+    architecture: str,
+    *,
+    skip_dependencies: bool,
+) -> list[str]:
+    """Build the desktop app and native CLI for the validated architecture."""
 
     command = [
         sys.executable,
@@ -322,6 +329,8 @@ def app_build_command(root: Path, target_platform: str, *, skip_dependencies: bo
         "app",
         "--platform",
         target_platform,
+        "--arch",
+        architecture,
         "--skip-libs",
     ]
     if skip_dependencies:
@@ -1412,8 +1421,16 @@ def assert_cli_contract(
         evidence_label="cli-status",
     )
     require_success(status_result, "CLI status")
-    if '"state": "Disconnected"' not in status_result.stdout:
-        raise SliceFailure(f"CLI did not report the initial disconnected state\n{status_result.describe()}")
+    try:
+        status = parse_public_status(status_result.stdout)
+    except CLIStatusError as error:
+        raise SliceFailure(
+            f"CLI status JSON was invalid: {error}\n{status_result.describe()}"
+        ) from error
+    if status.state != "Disconnected":
+        raise SliceFailure(
+            f"CLI did not report the initial disconnected state\n{status_result.describe()}"
+        )
 
     malformed_result = run_command(
         cli_command(root, target_platform, "check-config", str(fixture)),
@@ -1471,7 +1488,12 @@ def run_slice(
         )
         require_success(
             run_command(
-                app_build_command(root, target_platform, skip_dependencies=skip_dependencies),
+                app_build_command(
+                    root,
+                    target_platform,
+                    architecture,
+                    skip_dependencies=skip_dependencies,
+                ),
                 cwd=root,
                 env=build_environment,
                 timeout_seconds=budget.operation_timeout(),
