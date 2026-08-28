@@ -37,7 +37,6 @@ import os
 from pathlib import Path
 import platform as host_platform_module
 import re
-import secrets
 import signal
 import socket
 import stat
@@ -46,6 +45,7 @@ import sys
 import tempfile
 import time
 from typing import Callable, Sequence
+import uuid
 
 from torturer_checks.cli_status import CLIStatusError, parse_public_status
 from torturer_checks.source_checkout import (
@@ -56,6 +56,14 @@ from torturer_checks.source_checkout import (
     verify_source_checkout,
 )
 from torturer_checks.public_output import emit_evidence
+from torturer_checks.windows_job import (
+    WindowsJobError,
+    close_for as close_windows_job,
+    job_for as windows_job_for,
+    popen_with_windows_job,
+    terminate_and_prove_empty as terminate_windows_job,
+    wait_for_empty as wait_for_windows_job,
+)
 
 
 BUILD_SCRIPT_RELATIVE_PATH = Path(".github/scripts/desktop_build.py")
@@ -553,15 +561,22 @@ def _wait_for_process_tree(
 ) -> bool:
     """Wait for both the leader and its process group, proving disappearance."""
 
-    if os.name == "nt" and not getattr(process, "_torturer_tree_census_observed", False):
-        # CREATE_NEW_PROCESS_GROUP is not a Windows descendant boundary.  A
-        # missing Toolhelp census is unprovable, so callers must fail closed.
-        return False
     tracked = tracked if tracked is not None else set()
     if deadline is None:
         if timeout_seconds is None:
             raise SliceFailure("process-tree deadline is required")
         deadline = time.monotonic() + max(0.0, timeout_seconds)
+    # Windows Job Object accounting is the authoritative containment proof.
+    # The PID/parent census remains supplemental diagnostic evidence and may
+    # not turn a native ActiveProcesses=0 observation into a false failure.
+    if os.name == "nt":
+        if windows_job_for(process) is not None:
+            return wait_for_windows_job(process, deadline=deadline).process_tree_proven
+        # A Windows process without a Job Object is an invalid production
+        # launch. A PID census is supplemental evidence only and cannot
+        # replace the mandatory native containment boundary.
+        tracked.update(_proc_descendants(process.pid, process=process, deadline=deadline))
+        return False
     while True:
         tracked.update(
             _proc_descendants(process.pid, process=process, deadline=deadline)
@@ -582,27 +597,6 @@ def _wait_for_process_tree(
             process.wait(timeout=min(0.05, remaining))
         except subprocess.TimeoutExpired:
             pass
-
-
-def _retain_taskkill_diagnostics(
-    evidence_directory: Path | None,
-    description: str,
-    stdout: bytes,
-    stderr: bytes,
-    *,
-    status: str,
-) -> bool:
-    """Retain both taskkill streams before exposing only safe metadata."""
-
-    if evidence_directory is None:
-        return False
-    _validate_evidence_directory(evidence_directory)
-    suffix = secrets.token_hex(16)
-    stem = _safe_evidence_stem(description)
-    _retain_exclusive_bytes(evidence_directory, f"{stem}-taskkill-{suffix}.stdout.raw.log", stdout)
-    _retain_exclusive_bytes(evidence_directory, f"{stem}-taskkill-{suffix}.stderr.raw.log", stderr)
-    emit_evidence("desktop-taskkill", status=status, payloads={"stdout": stdout, "stderr": stderr})
-    return True
 
 
 def _terminate_process_tree(
@@ -664,15 +658,31 @@ def _terminate_process_tree(
     was_running = process.poll() is None
     if force_immediately:
         if os.name == "nt":
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-            except OSError as error:
-                termination_errors.append(
-                    f"{description} forced leader kill error={type(error).__name__}; "
-                    "EVIDENCE_INCOMPLETE=1 reason=process-kill-error"
+            job_attached = windows_job_for(process) is not None
+            if job_attached:
+                cleanup = terminate_windows_job(
+                    process,
+                    deadline=cleanup_deadline,
+                    stage=f"{description}-forced",
                 )
+                if cleanup.process_tree_proven:
+                    return ProcessTreeResult(True, (), cleanup.diagnostics)
+                termination_errors.extend(cleanup.diagnostics)
+            else:
+                termination_errors.append(
+                    f"stage={description} windows-job missing; "
+                    "EVIDENCE_INCOMPLETE=1 reason=job-containment-missing"
+                )
+            if not job_attached:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                except OSError as error:
+                    termination_errors.append(
+                        f"{description} forced leader kill error={type(error).__name__}; "
+                        "EVIDENCE_INCOMPLETE=1 reason=process-kill-error"
+                    )
         else:
             if was_running:
                 try:
@@ -704,10 +714,14 @@ def _terminate_process_tree(
             )
         return ProcessTreeResult(
             False,
-            tuple(
-                sorted(
-                    pid for pid in tracked
-                    if _pid_alive(pid, deadline=cleanup_deadline)
+            (
+                ((process_id,) if process.poll() is None else ())
+                if os.name == "nt" and windows_job_for(process) is None
+                else tuple(
+                    sorted(
+                        pid for pid in tracked
+                        if _pid_alive(pid, deadline=cleanup_deadline)
+                    )
                 )
             ),
             tuple(
@@ -753,7 +767,7 @@ def _terminate_process_tree(
                         )
 
     tree_gone = _wait_for_process_tree(process, tracked=tracked, deadline=cleanup_deadline)
-    if tree_gone and os.name != "nt":
+    if tree_gone and (os.name != "nt" or windows_job_for(process) is not None):
         return ProcessTreeResult(
             not termination_errors,
             (),
@@ -764,59 +778,31 @@ def _terminate_process_tree(
         diagnostics.append(f"{description} graceful-stop-expired")
         print(f"[torturer-process] {description} graceful-stop-expired", file=sys.stderr)
     if os.name == "nt":
-        try:
-            # taskkill's /T is the Windows descendant equivalent of a POSIX
-            # process-group signal. Capture both streams so the hosted log is
-            # never the sole copy of cleanup diagnostics.
-            remaining = _remaining_until(cleanup_deadline)
-            if remaining > 0:
-                taskkill = subprocess.run(
-                    ["taskkill.exe", "/PID", str(process_id), "/T", "/F"],
-                    check=False,
-                    timeout=remaining,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-                retained = _retain_taskkill_diagnostics(
-                    evidence_directory,
-                    description,
-                    taskkill.stdout or b"",
-                    taskkill.stderr or b"",
-                    status=("completed" if taskkill.returncode == 0 else "failed"),
-                )
-                if not retained:
-                    diagnostics.append(f"{description} taskkill diagnostics were not retained")
-            else:
-                process.kill()
-        except subprocess.TimeoutExpired as error:
-            retained = _retain_taskkill_diagnostics(
-                evidence_directory,
-                description,
-                getattr(error, "stdout", None) or b"",
-                getattr(error, "stderr", None) or b"",
-                status="timed-out",
+        if windows_job_for(process) is not None:
+            cleanup = terminate_windows_job(
+                process,
+                deadline=cleanup_deadline,
+                stage=description,
             )
-            diagnostics.append(f"{description} taskkill-expired")
-            if not retained:
-                diagnostics.append(f"{description} taskkill diagnostics were not retained")
-            print(f"[torturer-process] {description} taskkill-expired", file=sys.stderr)
-        except OSError as error:
-            diagnostics.append(
-                f"{description} taskkill-error={type(error).__name__}; "
-                "EVIDENCE_INCOMPLETE=1 reason=taskkill-error"
+            if cleanup.process_tree_proven:
+                return ProcessTreeResult(True, (), cleanup.diagnostics)
+            termination_errors.extend(cleanup.diagnostics)
+        else:
+            # A Windows process without a retained Job Object is not safe to
+            # clean recursively. Kill only the identity-bound leader and fail
+            # closed; never fall back to unsafe PID-based tree termination.
+            termination_errors.append(
+                f"stage={description} windows-job missing; "
+                "EVIDENCE_INCOMPLETE=1 reason=job-containment-missing"
             )
-            print(
-                f"[torturer-process] {description} taskkill-error={type(error).__name__}",
-                file=sys.stderr,
-            )
-        if process.poll() is None:
-            try:
-                process.kill()
-            except OSError as error:
-                termination_errors.append(
-                    f"{description} forced leader kill error={type(error).__name__}; "
-                    "EVIDENCE_INCOMPLETE=1 reason=process-kill-error"
-                )
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except OSError as error:
+                    termination_errors.append(
+                        f"{description} forced leader kill error={type(error).__name__}; "
+                        "EVIDENCE_INCOMPLETE=1 reason=process-kill-error"
+                    )
     else:
         if process.poll() is None:
             try:
@@ -847,9 +833,12 @@ def _terminate_process_tree(
             (),
             tuple(diagnostics + termination_errors),
         )
-    survivors = {
-        pid for pid in tracked if _pid_alive(pid, deadline=cleanup_deadline)
-    }
+    if os.name == "nt" and windows_job_for(process) is None:
+        survivors = {process_id} if process.poll() is None else set()
+    else:
+        survivors = {
+            pid for pid in tracked if _pid_alive(pid, deadline=cleanup_deadline)
+        }
     if _process_group_alive(process):
         survivors.add(process_id)
     diagnostics.extend(termination_errors)
@@ -938,16 +927,52 @@ def run_command(
     deadline = started_at + timeout_seconds
     cleanup_reserve = _command_cleanup_reserve(timeout_seconds)
     evidence_root = _prepare_evidence_directory(evidence_directory)
-    process = subprocess.Popen(
-        list(command),
-        cwd=cwd,
-        env=env,
-        stdin=None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=os.name != "nt",
-        creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
-    )
+    try:
+        process = popen_with_windows_job(
+            subprocess.Popen,
+            list(command),
+            cwd=cwd,
+            env=env,
+            stdin=None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=os.name != "nt",
+            creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
+            stage="desktop-command",
+            deadline=deadline,
+        )
+    except WindowsJobError as error:
+        if evidence_root is None:
+            raise SliceFailure(
+                f"{error}; EVIDENCE_INCOMPLETE=1 reason=setup-output-no-owner-evidence"
+            ) from error
+        setup_label = f"{evidence_label}-setup-{uuid.uuid4().hex}"
+        try:
+            paths = _retain_command_streams(
+                evidence_root,
+                setup_label,
+                error.stdout,
+                error.stderr,
+            )
+            _retain_cleanup_record(
+                evidence_root,
+                setup_label,
+                ProcessTreeResult(
+                    False,
+                    diagnostics=(
+                        str(error),
+                        "EVIDENCE_INCOMPLETE=1 reason=windows-job-setup",
+                    ),
+                ),
+                process_tree_diagnostics_path=paths.get("process_tree_diagnostics"),
+            )
+        except SliceFailure as retention_error:
+            raise SliceFailure(
+                f"{error}; setup-output-retention-failed: {retention_error}"
+            ) from error
+        raise SliceFailure(
+            f"{error}; complete setup diagnostics retained privately"
+        ) from error
     tracked = {process.pid}
     process._torturer_tracked = tracked  # type: ignore[attr-defined]
     timed_out = False
@@ -1367,26 +1392,79 @@ def stop_service(
     """Stop the service tree, prove it is gone, and remove only our socket."""
 
     cleanup_deadline = time.monotonic() + max(0.0, timeout_seconds)
-    cleanup = _terminate_process_tree(
-        process,
-        description="service",
-        evidence_directory=evidence_directory,
-        deadline=cleanup_deadline,
-    )
-    if not cleanup.process_tree_proven or cleanup.diagnostics:
-        raise SliceFailure(
-            "service process tree cleanup could not be proven: "
-            + "; ".join(cleanup.diagnostics)
+    failures: list[str] = []
+    try:
+        cleanup = _terminate_process_tree(
+            process,
+            description="service",
+            evidence_directory=evidence_directory,
+            deadline=cleanup_deadline,
         )
-    if socket_path is None:
-        return
-    if socket_path.exists() or socket_path.is_socket():
-        details = socket_path.lstat()
-        if not stat.S_ISSOCK(details.st_mode):
-            raise SliceFailure(f"refusing to remove non-socket cleanup path: {socket_path}")
-        socket_path.unlink()
-    if socket_path.exists() or socket_path.is_socket():
-        raise SliceFailure(f"control socket remained after cleanup: {socket_path}")
+        if not cleanup.process_tree_proven or cleanup.diagnostics:
+            failures.append(
+                "service process tree cleanup could not be proven: "
+                + "; ".join(cleanup.diagnostics)
+            )
+        if not failures:
+            if socket_path is not None:
+                if socket_path.exists() or socket_path.is_socket():
+                    details = socket_path.lstat()
+                    if not stat.S_ISSOCK(details.st_mode):
+                        failures.append(
+                            f"refusing to remove non-socket cleanup path: {socket_path}"
+                        )
+                    else:
+                        socket_path.unlink()
+                if socket_path.exists() or socket_path.is_socket():
+                    failures.append(f"control socket remained after cleanup: {socket_path}")
+    except (OSError, ValueError) as error:
+        failures.append(f"service cleanup error={type(error).__name__}")
+    finally:
+        try:
+            process.wait(timeout=_remaining_until(cleanup_deadline))
+        except subprocess.TimeoutExpired:
+            failures.append("service leader reap timed out; EVIDENCE_INCOMPLETE=1 reason=process-reap-timeout")
+        except (OSError, ValueError) as error:
+            failures.append(
+                f"service leader reap error={type(error).__name__}; "
+                "EVIDENCE_INCOMPLETE=1 reason=process-reap-error"
+            )
+        close_diagnostics = close_windows_job(
+            process,
+            stage="service",
+            deadline=cleanup_deadline,
+        )
+        # A first CloseHandle failure is retained but is not fatal when the
+        # shared same-deadline retry closed the Job.  Keep those bytes in a
+        # small owner-only cleanup record (or visible local diagnostics when
+        # no evidence directory was requested) so the successful retry never
+        # suppresses the original native observation.
+        close_failed = False
+        if len(close_diagnostics):
+            close_failed = getattr(close_diagnostics, "failed", bool(close_diagnostics))
+            if evidence_directory is not None:
+                try:
+                    _retain_cleanup_record(
+                        evidence_directory,
+                        "service",
+                        ProcessTreeResult(
+                            not close_failed,
+                            diagnostics=tuple(close_diagnostics),
+                        ),
+                        deadline_exceeded=time.monotonic() > cleanup_deadline,
+                    )
+                except SliceFailure as error:
+                    failures.append(str(error))
+            else:
+                print(
+                    "[torturer-process] service close diagnostics="
+                    + "; ".join(close_diagnostics),
+                    file=sys.stderr,
+                )
+        if close_failed:
+            failures.extend(close_diagnostics)
+    if failures:
+        raise SliceFailure("; ".join(failures))
 
 
 def assert_cli_contract(
@@ -1520,16 +1598,25 @@ def run_slice(
             environment = service_environment(target_platform, runtime, port)
             service_log_path = runtime.root / "service.combined.log"
             with service_log_path.open("wb", buffering=0) as service_log:
-                process = subprocess.Popen(
-                    service_command(service, target_platform, port),
-                    cwd=root,
-                    env=environment,
-                    stdin=None,
-                    stdout=service_log,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=os.name != "nt",
-                    creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
-                )
+                try:
+                    process = popen_with_windows_job(
+                        subprocess.Popen,
+                        service_command(service, target_platform, port),
+                        cwd=root,
+                        env=environment,
+                        stdin=None,
+                        stdout=service_log,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=os.name != "nt",
+                        creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
+                        stage=f"desktop-service-{target_platform}",
+                        deadline=budget.deadline,
+                    )
+                except WindowsJobError as error:
+                    service_log.flush()
+                    if evidence_root is not None:
+                        _emit_and_retain_service_log(service_log_path, evidence_root)
+                    raise SliceFailure(str(error)) from error
                 process._torturer_tracked = {process.pid}  # type: ignore[attr-defined]
                 try:
                     if target_platform == "macos":

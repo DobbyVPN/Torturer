@@ -54,6 +54,7 @@ from torturer_checks.desktop_slice import (
     wait_for_unix_socket,
 )
 from torturer_checks.source_checkout import _pid_alive
+from torturer_checks.windows_job import WindowsJobCloseDiagnostics
 
 
 class DesktopSliceHelperTest(unittest.TestCase):
@@ -273,6 +274,26 @@ class DesktopSliceHelperTest(unittest.TestCase):
         regular_path = _FakeSocketPath(mode=stat.S_IFREG | 0o600)
         with self.assertRaisesRegex(SliceFailure, "refusing to remove"):
             stop_service(_FakeProcess(returncode=0), regular_path)  # type: ignore[arg-type]
+
+    def test_service_teardown_accepts_transient_job_close_diagnostic(self) -> None:
+        transient = WindowsJobCloseDiagnostics(
+            (
+                "stage=service api=CloseHandle winerror=6",
+                "stage=service detail=close-retry attempt=2",
+            ),
+            failed=False,
+        )
+        with (
+            patch.object(desktop_slice.os, "name", "nt"),
+            patch.object(
+                desktop_slice,
+                "_terminate_process_tree",
+                return_value=ProcessTreeResult(True),
+            ),
+            patch.object(desktop_slice, "close_windows_job", return_value=transient) as close,
+        ):
+            stop_service(_FakeProcess(), None, timeout_seconds=1.0)  # type: ignore[arg-type]
+        close.assert_called_once()
 
     def test_run_command_streams_stdout_and_stderr(self) -> None:
         captured_stdout = io.StringIO()

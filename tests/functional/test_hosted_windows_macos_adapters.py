@@ -9,6 +9,7 @@ import tempfile
 import unittest
 
 from unittest import mock
+import torturer_checks.hosted.windows as hosted_windows
 from torturer_checks.hosted.cli import CommandResult, HostedAdapterError, _evidence_metadata
 from torturer_checks.hosted.factory import adapter_for_platform
 from torturer_checks.hosted.macos import (
@@ -34,6 +35,24 @@ from torturer_checks.hosted.windows import (
 )
 from torturer_contract.functional.capabilities import Capability
 from torturer_contract.functional.engine import FunctionalEngine, ScenarioExecutionError
+from torturer_checks.windows_job import WindowsJobCleanup
+
+
+class _FakeWindowsReplacementProcess:
+    def __init__(self) -> None:
+        self.pid = 456
+        self.returncode: int | None = None
+        self.wait_calls: list[float] = []
+        self._torturer_windows_job = object()
+
+    def wait(self, *, timeout: float | None = None) -> int:
+        self.wait_calls.append(0.0 if timeout is None else timeout)
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def poll(self) -> int | None:
+        return self.returncode
 from torturer_contract.functional.scenarios import get_scenario
 
 
@@ -54,6 +73,7 @@ class HostedDesktopProcessRunner:
         self.tree_survivor = False
         self.tree_identity_mismatch = False
         self.tree_partial = False
+        self.tree_late_descendant = False
         self.mac_descendant_binary: Path | None = None
         self.external_evidence: list[dict[str, object]] = []
         self.connected = False
@@ -173,6 +193,13 @@ class HostedDesktopProcessRunner:
             return CommandResult(argv, 0, (str(self.binary.resolve()) + "\n").encode(), b"")
         if argv[0] == "powershell.exe":
             script = argv[argv.index("-Command") + 1]
+            if script == hosted_windows._WINDOWS_EXTERNAL_DESCENDANT_SNAPSHOT_SCRIPT:
+                output = (
+                    b"late_tree_pid=789\nlate_tree_identity=789|200\n"
+                    if self.tree_late_descendant
+                    else b""
+                )
+                return CommandResult(argv, 0, output, b"")
             if "tree_pid=" in script:
                 if self.tree_partial:
                     return CommandResult(argv, 0, b"tree_pid=123\nmalformed-tree-row\n", b"")
@@ -209,6 +236,9 @@ class HostedDesktopProcessRunner:
                 Path(argv[7]).chmod(0o600)
                 Path(argv[8]).chmod(0o600)
                 return CommandResult(argv, 0, b"456\n", b"")
+            if script == hosted_windows._WINDOWS_EXTERNAL_PROCESS_STOP_SCRIPT:
+                self.service_alive = False
+                return CommandResult(argv, 0, b"external_service_stop=123\n", b"")
             if script == _WINDOWS_PROCESS_IDENTITY_SCRIPT:
                 if not self.service_alive:
                     return CommandResult(argv, 1, b"", b"")
@@ -275,7 +305,65 @@ class HostedDesktopAdapterTests(unittest.TestCase):
         self.profile = root / "profile.toml"
         self.profile.write_text("[[Outline]]\nPassword = \"synthetic\"\n", encoding="utf-8")
         self.profile.chmod(0o600)
+        self._current_windows_runner: HostedDesktopProcessRunner | None = None
+        self.windows_launches: list[tuple[object, tuple[str, ...], dict[str, object]]] = []
+        self._windows_popen_patch = mock.patch.object(
+            hosted_windows,
+            "popen_with_windows_job",
+            side_effect=self._popen_windows_service,
+        )
+        self._windows_job_patch = mock.patch.object(
+            hosted_windows,
+            "windows_job_for",
+            side_effect=lambda process: getattr(process, "_torturer_windows_job", None),
+        )
+        self._windows_terminate_patch = mock.patch.object(
+            hosted_windows,
+            "terminate_windows_job",
+            side_effect=self._terminate_windows_service,
+        )
+        self._windows_close_patch = mock.patch.object(
+            hosted_windows,
+            "close_windows_job",
+            side_effect=self._close_windows_service,
+        )
+        self._windows_popen_patch.start()
+        self._windows_job_patch.start()
+        self._windows_terminate_patch.start()
+        self._windows_close_patch.start()
+        self.addCleanup(self._windows_popen_patch.stop)
+        self.addCleanup(self._windows_job_patch.stop)
+        self.addCleanup(self._windows_terminate_patch.stop)
+        self.addCleanup(self._windows_close_patch.stop)
         self.addCleanup(self.directory.cleanup)
+
+    def _popen_windows_service(self, popen, command, **kwargs):
+        self.assertIs(popen, hosted_windows.subprocess.Popen)
+        runner = self._current_windows_runner
+        self.assertIsNotNone(runner)
+        assert runner is not None
+        process = _FakeWindowsReplacementProcess()
+        self.windows_launches.append((popen, tuple(command), kwargs))
+        stdout = kwargs["stdout"]
+        stderr = kwargs["stderr"]
+        stdout.write(b"windows service stdout\n")
+        stdout.flush()
+        stderr.write(b"windows service stderr\n")
+        stderr.flush()
+        runner.service_alive = True
+        runner.service_pid = process.pid
+        return process
+
+    def _terminate_windows_service(self, process, *, deadline: float, stage: str):
+        runner = self._current_windows_runner
+        assert runner is not None
+        process.returncode = 0
+        runner.service_alive = False
+        return WindowsJobCleanup(True, 0, ())
+
+    def _close_windows_service(self, process, *, deadline: float | None, stage: str):
+        delattr(process, "_torturer_windows_job")
+        return ()
 
     def _provenance(self, adapter, platform: str):
         from torturer_contract.functional.results import RunProvenance
@@ -299,6 +387,8 @@ class HostedDesktopAdapterTests(unittest.TestCase):
         *,
         identity_file: Path | None = None,
     ):
+        if platform == "windows":
+            self._current_windows_runner = runner
         root = Path(self.directory.name)
         return adapter_for_platform(
             platform,
@@ -331,13 +421,16 @@ class HostedDesktopAdapterTests(unittest.TestCase):
 
             self.assertEqual(result.outcome, "passed")
             self.assertTrue(result.cleanup["verified"])
-            self.assertTrue(any(call[0] in {"taskkill.exe", "kill"} for call in runner.calls))
+            if platform == "windows":
+                self.assertFalse(any(call[0] == "taskkill.exe" for call in runner.calls))
+                self.assertTrue(self.windows_launches)
+            else:
+                self.assertTrue(any(call[0] == "kill" for call in runner.calls))
             self.assertTrue(any(call[0] in {"powershell.exe", "sh"} for call in runner.calls))
             self.assertTrue(all(timeout <= 45 for timeout in runner.timeouts))
             self.assertEqual((Path(self.directory.name) / f"{platform}.pid").read_text(), "456\n")
 
             if platform == "windows":
-                self.assertTrue(any(call[0] == "powershell.exe" and "Start-Process" in call[5] for call in runner.calls))
                 self.assertTrue(any(call[0] == "powershell.exe" and "Test-NetConnection" in call[5] for call in runner.calls))
             else:
                 privileged = [call[2:] for call in runner.calls if call[:2] == ("sudo", "-n")]
@@ -519,13 +612,8 @@ class HostedDesktopAdapterTests(unittest.TestCase):
         runner.tree_identity_mismatch = True
         adapter = self._adapter("windows", runner)
         adapter.service._terminate(5.0)
-        self.assertTrue(adapter.service._tree_proof_for_evidence)
-        verify_call = next(
-            call
-            for call in runner.calls
-            if call[0] == "powershell.exe" and "identity_mismatch_pid=" in call[5]
-        )
-        self.assertIn("123|100", verify_call)
+        self.assertTrue(adapter.service._external_tree_cleanup_proven)
+        self.assertTrue(any(call[0] == "powershell.exe" for call in runner.calls))
 
     def test_windows_service_restart_evidence_is_exclusive_and_owner_only(self) -> None:
         runner = HostedDesktopProcessRunner(platform="windows", binary=self.cli)
@@ -540,12 +628,10 @@ class HostedDesktopAdapterTests(unittest.TestCase):
         runner.raw_directory = raw
         adapter = self._adapter("windows", runner)
         adapter.service._start(10.0)
-        launch = next(
-            call for call in runner.calls
-            if call[0] == "powershell.exe" and "Start-Process" in call[5]
-        )
-        stdout_path = Path(launch[7])
-        stderr_path = Path(launch[8])
+        launch = self.windows_launches[-1]
+        paths = adapter.service._service_evidence_paths
+        assert paths is not None
+        stdout_path, stderr_path = paths
         self.assertNotEqual(stdout_path, sentinel_stdout)
         self.assertNotEqual(stderr_path, sentinel_stderr)
         self.assertEqual(sentinel_stdout.read_bytes(), b"old stdout evidence\n")
@@ -554,8 +640,8 @@ class HostedDesktopAdapterTests(unittest.TestCase):
         self.assertEqual(stderr_path.stat().st_mode & 0o777, 0o600)
         adapter.service._terminate(5.0)
         adapter.service.finalize_evidence()
-        self.assertEqual(len(runner.external_evidence), 2)
-        for record, path in zip(runner.external_evidence, (stdout_path, stderr_path)):
+        self.assertEqual(len(runner.external_evidence), 3)
+        for record, path in zip(runner.external_evidence[:2], (stdout_path, stderr_path)):
             data = path.read_bytes()
             self.assertEqual(record["evidence_bytes"], len(data))
             self.assertEqual(record["evidence_sha256"], hashlib.sha256(data).hexdigest())
@@ -618,25 +704,19 @@ class HostedDesktopAdapterTests(unittest.TestCase):
                 self.assertFalse(any(
                     call[0] in {"taskkill.exe", "kill"} for call in runner.calls
                 ))
-                service._restart_number = 1
                 if platform == "windows":
-                    service._replacement_identity = "123|100"
-                    stdout = raw / "service.stdout.raw.log"
-                    stderr = raw / "service.stderr.raw.log"
-                    stdout.write_bytes(b"stdout\n")
-                    stderr.write_bytes(b"stderr\n")
-                    stdout.chmod(0o600)
-                    stderr.chmod(0o600)
-                    service._service_evidence_paths = (stdout, stderr)
+                    service._start(5.0)
                 else:
+                    service._restart_number = 1
                     service._replacement_identity = "123|1000.000001"
 
                 adapter.finalize(5.0)
-                self.assertTrue(any(
-                    call[0] in {"taskkill.exe", "kill"} for call in runner.calls
-                ))
                 if platform == "windows":
-                    self.assertEqual(len(runner.external_evidence), 2)
+                    self.assertFalse(any(call[0] == "taskkill.exe" for call in runner.calls))
+                else:
+                    self.assertTrue(any(call[0] == "kill" for call in runner.calls))
+                if platform == "windows":
+                    self.assertEqual(len(runner.external_evidence), 3)
 
     def test_desktop_finalization_refuses_same_path_reused_root_pid(self) -> None:
         for platform in ("windows", "macos"):
@@ -742,14 +822,17 @@ class HostedDesktopAdapterTests(unittest.TestCase):
                 adapter = self._adapter(platform, runner)
                 assert adapter.service is not None
                 adapter.service._start(5.0)
-                self.assertEqual(len(runner.detached_calls), 1)
                 if platform == "macos":
+                    self.assertEqual(len(runner.detached_calls), 1)
                     self.assertEqual(runner.detached_calls[0][2], "sh")
                     self.assertEqual(runner.detached_calls[0][3], "-c")
                     self.assertIn("binary=$1", runner.detached_calls[0][4])
                 else:
-                    self.assertEqual(runner.detached_calls[0][0], "powershell.exe")
-                    self.assertIn("Start-Process", runner.detached_calls[0][5])
+                    self.assertEqual(len(self.windows_launches), 1)
+                    self.assertEqual(
+                        self.windows_launches[0][1],
+                        (str(self.cli), "-port", "50051"),
+                    )
 
     def test_pid_file_write_failure_retains_owned_identity_for_finalization(self) -> None:
         for platform in ("windows", "macos"):
@@ -761,6 +844,9 @@ class HostedDesktopAdapterTests(unittest.TestCase):
                 identity_file = raw / (
                     "service.identity.json" if platform == "macos" else "service.identity"
                 )
+                if platform == "windows":
+                    identity_file.write_text("123|100\n", encoding="ascii")
+                    identity_file.chmod(0o600)
                 adapter = self._adapter(platform, runner, identity_file=identity_file)
                 assert adapter.service is not None
                 service = adapter.service
@@ -800,6 +886,9 @@ class HostedDesktopAdapterTests(unittest.TestCase):
                 runner.raw_directory.mkdir(mode=0o700)
                 identity_file = runner.raw_directory / "explicit.identity"
                 ambient_file = runner.raw_directory / "ambient.identity"
+                if platform == "windows":
+                    identity_file.write_text("123|100\n", encoding="ascii")
+                    identity_file.chmod(0o600)
                 with mock.patch.dict(
                     os.environ, {"SERVICE_IDENTITY_FILE": str(ambient_file)}, clear=False
                 ):

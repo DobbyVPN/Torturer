@@ -98,8 +98,14 @@ class FunctionalWindowsWorkflowPolicyTest(unittest.TestCase):
         self.assertNotIn("github.token", preflight_handoff)
         self.assertIn("if: always()", preflight_handoff)
         self.assertIn("preflight_service_stop_verified=true", preflight_handoff)
-        self.assertIn('taskkill.exe /PID "$service_pid" /T /F', preflight_handoff)
-        self.assertIn("PREFLIGHT_SERVICE_PID_FILE", preflight_handoff)
+        self.assertIn(
+            "python -m torturer_checks.hosted.finalize_windows_service",
+            preflight_handoff,
+        )
+        self.assertNotIn('python - "$service_identity_file"', preflight_handoff)
+        self.assertIn("preflight-controller-fallback", preflight_handoff)
+        self.assertNotIn("taskkill", preflight_handoff.lower())
+        self.assertIn("PREFLIGHT_SERVICE_IDENTITY_FILE", preflight_handoff)
         self.assertIn("GH_TOKEN", token_region)
         self.assertIn("github.token", token_region)
         for forbidden in ("windows_grpcvpnserver.exe", "macos_grpcvpnserver", "dobby-cli.exe", "Start-Process", "taskkill.exe", "PREFLIGHT_SERVICE_PID"):
@@ -237,19 +243,19 @@ class FunctionalWindowsWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("SERVICE_IDENTITY_FILE", client)
         self.assertIn("PREFLIGHT_SERVICE_IDENTITY_FILE", client)
         self.assertIn("CreationDate.ToUniversalTime().Ticks", client)
-        self.assertIn("service_state=path-mismatch", client)
-        self.assertIn("service_state=identity-mismatch", client)
+        self.assertIn("fallback_state=path-mismatch", client)
+        self.assertIn("fallback_state=identity-mismatch", client)
         self.assertIn("PREFLIGHT_SERVICE_LAUNCH_STARTED_EPOCH", client)
         self.assertIn("SERVICE_LAUNCH_STARTED_EPOCH", client)
-        self.assertGreaterEqual(client.count("FromUnixTimeSeconds([int64]$args[2])"), 4)
+        self.assertGreaterEqual(client.count("FromUnixTimeSeconds([int64]$args[2])"), 2)
         self.assertIn("cleanup_deadline_epoch=$((RUN_DEADLINE_EPOCH - 60))", client)
         self.assertIn("launch_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 60))", client)
-        self.assertGreaterEqual(client.count('timeout --foreground --signal=TERM --kill-after=1s "${probe_timeout}s"'), 2)
+        self.assertGreaterEqual(client.count('timeout --foreground --signal=TERM --kill-after=1s "${probe_timeout}s"'), 1)
         self.assertIn("readiness_reserve_seconds=180", client)
         self.assertIn('readiness_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - readiness_reserve_seconds))', client)
         self.assertIn('timeout --foreground --signal=TERM --kill-after=1s "${status_timeout}s"', client)
         self.assertIn('discovery_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 60 - 1))', client)
-        self.assertIn('timeout --foreground --signal=TERM --kill-after=1s "${kill_timeout}s"', client)
+        self.assertGreaterEqual(client.count('timeout --foreground --signal=TERM --kill-after=1s "${fallback_timeout}s"'), 2)
 
     def test_cleanup_keeps_authoritative_identity_when_pid_file_is_stale(self) -> None:
         client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
@@ -264,15 +270,21 @@ class FunctionalWindowsWorkflowPolicyTest(unittest.TestCase):
             ),
         ):
             cleanup = client[client.index(begin):client.index(end)]
-            self.assertIn("native identity sidecar", cleanup)
-            self.assertNotIn("recorded_pid", cleanup)
+            self.assertIn("service_identity_file=", cleanup)
+            self.assertIn("service_identity=\"$(tr -d", cleanup)
+            self.assertIn("service_pid=\"${service_identity%%|*}\"", cleanup)
             self.assertIn(
-                'if ! [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\\|[1-9][0-9]+$ ]] && [ -n "$service_binary" ]; then',
+                "python -m torturer_checks.hosted.finalize_windows_service",
                 cleanup,
             )
-            self.assertIn("service_state=path-mismatch", cleanup)
-            self.assertIn("actual=[System.IO.Path]::GetFullPath", cleanup)
-            self.assertIn("CreationDate.ToUniversalTime().Ticks", cleanup)
+            self.assertIn("--service-identity-file \"$service_identity_file\"", cleanup)
+            self.assertIn("--service-binary \"$service_binary\"", cleanup)
+            self.assertIn("--raw-log-dir \"$controller_raw\"", cleanup)
+            self.assertIn("--timeout-seconds \"$controller_timeout\"", cleanup)
+            self.assertNotIn('python - "$service_identity_file"', cleanup)
+            self.assertNotIn("service_pid_file=", cleanup)
+            self.assertNotIn("candidate-discovery", cleanup)
+            self.assertNotIn("taskkill", cleanup.lower())
 
     def test_render_handoff_is_opaque_and_bound_to_windows_origin(self) -> None:
         self.assertIn("render-request-${lease_run_id}-${PLATFORM}", self.text)
@@ -299,7 +311,12 @@ class FunctionalWindowsWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("if: always()", self.text[remove:marker_upload])
         self.assertIn("if: always()", self.text[stop:result])
         self.assertIn("if: always()", self.text[result:])
-        self.assertIn("taskkill.exe /PID", self.text[stop:result])
+        self.assertIn(
+            "python -m torturer_checks.hosted.finalize_windows_service",
+            self.text[stop:result],
+        )
+        self.assertIn("Stop-Process", self.text[stop:result])
+        self.assertNotIn("taskkill", self.text[stop:result].lower())
         uploads = self.text[result:remove]
         self.assertNotIn("profile.cms", uploads)
         self.assertNotIn("upload.cms", uploads)
@@ -319,9 +336,101 @@ class FunctionalWindowsWorkflowPolicyTest(unittest.TestCase):
         self.assertNotIn('cat "$service_err"', self.text)
         self.assertNotIn('| tee "$SERVICE_DIR/preflight-control-status.raw.log"', self.text)
         self.assertNotIn('| tee "$SERVICE_DIR/control-status.raw.log"', self.text)
-        self.assertIn('taskkill.exe /PID "$service_pid" /T /F > "$taskkill_log" 2>&1', self.text)
-        self.assertIn('emit_private_evidence preflight-taskkill "$taskkill_log"', self.text)
-        self.assertIn('emit_private_evidence taskkill "$taskkill_log"', self.text)
+        self.assertNotIn("taskkill", self.text.lower())
+        self.assertIn("Stop-Process -Id $processId -Force", self.text)
+        self.assertIn("emit_private_evidence preflight-controller-fallback", self.text)
+        self.assertIn("emit_private_evidence controller-fallback", self.text)
+        self.assertGreaterEqual(
+            self.text.count("state=retained-runner-private"),
+            2,
+        )
+        self.assertNotIn('diagnostic_display label=%s text=%s', self.text)
+        self.assertNotIn('read_bytes().decode("utf-8", "replace")', self.text)
+        self.assertNotIn("private_acl_path=", self.text)
+        self.assertNotIn(' sid=" + $sid', self.text)
+        self.assertIn("private_acl_verified_count=", self.text)
+
+    def test_windows_cleanup_uses_trusted_controller_and_fail_closed_fallback(self) -> None:
+        client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
+        for begin, end in (
+            (
+                "- name: Stop Windows preflight candidate before Render handoff",
+                "- name: Upload public certificate and opaque request",
+            ),
+            (
+                "- name: Stop exact Windows service and verify cleanup",
+                "- name: Remove plaintext handoff material and prepare completion marker",
+            ),
+        ):
+            cleanup = client[client.index(begin):client.index(end)]
+            self.assertIn(
+                'env PYTHONPATH="$GITHUB_WORKSPACE/torturer" python -m '
+                "torturer_checks.hosted.finalize_windows_service",
+                cleanup,
+            )
+            self.assertIn("--service-identity-file \"$service_identity_file\"", cleanup)
+            self.assertIn("--service-binary \"$service_binary\"", cleanup)
+            self.assertIn("--raw-log-dir \"$controller_raw\"", cleanup)
+            self.assertIn("--timeout-seconds \"$controller_timeout\"", cleanup)
+            self.assertNotIn("controller._terminate_initial_external", cleanup)
+            self.assertNotIn('python - "$service_identity_file"', cleanup)
+            self.assertIn("Stop-Process -Id $processId -Force", cleanup)
+            self.assertIn("tree-unproven", cleanup)
+            self.assertIn("exit 1", cleanup)
+            self.assertNotIn("taskkill", cleanup.lower())
+            self.assertNotIn(" /T", cleanup)
+
+        self.assertLess(
+            client.index("- name: Verify trusted Torturer checkout and candidate closure"),
+            client.index("- name: Stop exact Windows service and verify cleanup"),
+        )
+
+    def test_completed_hosted_controller_absence_is_the_only_clean_fallback(self) -> None:
+        client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
+        cleanup = client[
+            client.index("- name: Stop exact Windows service and verify cleanup"):
+            client.index("- name: Remove plaintext handoff material and prepare completion marker")
+        ]
+        allow = cleanup.index('allow_already_gone=0')
+        trusted_outcome = cleanup.index('[ "$FUNCTIONAL_OUTCOME" = "success" ]', allow)
+        absent_proof = cleanup.index('fallback_state=leader-absent trusted-controller-result', trusted_outcome)
+        success = cleanup.index(
+            'if [ "$allow_already_gone" -eq 1 ] && [ "$fallback_status" -eq 0 ]; then',
+            absent_proof,
+        )
+        failure = cleanup.index(
+            "service_cleanup=failed code=CONTROLLER_FINALIZER",
+            success,
+        )
+        self.assertLess(allow, trusted_outcome)
+        self.assertLess(trusted_outcome, absent_proof)
+        self.assertLess(absent_proof, success)
+        self.assertLess(success, failure)
+        self.assertIn("FUNCTIONAL_OUTCOME: ${{ steps.functional.outcome }}", cleanup)
+        self.assertNotIn("RESULT_PATH", cleanup[allow:success])
+        self.assertNotIn("grep -Fqx", cleanup)
+        self.assertIn(
+            "service_stop_verified=true method=completed-hosted-controller tree=proven",
+            cleanup[success:failure],
+        )
+
+        preflight = client[
+            client.index("- name: Stop Windows preflight candidate before Render handoff"):
+            client.index("- name: Upload public certificate and opaque request")
+        ]
+        self.assertNotIn("allow_already_gone", preflight)
+        self.assertNotIn("trusted-controller-result", preflight)
+
+    def test_shared_finalizer_is_the_only_workflow_controller_entrypoint(self) -> None:
+        finalizer = (ROOT / "torturer_checks" / "hosted" / "finalize_windows_service.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("controller.finalize_initial_service", finalizer)
+        self.assertIn("_ensure_owner_only_directory", finalizer)
+        self.assertIn("read_windows_service_identity", finalizer)
+        self.assertIn("expected_initial_identity=identity", finalizer)
+        self.assertNotIn("_terminate_initial_external", finalizer)
+        self.assertNotIn("taskkill", finalizer.lower())
 
     def test_schema_two_validator_rejects_identity_binding_and_private_field_attacks(self) -> None:
         self.assertEqual(run_validator(self.text, valid_lease("windows")).returncode, 0)
