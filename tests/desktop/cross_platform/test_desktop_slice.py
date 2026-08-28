@@ -48,12 +48,31 @@ from torturer_checks.desktop_slice import (
     safe_failure_reason,
     classify_service_startup_log,
     SERVICE_STARTUP_CONTROL_AUTH_ACL_APPLY_FAILED,
-    SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
-    SERVICE_STARTUP_CONTROL_AUTH_FAILED,
+    SERVICE_STARTUP_CONTROL_AUTH_ACL_READ_FAILED,
+    SERVICE_STARTUP_CONTROL_AUTH_ACE_DUPLICATE,
+    SERVICE_STARTUP_CONTROL_AUTH_ACE_FLAGS_INVALID,
+    SERVICE_STARTUP_CONTROL_AUTH_ACE_MASK_MISMATCH,
+    SERVICE_STARTUP_CONTROL_AUTH_ACE_MISSING,
+    SERVICE_STARTUP_CONTROL_AUTH_ACE_SID_INVALID,
+    SERVICE_STARTUP_CONTROL_AUTH_ACE_TYPE_INVALID,
+    SERVICE_STARTUP_CONTROL_AUTH_ACE_UNEXPECTED,
+    SERVICE_STARTUP_CONTROL_AUTH_DACL_COUNT_MISMATCH,
+    SERVICE_STARTUP_CONTROL_AUTH_DACL_DEFAULTED,
+    SERVICE_STARTUP_CONTROL_AUTH_DACL_MISSING,
+    SERVICE_STARTUP_CONTROL_AUTH_DACL_READ_FAILED,
     SERVICE_STARTUP_CONTROL_AUTH_IDENTITY_FAILED,
+    SERVICE_STARTUP_CONTROL_AUTH_INHERITANCE_ENABLED,
     SERVICE_STARTUP_CONTROL_AUTH_INVALID_TOKEN,
     SERVICE_STARTUP_CONTROL_AUTH_OTHER,
+    SERVICE_STARTUP_CONTROL_AUTH_OWNER_DEFAULTED,
+    SERVICE_STARTUP_CONTROL_AUTH_OWNER_MISMATCH,
+    SERVICE_STARTUP_CONTROL_AUTH_OWNER_READ_FAILED,
+    SERVICE_STARTUP_CONTROL_AUTH_REPARSE_POINT,
+    SERVICE_STARTUP_CONTROL_AUTH_SECURITY_DESCRIPTOR_CONTROL_READ_FAILED,
+    SERVICE_STARTUP_CONTROL_AUTH_SECURITY_DESCRIPTOR_INVALID,
+    SERVICE_STARTUP_CONTROL_AUTH_SECURITY_DESCRIPTOR_MISSING,
     SERVICE_STARTUP_CONTROL_AUTH_TOKEN_IO_FAILED,
+    SERVICE_STARTUP_CONTROL_AUTH_TYPE_INSPECTION_FAILED,
     SERVICE_STARTUP_EMPTY,
     SERVICE_STARTUP_GRPC_SERVE_FAILED,
     SERVICE_STARTUP_INTERRUPTED_STATE_RECOVERY_FAILED,
@@ -105,87 +124,87 @@ class DesktopSliceHelperTest(unittest.TestCase):
             ),
             (
                 b"panic: failed to prepare control authentication: read control token ACL: private-value",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_ACL_READ_FAILED,
             ),
             (
                 b"panic: failed to prepare control authentication: control token has no security descriptor",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_SECURITY_DESCRIPTOR_MISSING,
             ),
             (
                 b"panic: failed to prepare control authentication: control token security descriptor is invalid",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_SECURITY_DESCRIPTOR_INVALID,
             ),
             (
                 b"panic: failed to prepare control authentication: read control token security descriptor control: private-value",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_SECURITY_DESCRIPTOR_CONTROL_READ_FAILED,
             ),
             (
                 b"panic: failed to prepare control authentication: control token owner is defaulted",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_OWNER_DEFAULTED,
             ),
             (
                 b"panic: failed to prepare control authentication: control token DACL is defaulted",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_DACL_DEFAULTED,
             ),
             (
                 b"panic: failed to prepare control authentication: control token has no DACL",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_DACL_MISSING,
             ),
             (
                 b"panic: failed to prepare control authentication: read control token owner: private-value",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_OWNER_READ_FAILED,
             ),
             (
                 b"panic: failed to prepare control authentication: control token owner is not the expected identity",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_OWNER_MISMATCH,
             ),
             (
                 b"panic: failed to prepare control authentication: read control token DACL: private-value",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_DACL_READ_FAILED,
             ),
             (
                 b"panic: failed to prepare control authentication: inspect control token type: private-value",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_TYPE_INSPECTION_FAILED,
             ),
             (
                 b"panic: failed to prepare control authentication: control token is a reparse point",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_REPARSE_POINT,
             ),
             (
                 b"panic: failed to prepare control authentication: control token ACL contains an unsupported entry",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_ACE_TYPE_INVALID,
             ),
             (
                 b"panic: failed to prepare control authentication: control token ACL contains 3 entries; expected 2",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_DACL_COUNT_MISMATCH,
             ),
             (
                 b"panic: failed to prepare control authentication: control token ACL contains unsupported inheritance flags",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_ACE_FLAGS_INVALID,
             ),
             (
                 b"panic: failed to prepare control authentication: control token ACL contains an entry with unexpected access mask or inheritance",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_ACE_MASK_MISMATCH,
             ),
             (
                 b"panic: failed to prepare control authentication: control token ACL inheritance is not disabled",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_INHERITANCE_ENABLED,
             ),
             (
                 b"panic: failed to prepare control authentication: control token ACL contains an invalid identity",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_ACE_SID_INVALID,
             ),
             (
                 b"panic: failed to prepare control authentication: control token ACL repeats an identity",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_ACE_DUPLICATE,
             ),
             (
                 b"panic: failed to prepare control authentication: control token ACL grants access to an unexpected identity",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_ACE_UNEXPECTED,
             ),
             (
                 b"panic: failed to prepare control authentication: control token ACL is missing an expected identity",
-                SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
+                SERVICE_STARTUP_CONTROL_AUTH_ACE_MISSING,
             ),
             (
                 b"panic: failed to prepare control authentication: token=private-value",
@@ -212,10 +231,29 @@ class DesktopSliceHelperTest(unittest.TestCase):
             SERVICE_STARTUP_CONTROL_AUTH_IDENTITY_FAILED,
             SERVICE_STARTUP_CONTROL_AUTH_TOKEN_IO_FAILED,
             SERVICE_STARTUP_CONTROL_AUTH_ACL_APPLY_FAILED,
-            SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED,
             SERVICE_STARTUP_CONTROL_AUTH_INVALID_TOKEN,
             SERVICE_STARTUP_CONTROL_AUTH_OTHER,
-            SERVICE_STARTUP_CONTROL_AUTH_FAILED,
+            SERVICE_STARTUP_CONTROL_AUTH_ACL_READ_FAILED,
+            SERVICE_STARTUP_CONTROL_AUTH_SECURITY_DESCRIPTOR_MISSING,
+            SERVICE_STARTUP_CONTROL_AUTH_SECURITY_DESCRIPTOR_INVALID,
+            SERVICE_STARTUP_CONTROL_AUTH_SECURITY_DESCRIPTOR_CONTROL_READ_FAILED,
+            SERVICE_STARTUP_CONTROL_AUTH_OWNER_DEFAULTED,
+            SERVICE_STARTUP_CONTROL_AUTH_OWNER_READ_FAILED,
+            SERVICE_STARTUP_CONTROL_AUTH_OWNER_MISMATCH,
+            SERVICE_STARTUP_CONTROL_AUTH_DACL_DEFAULTED,
+            SERVICE_STARTUP_CONTROL_AUTH_DACL_MISSING,
+            SERVICE_STARTUP_CONTROL_AUTH_DACL_READ_FAILED,
+            SERVICE_STARTUP_CONTROL_AUTH_DACL_COUNT_MISMATCH,
+            SERVICE_STARTUP_CONTROL_AUTH_INHERITANCE_ENABLED,
+            SERVICE_STARTUP_CONTROL_AUTH_TYPE_INSPECTION_FAILED,
+            SERVICE_STARTUP_CONTROL_AUTH_REPARSE_POINT,
+            SERVICE_STARTUP_CONTROL_AUTH_ACE_TYPE_INVALID,
+            SERVICE_STARTUP_CONTROL_AUTH_ACE_FLAGS_INVALID,
+            SERVICE_STARTUP_CONTROL_AUTH_ACE_MASK_MISMATCH,
+            SERVICE_STARTUP_CONTROL_AUTH_ACE_SID_INVALID,
+            SERVICE_STARTUP_CONTROL_AUTH_ACE_DUPLICATE,
+            SERVICE_STARTUP_CONTROL_AUTH_ACE_UNEXPECTED,
+            SERVICE_STARTUP_CONTROL_AUTH_ACE_MISSING,
             SERVICE_STARTUP_LOOPBACK_LISTEN_FAILED,
             SERVICE_STARTUP_INTERRUPTED_STATE_RECOVERY_FAILED,
             SERVICE_STARTUP_SECURE_LOCAL_LOGGING_FAILED,
@@ -238,6 +276,36 @@ class DesktopSliceHelperTest(unittest.TestCase):
         )
         self.assertEqual(classify_service_startup_log("not bytes"), SERVICE_STARTUP_UNCLASSIFIED)  # type: ignore[arg-type]
 
+    def test_service_startup_classifier_handles_acl_count_placeholders_without_exposing_numbers(self) -> None:
+        cases = (
+            b"panic: failed to prepare control authentication: control token ACL contains 3 entries; expected 2",
+            b"CONTROL TOKEN ACL CONTAINS 4294967295 ENTRIES; EXPECTED 2; path=C:\\private\\control.token",
+            b"control token ACL contains 0 entries; expected 2 (SID=S-1-5-21-private)",
+        )
+        for payload in cases:
+            with self.subTest(payload=payload):
+                result = classify_service_startup_log(payload)
+                self.assertEqual(result, SERVICE_STARTUP_CONTROL_AUTH_DACL_COUNT_MISMATCH)
+                self.assertRegex(result, r"^CONTROL_AUTH_[A-Z0-9_]+$")
+                self.assertNotIn(b"entries", result.encode("ascii"))
+                self.assertNotIn(b"4294967295", result.encode("ascii"))
+                self.assertNotIn(b"S-1-5-21-private", result.encode("ascii"))
+
+    def test_service_startup_classifier_rejects_near_miss_acl_count_as_unknown_control_auth(self) -> None:
+        near_misses = (
+            b"panic: failed to prepare control authentication: control token ACL contains entries; expected 2",
+            b"panic: failed to prepare control authentication: control token ACL contains 3 entries expected 2",
+            b"panic: failed to prepare control authentication: control token ACL contains 3 entries; expected two",
+            b"panic: failed to prepare control authentication: control token ACL contains 3 entries; expected 2.5",
+            b"panic: failed to prepare control authentication: control token ACL contains 3 entries; expected -2",
+        )
+        for payload in near_misses:
+            with self.subTest(payload=payload):
+                self.assertEqual(
+                    classify_service_startup_log(payload),
+                    SERVICE_STARTUP_CONTROL_AUTH_OTHER,
+                )
+
     def test_service_startup_classifier_output_is_fixed_for_adversarial_private_content(self) -> None:
         private_values = (
             b"https://user:password@private.example.test/profile?token=secret",
@@ -250,7 +318,7 @@ class DesktopSliceHelperTest(unittest.TestCase):
             with self.subTest(private_value=private_value):
                 result = classify_service_startup_log(private_value)
                 self.assertEqual(result, SERVICE_STARTUP_UNCLASSIFIED)
-                self.assertRegex(result, r"^(?:CONTROL_AUTH_(?:IDENTITY_FAILED|TOKEN_IO_FAILED|ACL_APPLY_FAILED|ACL_VERIFY_FAILED|INVALID_TOKEN|OTHER)|LOOPBACK_LISTEN_FAILED|INTERRUPTED_STATE_RECOVERY_FAILED|SECURE_LOCAL_LOGGING_FAILED|GRPC_SERVE_FAILED|EMPTY|UNCLASSIFIED)$")
+                self.assertRegex(result, r"^(?:CONTROL_AUTH_[A-Z0-9_]+|LOOPBACK_LISTEN_FAILED|INTERRUPTED_STATE_RECOVERY_FAILED|SECURE_LOCAL_LOGGING_FAILED|GRPC_SERVE_FAILED|EMPTY|UNCLASSIFIED)$")
                 self.assertNotIn(private_value.decode("utf-8", "replace"), result)
 
     def test_service_startup_classifier_is_case_insensitive_and_does_not_return_log_bytes(self) -> None:
