@@ -28,6 +28,7 @@ def valid_lease(platform: str) -> dict[str, object]:
         "platform": platform,
         "source_sha": _SOURCE_SHA,
         "state": "issued",
+        "available_until_epoch": 2_000_000_000,
         "services": [
             {
                 "role": "outline",

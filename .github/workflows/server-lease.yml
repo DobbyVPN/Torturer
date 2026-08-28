@@ -132,14 +132,14 @@ jobs:
               raise SystemExit("lease run identity mismatch")
           started = datetime.datetime.fromisoformat(run["run_started_at"].replace("Z", "+00:00"))
           deadline = int(started.timestamp()) + 30 * 60
-          # RenderAPI uses a 20-second transport timeout, two retries, and
+          # Cleanup uses a 5-second transport timeout, two retries, and
           # 0.5s/1s backoff.  A stale journal can require an exact existence
           # probe, delete, and final existence probe per service.  A
           # journal-only namespace repair can additionally require one list,
           # delete+verify for each unknown service, a second list, and the
           # final absence list.  The one-known/one-unknown two-service case is
-          # the worst bounded path: eight API calls at 61.5 seconds each.
-          render_api_timeout_seconds = 20
+          # the worst bounded path: eight API calls at 16.5 seconds each.
+          render_api_timeout_seconds = 5
           render_api_retry_attempts = 2
           render_api_backoff_seconds = 0.5 + 1.0
           render_api_attempt_seconds = (
@@ -150,8 +150,9 @@ jobs:
           cleanup_provider_worst_case_seconds = (
               cleanup_provider_api_calls * render_api_attempt_seconds
           )
-          cleanup_command_seconds = 600
-          reserve = 680
+          cleanup_command_seconds = 150
+          reserve = 240
+          available_until = deadline - reserve
           cleanup_kill_grace_seconds = 1
           plaintext_cleanup_seconds = 4
           plaintext_kill_grace_seconds = 1
@@ -173,11 +174,15 @@ jobs:
               raise SystemExit(
                   "finalization sub-budgets exceed the configured cleanup reserve"
               )
-          if int(datetime.datetime.now(datetime.timezone.utc).timestamp()) >= deadline:
+          now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+          if now >= deadline:
               raise SystemExit("lease workflow already exceeded its hard deadline")
+          if now >= available_until:
+              raise SystemExit("lease workflow has no functional availability window")
           with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as output:
               output.write(f"LEASE_DEADLINE_EPOCH={deadline}\n")
               output.write(f"LEASE_CLEANUP_RESERVE_SECONDS={reserve}\n")
+              output.write(f"LEASE_AVAILABLE_UNTIL_EPOCH={available_until}\n")
               output.write(f"LEASE_CLEANUP_COMMAND_SECONDS={cleanup_command_seconds}\n")
               output.write(
                   "LEASE_CLEANUP_PROVIDER_WORST_CASE_SECONDS="
@@ -190,6 +195,7 @@ jobs:
               output.write(f"LEASE_FINALIZATION_OVERHEAD_SECONDS={finalization_overhead_seconds}\n")
           print(f"lease_workflow_started_epoch={int(started.timestamp())}")
           print(f"lease_workflow_deadline_epoch={deadline}")
+          print(f"lease_available_until_epoch={available_until}")
           print(f"lease_cleanup_reserve_seconds={reserve}")
           print(
               "lease_cleanup_provider_worst_case_seconds="
@@ -422,7 +428,8 @@ jobs:
             --journal "$LEASE_DIR/journal.json" \
             --region "$RENDER_REGION" \
             --timeout-seconds "$readiness_timeout" \
-            --poll-seconds 5
+            --poll-seconds 5 \
+            --available-until-epoch "$LEASE_AVAILABLE_UNTIL_EPOCH"
           )
           acquire_args+=(
             --sink-image-owner-id "$RENDER_SINK_IMAGE_OWNER_ID" \
@@ -454,6 +461,7 @@ jobs:
               "platform": os.environ["PLATFORM"],
               "source_sha": os.environ["ORIGIN_SOURCE_SHA"],
               "state": "issued",
+              "available_until_epoch": int(os.environ["LEASE_AVAILABLE_UNTIL_EPOCH"]),
           }
           if set(value) != set(expected) | {"services"}:
               raise SystemExit("lease bundle has an unsafe top-level shape")
@@ -662,15 +670,23 @@ jobs:
           RENDER_API_TOKEN: ${{ secrets.RENDER_API_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -f "$LEASE_DIR/journal.json" ]; then
+          lease_dir="${LEASE_DIR:-}"
+          if [ -z "$lease_dir" ]; then
+            printf '%s\n' 'lease directory was never established; provider cleanup has no local journal to use' >&2
+            exit 0
+          fi
+          if [ -f "$lease_dir/journal.json" ]; then
             test -n "$RENDER_API_TOKEN"
             cleanup_args=(
-              --journal "$LEASE_DIR/journal.json"
-              --request "$LEASE_DIR/request/unpacked/request.json"
+              --journal "$lease_dir/journal.json"
+              --request "$lease_dir/request/unpacked/request.json"
               --owner-id "$RENDER_OWNER_ID"
+              --api-timeout-seconds 5
+              --api-retry-attempts 2
+              --api-retry-backoff-seconds 0.5
             )
-            if [ -f "$LEASE_DIR/lease.json" ]; then
-              cleanup_args+=(--lease "$LEASE_DIR/lease.json")
+            if [ -f "$lease_dir/lease.json" ]; then
+              cleanup_args+=(--lease "$lease_dir/lease.json")
             fi
             remaining=$((LEASE_DEADLINE_EPOCH - $(date +%s)))
             if [ "$remaining" -le 1 ]; then
@@ -698,7 +714,25 @@ jobs:
             printf '%s\n' 'lease directory was never established; no plaintext lease material to remove'
             exit 0
           fi
-          remaining=$((LEASE_DEADLINE_EPOCH - $(date +%s)))
+          deadline="${LEASE_DEADLINE_EPOCH:-}"
+          if ! [[ "$deadline" =~ ^[0-9]+$ ]] || [ "$deadline" -le 0 ]; then
+            # The deadline step may fail before exporting its metadata. Still
+            # remove any plaintext handoff with a fixed, owner-only bounded
+            # fallback; never let this diagnostic cleanup become unbounded or
+            # manufacture a second failure from set -u.
+            fallback_timeout_seconds=4
+            printf 'plaintext cleanup deadline unavailable; using bounded fallback seconds=%s\n' \
+              "$fallback_timeout_seconds" >&2
+            fallback_status=0
+            timeout --foreground --signal=TERM --kill-after=1s "${fallback_timeout_seconds}s" \
+              rm -f "$lease_dir/profile.toml" "$lease_dir/upload-url.txt" "$lease_dir/request/unpacked/recipient.crt" || fallback_status=$?
+            if [ "$fallback_status" -ne 0 ]; then
+              printf 'plaintext cleanup fallback failed status=%s\n' "$fallback_status" >&2
+              exit "$fallback_status"
+            fi
+            exit 0
+          fi
+          remaining=$((deadline - $(date +%s)))
           if [ "$remaining" -le 1 ]; then
             printf 'plaintext cleanup reached the hard deadline: remaining=%s\n' "$remaining" >&2
             exit 1

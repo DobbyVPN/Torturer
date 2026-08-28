@@ -151,6 +151,92 @@ class HostedDeadlineTests(unittest.TestCase):
                     pass
                 self.fail("deadline left a child process running")
 
+    @unittest.skipIf(os.name == "nt", "POSIX adopted-child lifecycle test")
+    def test_deadline_returns_after_an_intentional_detached_child_is_finalized(self) -> None:
+        leader_script = """
+import os
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+from torturer_checks.hosted.cli import CommandResult
+from torturer_checks.hosted.linux import LinuxServiceProcessController
+
+service = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(60)"],
+    start_new_session=True,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+pid = service.pid
+service_binary = Path(sys.executable)
+
+def service_stat():
+    return Path(f"/proc/{pid}/stat").read_bytes()
+
+stat_fields = service_stat().decode("ascii").rsplit(") ", 1)[1].split()
+service_start = stat_fields[19]
+service_group = int(stat_fields[2])
+
+class Runner:
+    def run(self, command, *, timeout_seconds):
+        argv = tuple(command)
+        inner = argv[2:] if argv[:2] == ("sudo", "-n") else argv
+        if inner[:2] == ("kill", "-0"):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return CommandResult(argv, 1, b"", b"")
+            return CommandResult(argv, 0, b"", b"")
+        if inner[:2] == ("ps", "-o"):
+            result = subprocess.run(
+                ["ps", "-o", "state=", "-p", str(pid)],
+                check=False,
+                capture_output=True,
+            )
+            return CommandResult(argv, result.returncode, result.stdout, result.stderr)
+        if inner[:2] == ("ps", "-axo"):
+            result = subprocess.run(
+                ["ps", "-o", "pid=,ppid=,pgid=,state=", "-p", str(pid)],
+                check=False,
+                capture_output=True,
+            )
+            return CommandResult(argv, result.returncode, result.stdout, result.stderr)
+        if inner[:2] == ("sh", "-c") and inner[-1] == str(pid):
+            try:
+                return CommandResult(argv, 0, service_stat(), b"")
+            except FileNotFoundError:
+                return CommandResult(argv, 2, b"service_probe_absent\\n", b"")
+        if inner[:2] == ("readlink", "-f"):
+            return CommandResult(argv, 0, (sys.executable + "\\n").encode(), b"")
+        if inner[:2] == ("kill", "-TERM"):
+            os.killpg(service_group, signal.SIGTERM)
+            return CommandResult(argv, 0, b"", b"")
+        if inner[:2] == ("kill", "-KILL"):
+            os.killpg(service_group, signal.SIGKILL)
+            return CommandResult(argv, 0, b"", b"")
+        raise AssertionError(argv)
+
+controller = object.__new__(LinuxServiceProcessController)
+controller.pid = pid
+controller.binary = service_binary
+controller.runner = Runner()
+controller._restart_number = 1
+controller._replacement_identity = (service_start, service_group)
+controller._replacement_tree = ()
+controller.stop_restarted_service(3.0)
+print("service-finalized", flush=True)
+"""
+        started = time.monotonic()
+        code = run(
+            [sys.executable, "-c", leader_script],
+            timeout_seconds=5,
+            grace_seconds=1,
+        )
+        self.assertEqual(code, 0)
+        self.assertLess(time.monotonic() - started, 4.0)
+
     @unittest.skipIf(os.name == "nt", "POSIX process-tree timing probe")
     def test_timeout_total_wall_clock_includes_cleanup_and_reap(self) -> None:
         started = time.monotonic()

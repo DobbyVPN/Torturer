@@ -11,15 +11,17 @@ import unittest
 from unittest import mock
 
 from torturer_provider import lease_cli
-from torturer_provider.lease import LeaseJournalRecord, LeaseState, RenderLeaseJournal
-from torturer_provider.render import RenderAPIError, RenderServiceHandle, RenderServiceRecord
+from torturer_provider.lease import LeaseCleanupError, LeaseJournalRecord, LeaseState, RenderLeaseJournal
+from torturer_provider.render import HTTPResponse, RenderAPIError, RenderServiceHandle, RenderServiceRecord
 
 
 class FakeAPI:
     deleted: list[str] = []
+    options: list[dict[str, object]] = []
 
-    def __init__(self, token: str) -> None:
+    def __init__(self, token: str, **options: object) -> None:
         self.token = token
+        type(self).options.append(dict(options))
 
     def delete_service(self, service_id: str) -> bool:
         self.deleted.append(service_id)
@@ -75,9 +77,11 @@ class NamespaceStaleAPI(FakeAPI):
 
 class FakeAcquireAPI:
     specs: list[object] = []
+    options: list[dict[str, object]] = []
 
-    def __init__(self, token: str) -> None:
+    def __init__(self, token: str, **options: object) -> None:
         self.token = token
+        type(self).options.append(dict(options))
         self.deleted: list[str] = []
 
     def create_service(self, spec):
@@ -100,6 +104,78 @@ class FakeAcquireAPI:
     def exists(self, service_id):
         return False
 
+    def list_services(self, owner_id):
+        return ()
+
+
+class LostCreateTransport:
+    def __init__(self, *, full_page: bool) -> None:
+        self.full_page = full_page
+        self.calls: list[tuple[str, str]] = []
+        self.deleted: list[str] = []
+
+    def request(self, method, path, payload, headers):
+        self.calls.append((method, path))
+        if method == "POST" and path == "/services":
+            # Render accepted the request, but the acquisition client lost
+            # the response before it received a service ID.
+            raise RenderAPIError("TRANSPORT_ERROR")
+        if method == "GET" and path.startswith("/services?"):
+            record = {
+                "id": "srv-orphan123",
+                "name": "dobby-torturer-" + "d" * 32 + "-linux",
+                "ownerId": "tea-owner123",
+                "type": "web_service",
+                "createdAt": "2026-08-23T00:00:00Z",
+            }
+            records = [record]
+            if not self.full_page:
+                records.append({**record, "id": "srv-stale123", "name": record["name"] + "-stale"})
+            if self.full_page:
+                return HTTPResponse(
+                    200,
+                    [{"service": record, "cursor": f"cursor-{index}"} for index in range(100)],
+                )
+            return HTTPResponse(200, [{"service": value} for value in records])
+        if method == "DELETE":
+            self.deleted.append(path)
+            return HTTPResponse(204, {})
+        raise AssertionError((method, path, payload))
+
+
+def acquire_args(root: Path, *, platform: str = "linux") -> argparse.Namespace:
+    digest = "sha256:" + "c" * 64
+    sink_digest = "sha256:" + "d" * 64
+    request_path = root / "request.json"
+    request_path.write_text(json.dumps({
+        "schema": 1,
+        "kind": "dobbyvpn.render-lease-request",
+        "run_id": "d" * 32,
+        "platform": platform,
+        "source_sha": "e" * 40,
+        "image_digest": digest,
+    }), encoding="utf-8")
+    request_path.chmod(0o600)
+    return argparse.Namespace(
+        request=request_path,
+        owner_id="tea-owner123",
+        image_owner_id="tea-owner123",
+        image_path="ghcr.io/dobbyvpn/outline@" + digest,
+        expected_image_digest=digest,
+        sink_image_owner_id="tea-owner123",
+        sink_image_path="ghcr.io/dobbyvpn/sink@" + sink_digest,
+        expected_sink_image_digest=sink_digest,
+        profile_output=root / "profile.toml",
+        upload_url_output=root / "upload-url.txt",
+        lease_output=root / "lease.json",
+        journal=root / "journal.json",
+        listen_port=10000,
+        region="oregon",
+        timeout_seconds=5.0,
+        poll_seconds=1.0,
+        available_until_epoch=2_000_000_000,
+    )
+
 
 class LeaseCLIContractTests(unittest.TestCase):
     @staticmethod
@@ -114,6 +190,82 @@ class LeaseCLIContractTests(unittest.TestCase):
                 timestamp="2026-08-23T00:00:00Z",
             )
         )
+
+    def test_cleanup_api_uses_the_workflow_bounded_retry_contract(self) -> None:
+        original = lease_cli.RenderAPI
+        lease_cli.RenderAPI = FakeAPI
+        FakeAPI.options = []
+        try:
+            lease_cli._cleanup_api(argparse.Namespace(
+                api_timeout_seconds=5,
+                api_retry_attempts=2,
+                api_retry_backoff_seconds=0.5,
+            ))
+        finally:
+            lease_cli.RenderAPI = original
+        self.assertEqual(FakeAPI.options, [{
+            "timeout_seconds": 5.0,
+            "retry_attempts": 2,
+            "retry_backoff_seconds": 0.5,
+            "service_list_max_pages": 1,
+        }])
+
+    def test_acquire_lost_create_recovery_uses_one_page_cleanup_api(self) -> None:
+        original = lease_cli.RenderAPI
+        transports: list[LostCreateTransport] = []
+        options: list[dict[str, object]] = []
+
+        def provider(token: str, **kwargs: object):
+            options.append(dict(kwargs))
+            transport = LostCreateTransport(full_page=True)
+            transports.append(transport)
+            return original(token or "fixture-token", transport=transport, **kwargs)
+
+        lease_cli.RenderAPI = provider
+        try:
+            with tempfile.TemporaryDirectory(prefix="lease-cli-lost-create-page-bound-") as directory:
+                with self.assertRaises(LeaseCleanupError):
+                    lease_cli.acquire(acquire_args(Path(directory)))
+        finally:
+            lease_cli.RenderAPI = original
+
+        self.assertEqual(options, [{}, {
+            "timeout_seconds": 5.0,
+            "retry_attempts": 2,
+            "retry_backoff_seconds": 0.5,
+            "service_list_max_pages": 1,
+        }])
+        self.assertEqual(transports[0].calls, [("POST", "/services")])
+        cleanup_transport = transports[1]
+        list_paths = [path for method, path in cleanup_transport.calls if method == "GET"]
+        self.assertEqual(len(list_paths), 2)
+        self.assertTrue(all("cursor=" not in path for path in list_paths))
+        self.assertEqual(cleanup_transport.deleted, [])
+
+    def test_acquire_lost_create_recovery_refuses_ambiguous_candidates_without_delete(self) -> None:
+        original = lease_cli.RenderAPI
+        transports: list[LostCreateTransport] = []
+
+        def provider(token: str, **kwargs: object):
+            transport = LostCreateTransport(full_page=False)
+            transports.append(transport)
+            return original(token or "fixture-token", transport=transport, **kwargs)
+
+        lease_cli.RenderAPI = provider
+        try:
+            with tempfile.TemporaryDirectory(prefix="lease-cli-lost-create-ambiguous-") as directory:
+                with self.assertRaises(LeaseCleanupError):
+                    lease_cli.acquire(acquire_args(Path(directory)))
+        finally:
+            lease_cli.RenderAPI = original
+
+        cleanup_transport = transports[1]
+        self.assertGreaterEqual(
+            sum(method == "GET" for method, _path in cleanup_transport.calls),
+            2,
+        )
+        self.assertEqual(cleanup_transport.deleted, [])
+        self.assertTrue(all(method != "DELETE" for method, _path in cleanup_transport.calls))
 
     def test_acquire_writes_owner_only_profile_and_safe_bundle(self) -> None:
         original = lease_cli.RenderAPI
@@ -145,6 +297,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                     upload_url_output=root / "upload-url.txt", journal=root / "journal.json",
                     listen_port=10000, region="oregon",
                     timeout_seconds=5.0, poll_seconds=1.0,
+                    available_until_epoch=2_000_000_000,
                 )
                 self.assertEqual(lease_cli.acquire(args), 0)
                 self.assertEqual((root / "profile.toml").stat().st_mode & 0o777, 0o600)
@@ -154,6 +307,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                 lease = json.loads((root / "lease.json").read_text(encoding="utf-8"))
                 self.assertEqual(lease["schema"], 2)
                 self.assertEqual(lease["state"], "issued")
+                self.assertEqual(lease["available_until_epoch"], 2_000_000_000)
                 self.assertEqual(
                     {service["role"] for service in lease["services"]},
                     {"outline", "upload-sink"},
@@ -202,11 +356,13 @@ class LeaseCLIContractTests(unittest.TestCase):
                         lease_output=root / "lease.json",
                         journal=root / "journal.json", listen_port=10000,
                         region="oregon", timeout_seconds=5.0, poll_seconds=1.0,
+                        available_until_epoch=2_000_000_000,
                     )
                     self.assertEqual(lease_cli.acquire(args), 0)
                     lease = json.loads((root / "lease.json").read_text(encoding="utf-8"))
                     self.assertEqual(lease["platform"], platform)
                     self.assertEqual(lease["schema"], 2)
+                    self.assertEqual(lease["available_until_epoch"], 2_000_000_000)
                     self.assertEqual(
                         {service["role"] for service in lease["services"]},
                         {"outline", "upload-sink"},
@@ -290,6 +446,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                     region="oregon",
                     timeout_seconds=5.0,
                     poll_seconds=1.0,
+                    available_until_epoch=2_000_000_000,
                 )
                 self.assertEqual(lease_cli.acquire(args), 0)
                 lease = json.loads((root / "lease.json").read_text(encoding="utf-8"))
@@ -359,7 +516,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                     cleanup_result="verified",
                 ))
                 args = argparse.Namespace(
-                    lease=lease_path, journal=journal_path, request=None, owner_id=None,
+                    lease=lease_path, journal=journal_path, request=None, owner_id="tea-owner123",
                 )
                 self.assertEqual(lease_cli.cleanup(args), 0)
                 self.assertEqual(StaleAbsentAPI.deleted, ["srv-stale123"])
@@ -407,7 +564,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                     cleanup_result="verified",
                 ))
                 args = argparse.Namespace(
-                    lease=lease_path, journal=journal_path, request=None, owner_id=None,
+                    lease=lease_path, journal=journal_path, request=None, owner_id="tea-owner123",
                 )
                 with self.assertRaises(RenderAPIError):
                     lease_cli.cleanup(args)
@@ -452,6 +609,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                     "run_id": "e" * 32,
                     "platform": "android",
                     "source_sha": "f" * 40,
+                    "available_until_epoch": 2_000_000_000,
                     "services": services,
                     "state": "absent",
                     "cleanup": "verified",
@@ -472,7 +630,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                         role=service["role"],
                     ))
                 args = argparse.Namespace(
-                    lease=lease_path, journal=journal_path, request=None, owner_id=None,
+                    lease=lease_path, journal=journal_path, request=None, owner_id="tea-owner123",
                 )
                 self.assertEqual(lease_cli.cleanup(args), 0)
                 self.assertEqual(StaleAbsentAPI.deleted, ["srv-stale-sink123"])
@@ -574,9 +732,76 @@ class LeaseCLIContractTests(unittest.TestCase):
                     request=request_path,
                     owner_id="tea-owner123",
                 )
-                self.assertEqual(lease_cli.cleanup(args), 0)
+                candidate_bounds: list[int | None] = []
+                original_reap = lease_cli.RenderReaper.reap_tagged
+
+                def bounded_reap(reaper, *reap_args, **reap_kwargs):
+                    candidate_bounds.append(reap_kwargs.get("max_candidates"))
+                    return original_reap(reaper, *reap_args, **reap_kwargs)
+
+                with mock.patch.object(
+                    lease_cli.RenderReaper,
+                    "reap_tagged",
+                    new=bounded_reap,
+                ):
+                    self.assertEqual(lease_cli.cleanup(args), 0)
+                self.assertEqual(candidate_bounds, [2])
                 self.assertEqual(NamespaceStaleAPI.deleted, ["srv-namespace-stale123"])
                 self.assertEqual(NamespaceStaleAPI.records, [])
+        finally:
+            lease_cli.RenderAPI = original
+
+    def test_journal_only_absent_retry_rejects_an_extra_tagged_service(self) -> None:
+        original = lease_cli.RenderAPI
+        lease_cli.RenderAPI = NamespaceStaleAPI
+        NamespaceStaleAPI.deleted = []
+        run_id = "3" * 32
+        NamespaceStaleAPI.records = [
+            RenderServiceRecord(
+                service_id="srv-extra123",
+                name=f"dobby-torturer-{run_id}-linux",
+                owner_id="tea-owner123",
+                service_type="web_service",
+                created_at="2026-08-23T00:00:00Z",
+            )
+        ]
+        try:
+            with tempfile.TemporaryDirectory(prefix="lease-cli-retry-extra-namespace-") as directory:
+                root = Path(directory)
+                request_value = {
+                    "schema": 1,
+                    "kind": "dobbyvpn.render-lease-request",
+                    "run_id": run_id,
+                    "platform": "linux",
+                    "source_sha": "4" * 40,
+                    "image_digest": "sha256:" + "5" * 64,
+                }
+                request_path = root / "request.json"
+                request_path.write_text(json.dumps(request_value), encoding="utf-8")
+                request_path.chmod(0o600)
+                journal_path = root / "journal.json"
+                journal = RenderLeaseJournal(journal_path)
+                journal.append(LeaseJournalRecord(
+                    run_id=run_id,
+                    service_id="srv-known123",
+                    image_digest=request_value["image_digest"],
+                    state=LeaseState.ABSENT,
+                    timestamp="2026-08-23T00:00:00Z",
+                    cleanup_result="verified",
+                ))
+                args = argparse.Namespace(
+                    lease=None,
+                    journal=journal_path,
+                    request=request_path,
+                    owner_id="tea-owner123",
+                )
+                with self.assertRaisesRegex(RenderAPIError, "DELETE_NOT_VERIFIED"):
+                    lease_cli.cleanup(args)
+                self.assertEqual(NamespaceStaleAPI.deleted, [])
+                self.assertEqual(
+                    [record.service_id for record in NamespaceStaleAPI.records],
+                    ["srv-extra123"],
+                )
         finally:
             lease_cli.RenderAPI = original
 
@@ -590,6 +815,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                 "run_id": "7" * 32,
                 "platform": "linux",
                 "source_sha": "8" * 40,
+                "available_until_epoch": 2_000_000_000,
                 "services": [
                     {
                         "role": "outline",
@@ -665,7 +891,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                 os.chmod(path, 0o600)
                 journal_path = Path(directory) / "journal.json"
                 self._write_issued_journal(journal_path, value)
-                args = argparse.Namespace(lease=path, journal=journal_path, request=None, owner_id=None)
+                args = argparse.Namespace(lease=path, journal=journal_path, request=None, owner_id="tea-owner123")
                 self.assertEqual(lease_cli.cleanup(args), 0)
                 self.assertEqual(lease_cli.cleanup(args), 0)
                 self.assertEqual(FakeAPI.deleted, ["srv-test123"])
@@ -697,6 +923,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                     "run_id": "a" * 32,
                     "platform": "linux",
                     "source_sha": "d" * 40,
+                    "available_until_epoch": 2_000_000_000,
                     "services": [
                         {"role": "outline", "service_id": "srv-outline123", "image_digest": outline_digest, "provider_generation": "dep-outline123"},
                         {"role": "upload-sink", "service_id": "srv-sink123", "image_digest": sink_digest, "provider_generation": "dep-sink123"},
@@ -717,7 +944,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                         timestamp="2026-08-23T00:00:00Z",
                         role=service["role"],
                     ))
-                args = argparse.Namespace(lease=lease_path, journal=journal_path, request=None, owner_id=None)
+                args = argparse.Namespace(lease=lease_path, journal=journal_path, request=None, owner_id="tea-owner123")
                 self.assertEqual(lease_cli.cleanup(args), 0)
                 self.assertEqual(lease_cli.cleanup(args), 0)
                 self.assertEqual(FakeAPI.deleted, ["srv-outline123", "srv-sink123"])
@@ -799,7 +1026,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                             lease=lease_path,
                             journal=journal_path,
                             request=None,
-                            owner_id=None,
+                            owner_id="tea-owner123",
                         )
                     ),
                     0,
@@ -864,6 +1091,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                 "run_id": "8" * 32,
                 "platform": "linux",
                 "source_sha": "9" * 40,
+                "available_until_epoch": 2_000_000_000,
                 "services": [
                     {
                         "role": "outline",
@@ -992,7 +1220,7 @@ class LeaseCLIContractTests(unittest.TestCase):
             def request(self, method, path, payload, headers):
                 raise RuntimeError(secret)
 
-        def provider(token: str):
+        def provider(token: str, **_options: object):
             return original("fixture-token", transport=SecretTransport())
 
         lease_cli.RenderAPI = provider
@@ -1048,6 +1276,7 @@ class LeaseCLIContractTests(unittest.TestCase):
                     "--profile-output", str(root / "profile.toml"),
                     "--lease-output", str(root / "lease.json"),
                     "--journal", str(root / "journal.json"),
+                    "--available-until-epoch", "2000000000",
                     "--safe-result-output", str(safe_result),
                 ])
             self.assertEqual(result, 1)

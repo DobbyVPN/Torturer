@@ -250,6 +250,7 @@ class RenderAPI:
         transport: RenderTransport | None = None,
         retry_attempts: int = 2,
         retry_backoff_seconds: float = 0.5,
+        service_list_max_pages: int = 100,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         if not isinstance(token, str) or not token or any(character.isspace() for character in token):
@@ -263,10 +264,16 @@ class RenderAPI:
             raise ValueError("Render API retry attempts must be between 0 and 3")
         if isinstance(retry_backoff_seconds, bool) or retry_backoff_seconds < 0:
             raise ValueError("Render API retry backoff must not be negative")
+        if (
+            isinstance(service_list_max_pages, bool)
+            or not 1 <= service_list_max_pages <= 100
+        ):
+            raise ValueError("Render service-list page bound must be between 1 and 100")
         self._token = token
         self._transport = transport or _URLTransport(base_url, timeout_seconds)
         self._retry_attempts = retry_attempts
         self._retry_backoff_seconds = retry_backoff_seconds
+        self._service_list_max_pages = service_list_max_pages
         self._sleeper = sleeper
 
     def _request(
@@ -344,16 +351,21 @@ class RenderAPI:
         owner_id: str,
         *,
         page_limit: int = 100,
-        max_pages: int = 100,
+        max_pages: int | None = None,
     ) -> tuple[RenderServiceRecord, ...]:
         """List only web services in one owner workspace, with bounded pagination."""
         _require(owner_id, _OWNER_ID, "owner_id")
-        if not 1 <= page_limit <= 100 or max_pages <= 0:
+        page_bound = self._service_list_max_pages if max_pages is None else max_pages
+        if (
+            not 1 <= page_limit <= 100
+            or isinstance(page_bound, bool)
+            or not 1 <= page_bound <= 100
+        ):
             raise ValueError("Render service-list bounds are invalid")
         records: list[RenderServiceRecord] = []
         cursor: str | None = None
         seen_cursors: set[str] = set()
-        for _ in range(max_pages):
+        for _ in range(page_bound):
             query: dict[str, object] = {
                 "ownerId": owner_id,
                 "type": "web_service",
@@ -425,8 +437,10 @@ class DisposableRenderController:
         *,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
+        cleanup_api: RenderAPI | None = None,
     ) -> None:
         self.api = api
+        self.cleanup_api = api if cleanup_api is None else cleanup_api
         self._clock = clock
         self._sleeper = sleeper
 
@@ -441,7 +455,11 @@ class DisposableRenderController:
                 # fresh exact-name list/delete/absence proof is the only safe
                 # recovery when no service ID was returned.  Create is never
                 # retried because a second POST could create a duplicate.
-                RenderReaper(self.api).reap_exact(spec.owner_id, spec.name)
+                RenderReaper(self.cleanup_api).reap_exact(
+                    spec.owner_id,
+                    spec.name,
+                    max_candidates=1,
+                )
             except BaseException as cleanup_error:
                 raise RenderAPIError("CREATE_CLEANUP_FAILED") from cleanup_error
             raise
@@ -507,16 +525,36 @@ class RenderReaper:
             if self.api.exists(service_id):
                 raise RenderAPIError("REAPER_DELETE_NOT_VERIFIED")
 
-    def reap_exact(self, owner_id: str, service_name: str) -> tuple[str, ...]:
+    def reap_exact(
+        self,
+        owner_id: str,
+        service_name: str,
+        *,
+        max_candidates: int | None = None,
+    ) -> tuple[str, ...]:
         """Delete and freshly verify one owner/name identity after lost create."""
 
         _require(owner_id, _OWNER_ID, "owner_id")
         _require(service_name, _SERVICE_NAME, "service_name")
+        if (
+            max_candidates is not None
+            and (
+                isinstance(max_candidates, bool)
+                or not 0 <= max_candidates <= 100
+            )
+        ):
+            raise ValueError("reaper candidate bound is invalid")
+        matches = tuple(
+            record
+            for record in self.api.list_services(owner_id)
+            if record.owner_id == owner_id and record.name == service_name
+        )
+        if max_candidates is not None and len(matches) > max_candidates:
+            raise RenderAPIError("REAPER_CANDIDATE_LIMIT")
         deleted: list[str] = []
-        for record in self.api.list_services(owner_id):
-            if record.owner_id == owner_id and record.name == service_name:
-                self.reap((record.service_id,))
-                deleted.append(record.service_id)
+        for record in matches:
+            self.reap((record.service_id,))
+            deleted.append(record.service_id)
         remaining = tuple(
             record.service_id
             for record in self.api.list_services(owner_id)
@@ -568,6 +606,7 @@ class RenderReaper:
         *,
         active_service_ids: tuple[str, ...] = (),
         older_than_seconds: float = 900.0,
+        max_candidates: int | None = None,
     ) -> tuple[str, ...]:
         """Delete only aged services in the dedicated owner/name namespace.
 
@@ -579,16 +618,29 @@ class RenderReaper:
         prefix = _service_prefix(name_prefix)
         if older_than_seconds < 0:
             raise ValueError("reaper age bound must not be negative")
+        if (
+            max_candidates is not None
+            and (
+                isinstance(max_candidates, bool)
+                or not 0 <= max_candidates <= 100
+            )
+        ):
+            raise ValueError("reaper candidate bound is invalid")
         active = set()
         for service_id in active_service_ids:
             active.add(_require(service_id, _SERVICE_ID, "active_service_id"))
         now = self._clock()
         if not isinstance(now, (int, float)) or isinstance(now, bool):
             raise ValueError("reaper clock returned an invalid value")
+        candidates = tuple(
+            record
+            for record in self.api.list_services(owner_id)
+            if self._tagged_record(record, owner_id, prefix, active)
+        )
+        if max_candidates is not None and len(candidates) > max_candidates:
+            raise RenderAPIError("REAPER_CANDIDATE_LIMIT")
         deleted: list[str] = []
-        for record in self.api.list_services(owner_id):
-            if not self._tagged_record(record, owner_id, prefix, active):
-                continue
+        for record in candidates:
             try:
                 age = now - _timestamp(record.created_at)
             except ValueError as error:

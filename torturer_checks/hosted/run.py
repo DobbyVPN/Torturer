@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import hashlib
+import inspect
+import math
 import json
 import os
 from pathlib import Path
@@ -38,9 +40,27 @@ _SHA40 = set("0123456789abcdef")
 # and cleanup, but the engine must not impose a contradictory 20-minute cap.
 _MAX_LANE_SECONDS = 1_800
 _RESET_TIMEOUT_SECONDS = 5
+_FINALIZE_TIMEOUT_SECONDS = 30
+# The workflows retain a small bounded scheduling tail after the selected
+# scenario/reset maxima and finalizer reserve.  Keep these executable minima
+# here so a direct hosted.run invocation cannot bypass the workflow contract.
+_HOSTED_PLATFORM_MINIMUM_SECONDS = {
+    "linux": 1_010,
+    "windows": 1_010,
+    "macos": 1_010,
+    "android": 980,
+}
 _OPAQUE_EVIDENCE_ID = re.compile(r"[a-z][0-9a-f]{31}\Z")
 _SCENARIO_ID = re.compile(r"[a-z][a-z0-9._-]{2,95}\Z")
 _REASON_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
+_PUBLIC_MESSAGE_REASON_CODES = frozenset({
+    "ADAPTER_FINALIZER_UNAVAILABLE",
+    "EVIDENCE_METADATA_INVALID",
+    "EVIDENCE_SINK_UNAVAILABLE",
+    "HOSTED_LANE_DEADLINE_EXCEEDED",
+    "RESULT_EVIDENCE_EXISTS",
+    "RESULT_EVIDENCE_UNAVAILABLE",
+})
 
 # These are deliberately part of the executable contract as well as being
 # repeated in each trusted workflow invocation.  A workflow may not silently
@@ -136,14 +156,51 @@ def _public_evidence(records: object) -> list[dict[str, object]]:
     return [reference.to_dict() for reference in _evidence_references(records)]
 
 
-def _select_scenarios(scenario_ids: list[str] | None) -> tuple:
+def _parse_lane_timeout(value: str) -> float:
+    """Parse the workflow's remaining canonical-lane budget strictly."""
+
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("lane timeout must be a finite number") from error
+    if not math.isfinite(timeout) or timeout <= 0 or timeout > _MAX_LANE_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"lane timeout must be finite, greater than zero, and at most {_MAX_LANE_SECONDS:g} seconds"
+        )
+    return timeout
+
+
+def _select_scenarios(
+    scenario_ids: list[str] | None,
+    *,
+    lane_timeout_seconds: float | None = None,
+    capabilities=None,
+    platform: str | None = None,
+) -> tuple:
+    if lane_timeout_seconds is None:
+        lane_timeout_seconds = float(_MAX_LANE_SECONDS)
+    lane_timeout_seconds = _parse_lane_timeout(str(lane_timeout_seconds))
     scenarios = scenario_catalog() if not scenario_ids else tuple(get_scenario(value) for value in scenario_ids)
     if len({scenario.id for scenario in scenarios}) != len(scenarios):
         raise ValueError("scenario-id values must be unique")
-    worst_case_seconds = sum(scenario.max_duration_seconds for scenario in scenarios)
+    available = None if capabilities is None else frozenset(capabilities)
+    worst_case_seconds = sum(
+        scenario.max_duration_seconds
+        for scenario in scenarios
+        if available is None
+        or not scenario.required_capabilities - available
+    )
     worst_case_seconds += len(scenarios) * _RESET_TIMEOUT_SECONDS
-    if worst_case_seconds > _MAX_LANE_SECONDS:
-        raise ValueError("selected scenarios exceed the 30-minute lane bound")
+    worst_case_seconds += _FINALIZE_TIMEOUT_SECONDS
+    if platform is not None:
+        try:
+            platform_minimum = _HOSTED_PLATFORM_MINIMUM_SECONDS[platform]
+        except KeyError:
+            raise ValueError("unknown hosted platform") from None
+        if not scenario_ids:
+            worst_case_seconds = max(worst_case_seconds, platform_minimum)
+    if worst_case_seconds > lane_timeout_seconds:
+        raise ValueError("selected scenarios exceed the requested lane bound")
     return scenarios
 
 
@@ -333,6 +390,53 @@ def _lane_remaining(deadline: float | None) -> float | None:
     if deadline is None:
         return None
     return max(0.0, deadline - time.monotonic())
+
+
+def _diagnostic_code(error: BaseException) -> str:
+    """Return only a stable, non-sensitive reason for top-level diagnostics."""
+
+    for value in (getattr(error, "reason_code", None), getattr(error, "code", None)):
+        if isinstance(value, str):
+            # Typed errors may carry private context after the public reason.
+            # Only the validated first token may cross the public log boundary.
+            prefix = value.split(maxsplit=1)[0] if value else ""
+            if _REASON_CODE.fullmatch(prefix):
+                return prefix
+    # Generic exception messages are not trusted diagnostic identifiers: an
+    # all-uppercase credential or candidate-controlled value could otherwise
+    # satisfy the reason-code syntax and be printed.  Only this closed set of
+    # internal ValueError prefixes may cross the public log boundary.
+    message = str(error)
+    prefix = message.split(maxsplit=1)[0] if message else ""
+    if prefix in _PUBLIC_MESSAGE_REASON_CODES:
+        return prefix
+    return type(error).__name__
+
+
+def _finalize_adapter(adapter, deadline: float | None) -> None:
+    """Release adapter-owned resources before the hosted process may exit."""
+
+    finalize = getattr(adapter, "finalize", None)
+    if not callable(finalize):
+        raise ValueError("ADAPTER_FINALIZER_UNAVAILABLE")
+    remaining = _lane_remaining(deadline)
+    if remaining is not None:
+        if remaining <= 0:
+            raise ValueError("HOSTED_LANE_DEADLINE_EXCEEDED before adapter finalization")
+        timeout_seconds = min(float(_FINALIZE_TIMEOUT_SECONDS), remaining)
+    else:
+        timeout_seconds = float(_FINALIZE_TIMEOUT_SECONDS)
+    # Keep compatibility with small dry-run adapters that implement the old
+    # one-argument hook, while first-party adapters receive the canonical
+    # absolute lane deadline.  Do not catch a TypeError raised by the hook.
+    try:
+        accepts_deadline = "deadline" in inspect.signature(finalize).parameters
+    except (TypeError, ValueError):
+        accepts_deadline = False
+    if accepts_deadline:
+        finalize(timeout_seconds=timeout_seconds, deadline=deadline)
+    else:
+        finalize(timeout_seconds=timeout_seconds)
 
 
 def _require_lane_time(
@@ -559,6 +663,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--candidate-manifest", type=Path, required=True)
     parser.add_argument("--server-image-digest", required=True)
+    parser.add_argument(
+        "--lane-timeout-seconds",
+        type=_parse_lane_timeout,
+        required=True,
+        help="Workflow-provided remaining canonical lane budget (0 < value <= 1800)",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--raw-log-dir", type=Path)
     parser.add_argument("--adb", type=Path)
@@ -572,6 +682,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--service-socket", type=Path)
     parser.add_argument("--service-library-path", type=Path)
     parser.add_argument("--service-pid-file", type=Path)
+    parser.add_argument("--service-identity-file", type=Path)
     parser.add_argument("--network-interface")
     parser.add_argument(
         "--expected-unavailable",
@@ -585,6 +696,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    adapter = None
+    # The workflow's remaining budget is also the outer deadline's budget.
+    # Start the one canonical clock before any preflight so inner work cannot
+    # accidentally outlive the wrapper that owns process cleanup.
+    lane_deadline: float | None = time.monotonic() + args.lane_timeout_seconds
+    finalization_attempted = False
     try:
         expected_unavailable = _expected_unavailable(args.expected_unavailable)
         source_sha = _full_sha(args.source_sha, "source SHA")
@@ -629,6 +746,7 @@ def main(argv: list[str] | None = None) -> int:
             service_socket=args.service_socket,
             service_library_path=args.service_library_path,
             service_pid_file=args.service_pid_file,
+            service_identity_file=args.service_identity_file,
             network_interface=args.network_interface,
         )
         provenance = RunProvenance(
@@ -650,7 +768,12 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(catalog_document(), sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         engine = FunctionalEngine(scenario_set_digest=scenario_set_digest, schema_version=2)
-        selected_scenarios = _select_scenarios(args.scenario_ids)
+        selected_scenarios = _select_scenarios(
+            args.scenario_ids,
+            lane_timeout_seconds=args.lane_timeout_seconds,
+            capabilities=adapter.capabilities,
+            platform=args.platform,
+        )
         # Keep every selected canonical scenario in the engine run. The engine
         # emits a versioned unavailable result for missing capabilities; merely
         # removing those scenarios would make an all-applicable pass look like
@@ -661,18 +784,20 @@ def main(argv: list[str] | None = None) -> int:
             getattr(adapter, "capability_unavailable_reasons", None),
         )
         scenarios = selected_scenarios
-        # The canonical lane clock starts only after source/candidate
-        # preflight. The outer workflow still bounds this whole process; this
-        # clock specifically covers scenario execution, reset/cleanup, result
-        # serialization, and both result fsyncs.
-        lane_deadline = time.monotonic() + _MAX_LANE_SECONDS
+        # This absolute clock started immediately after argparse, before
+        # source/candidate preflight, and covers all remaining scenario,
+        # reset/cleanup, adapter finalization, result serialization, and both
+        # result fsyncs inside the outer hosted deadline.
+        scenario_deadline = lane_deadline - _FINALIZE_TIMEOUT_SECONDS
         results, reset_failures, reset_count = _run_scenarios(
             engine,
             scenarios,
             adapter,
             provenance,
-            deadline=lane_deadline,
+            deadline=scenario_deadline,
         )
+        finalization_attempted = True
+        _finalize_adapter(adapter, lane_deadline)
         coverage = _coverage_contract(
             args.platform,
             selected_scenarios,
@@ -741,7 +866,17 @@ def main(argv: list[str] | None = None) -> int:
             coverage=coverage,
         )
     except Exception as error:
-        print(f"hosted-functional failed code={type(error).__name__}", file=sys.stderr)
+        if adapter is not None and not finalization_attempted:
+            finalization_attempted = True
+            try:
+                _finalize_adapter(adapter, lane_deadline)
+            except Exception as finalization_error:
+                print(
+                    "hosted-functional adapter-finalization-failed "
+                    f"code={_diagnostic_code(finalization_error)}",
+                    file=sys.stderr,
+                )
+        print(f"hosted-functional failed code={_diagnostic_code(error)}", file=sys.stderr)
         return 1
 
 

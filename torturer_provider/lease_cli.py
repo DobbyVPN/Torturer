@@ -40,6 +40,9 @@ _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _UPLOAD_PATH = re.compile(r"^/upload/[0-9a-f]{32}$")
 _UPLOAD_SINK_ROLE = "upload-sink"
 _SAFE_RESULT_CODE = re.compile(r"^[A-Z][A-Z0-9_]{1,127}$")
+_CLEANUP_API_TIMEOUT_SECONDS = 5.0
+_CLEANUP_API_RETRY_ATTEMPTS = 2
+_CLEANUP_API_RETRY_BACKOFF_SECONDS = 0.5
 
 
 def _owner_output(path: Path, payload: dict[str, object]) -> None:
@@ -197,8 +200,15 @@ def _safe_bundle_payload(
     outline: RenderLease,
     upload_sink: RenderLease,
     state: str,
+    available_until_epoch: int,
     cleanup: str | None = None,
 ) -> dict[str, object]:
+    if (
+        isinstance(available_until_epoch, bool)
+        or not isinstance(available_until_epoch, int)
+        or available_until_epoch <= 0
+    ):
+        raise ValueError("lease availability deadline is invalid")
     services: list[dict[str, object]] = []
     for lease in (outline, upload_sink):
         if lease.handle is None or lease.ready is None:
@@ -217,6 +227,7 @@ def _safe_bundle_payload(
         "source_sha": request.source_sha,
         "services": services,
         "state": state,
+        "available_until_epoch": available_until_epoch,
     }
     if cleanup is not None:
         payload["cleanup"] = cleanup
@@ -337,6 +348,76 @@ def _append_cleanup_state(
     )
 
 
+def _cleanup_api(args: argparse.Namespace) -> RenderAPI:
+    """Build the cleanup-only API client with an explicitly bounded budget."""
+
+    timeout_seconds = getattr(
+        args, "api_timeout_seconds", _CLEANUP_API_TIMEOUT_SECONDS
+    )
+    retry_attempts = getattr(
+        args, "api_retry_attempts", _CLEANUP_API_RETRY_ATTEMPTS
+    )
+    retry_backoff_seconds = getattr(
+        args,
+        "api_retry_backoff_seconds",
+        _CLEANUP_API_RETRY_BACKOFF_SECONDS,
+    )
+    if (
+        isinstance(timeout_seconds, bool)
+        or not 0 < timeout_seconds <= 20
+        or isinstance(retry_attempts, bool)
+        or not 0 <= retry_attempts <= 3
+        or isinstance(retry_backoff_seconds, bool)
+        or not 0 <= retry_backoff_seconds <= 5
+    ):
+        raise ValueError("cleanup API retry budget is invalid")
+    return RenderAPI(
+        os.environ.get("RENDER_API_TOKEN", ""),
+        timeout_seconds=float(timeout_seconds),
+        retry_attempts=int(retry_attempts),
+        retry_backoff_seconds=float(retry_backoff_seconds),
+        service_list_max_pages=1,
+    )
+
+
+def _lease_namespace_descriptor(request: RenderLeaseRequest) -> RenderLeaseDescriptor:
+    """Build the service namespace identity from the authenticated request."""
+
+    return RenderLeaseDescriptor(
+        run_id=request.run_id,
+        platform=request.platform,
+        service_name=f"dobby-torturer-{request.run_id}-{request.platform}",
+        image_digest=request.image_digest,
+    )
+
+
+def _prove_namespace_absent(
+    api: RenderAPI,
+    owner_id: str | None,
+    descriptor: RenderLeaseDescriptor | None,
+    *,
+    active_service_ids: tuple[str, ...] = (),
+    max_candidates: int = 0,
+) -> None:
+    """Prove that no non-active service remains in this run's namespace."""
+
+    if not isinstance(owner_id, str) or descriptor is None:
+        raise RenderAPIError("DELETE_NOT_VERIFIED")
+    reaper = RenderReaper(api)
+    # ``max_candidates`` is zero when all service IDs are known.  Any extra
+    # tagged service then fails closed instead of being silently ignored.
+    reaper.reap_tagged(
+        owner_id,
+        descriptor.service_prefix,
+        active_service_ids=active_service_ids,
+        older_than_seconds=0,
+        max_candidates=max_candidates,
+    )
+    # Do not exclude active IDs from the final proof: exact-ID checks above
+    # must also establish that each recorded service is gone.
+    reaper.assert_tagged_absent(owner_id, descriptor.service_prefix)
+
+
 def _reverify_recorded_absence(
     api: RenderAPI,
     journal: RenderLeaseJournal,
@@ -408,32 +489,31 @@ def _reverify_recorded_absence(
     unknown_roles = tuple(
         role for role, record in last_records.items() if record.service_id is None
     )
-    if unknown_roles:
-        if not isinstance(owner_id, str) or descriptor is None:
-            failures.append(ValueError("namespace identity is unavailable"))
-        else:
-            try:
-                reaper = RenderReaper(api)
-                reaper.reap_tagged(
-                    owner_id,
-                    descriptor.service_prefix,
-                    active_service_ids=known_ids,
-                    older_than_seconds=0,
-                )
-                reaper.assert_tagged_absent(owner_id, descriptor.service_prefix)
-                for role in unknown_roles:
-                    record = last_records[role]
-                    _append_cleanup_state(
-                        journal,
-                        request,
-                        None,
-                        LeaseState.ABSENT,
-                        "verified-namespace",
-                        image_digest=record.image_digest,
-                        role=role,
-                    )
-            except BaseException as error:
-                failures.append(error)
+    try:
+        # The number of unknown journal roles is the maximum number of
+        # services this run could have created without an exact ID.  A
+        # larger candidate set is a stale/ambiguous namespace and must fail
+        # closed before any candidate is deleted.
+        _prove_namespace_absent(
+            api,
+            owner_id,
+            descriptor,
+            active_service_ids=known_ids,
+            max_candidates=len(unknown_roles),
+        )
+        for role in unknown_roles:
+            record = last_records[role]
+            _append_cleanup_state(
+                journal,
+                request,
+                None,
+                LeaseState.ABSENT,
+                "verified-namespace",
+                image_digest=record.image_digest,
+                role=role,
+            )
+    except BaseException as error:
+        failures.append(error)
     if failures:
         raise RenderAPIError("DELETE_NOT_VERIFIED") from failures[0]
 
@@ -449,13 +529,16 @@ def acquire(args: argparse.Namespace) -> int:
         raise ValueError("listen port is invalid")
     if not 0 < args.timeout_seconds <= 900 or not 0 < args.poll_seconds <= 60:
         raise ValueError("lease readiness bounds are invalid")
+    available_until_epoch = getattr(args, "available_until_epoch", None)
+    if (
+        isinstance(available_until_epoch, bool)
+        or not isinstance(available_until_epoch, int)
+        or available_until_epoch <= 0
+    ):
+        raise ValueError("lease availability deadline is required")
     api = RenderAPI(os.environ.get("RENDER_API_TOKEN", ""))
-    descriptor = RenderLeaseDescriptor(
-        run_id=request.run_id,
-        platform=request.platform,
-        service_name=f"dobby-torturer-{request.run_id}-{request.platform}",
-        image_digest=request.image_digest,
-    )
+    cleanup_api = _cleanup_api(args)
+    descriptor = _lease_namespace_descriptor(request)
     profile = OutlineWSSProfile.random()
     outline_spec = RenderServiceSpec(
         owner_id=args.owner_id,
@@ -498,8 +581,8 @@ def acquire(args: argparse.Namespace) -> int:
         secret_files=(("upload-path", upload_path),),
     )
     journal = RenderLeaseJournal(args.journal, schema=2)
-    outline = RenderLease(api, outline_spec, descriptor, journal)
-    upload_sink = RenderLease(api, sink_spec, sink_descriptor, journal)
+    outline = RenderLease(api, outline_spec, descriptor, journal, cleanup_api=cleanup_api)
+    upload_sink = RenderLease(api, sink_spec, sink_descriptor, journal, cleanup_api=cleanup_api)
     bundle = RenderLeaseBundle(outline, upload_sink)
     bundle.acquire(timeout_seconds=args.timeout_seconds, poll_seconds=args.poll_seconds)
     try:
@@ -508,11 +591,23 @@ def acquire(args: argparse.Namespace) -> int:
         _owner_text(args.profile_output, profile.client_toml(outline.ready.url))
         _owner_text(args.upload_url_output, _upload_url(upload_sink.ready.url, upload_path) + "\n")
         bundle.mark_issued()
-        _owner_output(args.lease_output, _safe_bundle_payload(request, outline, upload_sink, "issued"))
+        _owner_output(
+            args.lease_output,
+            _safe_bundle_payload(
+                request, outline, upload_sink, "issued", available_until_epoch
+            ),
+        )
     except Exception:
         bundle.cleanup()
         raise
-    print(json.dumps(_safe_bundle_payload(request, outline, upload_sink, "issued"), sort_keys=True))
+    print(
+        json.dumps(
+            _safe_bundle_payload(
+                request, outline, upload_sink, "issued", available_until_epoch
+            ),
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -541,11 +636,21 @@ def _lease_record(path: Path) -> tuple[dict[str, object], RenderLeaseRequest, tu
             "provider_generation": value["provider_generation"],
         },)
     elif schema == 2:
-        base_keys = {"schema", "kind", "run_id", "platform", "source_sha", "services", "state"}
+        base_keys = {
+            "schema", "kind", "run_id", "platform", "source_sha", "services",
+            "state", "available_until_epoch",
+        }
         if set(value) not in (base_keys, base_keys | {"cleanup"}):
             raise ValueError("lease record has an unsafe shape")
         if not isinstance(value.get("services"), list):
             raise ValueError("lease bundle record is invalid")
+        available_until_epoch = value.get("available_until_epoch")
+        if (
+            isinstance(available_until_epoch, bool)
+            or not isinstance(available_until_epoch, int)
+            or available_until_epoch <= 0
+        ):
+            raise ValueError("lease availability deadline is invalid")
         if len(value["services"]) != 2:
             raise ValueError("lease bundle must contain exactly two services")
         parsed: list[dict[str, object]] = []
@@ -644,13 +749,8 @@ def _recover_from_journal(args: argparse.Namespace) -> int:
         raise ValueError("journal-only cleanup requires request and owner identity")
     request = RenderLeaseRequest.from_file(request_path)
     journal, last_records = _cleanup_journal(args.journal, request, None)
-    api = RenderAPI(os.environ.get("RENDER_API_TOKEN", ""))
-    descriptor = RenderLeaseDescriptor(
-        run_id=request.run_id,
-        platform=request.platform,
-        service_name=f"dobby-torturer-{request.run_id}-{request.platform}",
-        image_digest=request.image_digest,
-    )
+    api = _cleanup_api(args)
+    descriptor = _lease_namespace_descriptor(request)
     if last_records and all(
         record.state is LeaseState.ABSENT and record.cleanup_result in {"verified", "verified-namespace"}
         for record in last_records.values()
@@ -718,6 +818,9 @@ def _recover_from_journal(args: argparse.Namespace) -> int:
                 descriptor.service_prefix,
                 active_service_ids=known_ids,
                 older_than_seconds=0,
+                max_candidates=sum(
+                    record.service_id is None for record in last_records.values()
+                ),
             )
             RenderReaper(api).assert_tagged_absent(owner_id, descriptor.service_prefix)
         except BaseException as error:
@@ -745,6 +848,8 @@ def cleanup(args: argparse.Namespace) -> int:
         return _recover_from_journal(args)
     value, request, services = _lease_record(lease_path)
     journal, last_records = _cleanup_journal(args.journal, request, services)
+    owner_id = getattr(args, "owner_id", None)
+    descriptor = _lease_namespace_descriptor(request)
     if value["schema"] == 2:
         if value["state"] == "absent":
             if value.get("cleanup") != "verified" or any(
@@ -756,8 +861,15 @@ def cleanup(args: argparse.Namespace) -> int:
                 for record in last_records.values()
             ):
                 raise ValueError("absent lease bundle cleanup is not journaled")
-            api = RenderAPI(os.environ.get("RENDER_API_TOKEN", ""))
-            _reverify_recorded_absence(api, journal, request, last_records)
+            api = _cleanup_api(args)
+            _reverify_recorded_absence(
+                api,
+                journal,
+                request,
+                last_records,
+                owner_id=owner_id,
+                descriptor=descriptor,
+            )
             print(json.dumps({"state": "absent", "cleanup": "verified"}, sort_keys=True))
             return 0
         if value["state"] not in {"issued", "testing"}:
@@ -776,7 +888,7 @@ def cleanup(args: argparse.Namespace) -> int:
                     image_digest=str(service["image_digest"]),
                     role=role,
                 )
-        api = RenderAPI(os.environ.get("RENDER_API_TOKEN", ""))
+        api = _cleanup_api(args)
         failures: list[BaseException] = []
         for service in services:
             role = str(service["role"])
@@ -810,6 +922,13 @@ def cleanup(args: argparse.Namespace) -> int:
                 )
         if failures:
             raise RenderAPIError("DELETE_NOT_VERIFIED") from failures[0]
+        _prove_namespace_absent(
+            api,
+            owner_id,
+            descriptor,
+            active_service_ids=tuple(str(service["service_id"]) for service in services),
+            max_candidates=0,
+        )
         updated = dict(value)
         updated["state"] = "absent"
         updated["cleanup"] = "verified"
@@ -828,8 +947,15 @@ def cleanup(args: argparse.Namespace) -> int:
             and last_record.cleanup_result != "verified"
         ):
             raise ValueError("absent lease cleanup is not journaled")
-        api = RenderAPI(os.environ.get("RENDER_API_TOKEN", ""))
-        _reverify_recorded_absence(api, journal, request, last_records)
+        api = _cleanup_api(args)
+        _reverify_recorded_absence(
+            api,
+            journal,
+            request,
+            last_records,
+            owner_id=owner_id,
+            descriptor=descriptor,
+        )
         print(json.dumps({"service_id": service_id, "state": "absent", "cleanup": "verified"}, sort_keys=True))
         return 0
     if value["state"] not in {"issued", "testing"}:
@@ -838,12 +964,19 @@ def cleanup(args: argparse.Namespace) -> int:
         raise ValueError("active lease record conflicts with cleanup journal")
     if last_record.state is not LeaseState.DELETING:
         _append_cleanup_state(journal, request, service_id, LeaseState.DELETING)
-    api = RenderAPI(os.environ.get("RENDER_API_TOKEN", ""))
+    api = _cleanup_api(args)
     api.delete_service(service_id)
     if api.exists(service_id):
         _append_cleanup_state(journal, request, service_id, LeaseState.DELETING, "delete-unverified")
         raise RenderAPIError("DELETE_NOT_VERIFIED")
     _append_cleanup_state(journal, request, service_id, LeaseState.ABSENT, "verified")
+    _prove_namespace_absent(
+        api,
+        owner_id=owner_id,
+        descriptor=descriptor,
+        active_service_ids=(service_id,),
+        max_candidates=0,
+    )
     _owner_output(lease_path, _safe_lease_payload(request, service_id, value["provider_generation"], "absent", "verified"))
     print(json.dumps({"service_id": service_id, "state": "absent", "cleanup": "verified"}, sort_keys=True))
     return 0
@@ -870,12 +1003,31 @@ def parser() -> argparse.ArgumentParser:
     acquire_parser.add_argument("--region", default="oregon")
     acquire_parser.add_argument("--timeout-seconds", type=float, default=600.0)
     acquire_parser.add_argument("--poll-seconds", type=float, default=5.0)
+    acquire_parser.add_argument(
+        "--available-until-epoch", type=int, required=True,
+        help="Absolute epoch through which the client lane may use the lease.",
+    )
     acquire_parser.set_defaults(handler=acquire)
     cleanup_parser = commands.add_parser("cleanup")
     cleanup_parser.add_argument("--lease", type=Path)
     cleanup_parser.add_argument("--journal", type=Path, required=True)
     cleanup_parser.add_argument("--request", type=Path)
     cleanup_parser.add_argument("--owner-id")
+    cleanup_parser.add_argument(
+        "--api-timeout-seconds",
+        type=float,
+        default=_CLEANUP_API_TIMEOUT_SECONDS,
+    )
+    cleanup_parser.add_argument(
+        "--api-retry-attempts",
+        type=int,
+        default=_CLEANUP_API_RETRY_ATTEMPTS,
+    )
+    cleanup_parser.add_argument(
+        "--api-retry-backoff-seconds",
+        type=float,
+        default=_CLEANUP_API_RETRY_BACKOFF_SECONDS,
+    )
     cleanup_parser.set_defaults(handler=cleanup)
     testing_parser = commands.add_parser("begin-testing")
     testing_parser.add_argument("--lease", type=Path, required=True)

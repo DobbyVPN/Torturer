@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
@@ -36,13 +37,14 @@ class FunctionalAndroidWorkflowPolicyTest(unittest.TestCase):
         self.assertNotRegex(self.text, r"(?m)^  (?:push|pull_request|pull_request_target|schedule):")
         self.assertRegex(self.text, r"(?m)^    runs-on: ubuntu-24\.04$")
         client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
-        self.assertRegex(client, r"(?m)^    timeout-minutes: 20$")
+        self.assertRegex(client, r"(?m)^    timeout-minutes: 30$")
         self.assertIn("deadline = int(started.timestamp()) + 30 * 60", self.text)
         self.assertIn('if [ "$remaining" -lt 980 ]', self.text)
         self.assertIn("Eight applicable scenarios plus ten resets", self.text)
         self.assertIn('if [ "$remaining" -gt 1200 ]', self.text)
         self.assertIn("hosted.deadline", self.text)
         self.assertIn("--kill-grace-seconds 30", self.text)
+        self.assertIn('--lane-timeout-seconds "$remaining"', self.text)
 
     def test_actions_are_immutable_and_minimal(self) -> None:
         self.assertEqual(set(self.uses), EXPECTED_ACTIONS)
@@ -52,8 +54,6 @@ class FunctionalAndroidWorkflowPolicyTest(unittest.TestCase):
 
     def test_build_is_secretless_and_stages_exact_apk_closure(self) -> None:
         build = self.text[self.text.index("  build:"):self.text.index("\n\n  client:")]
-        self.assertNotIn("GH_TOKEN", build)
-        self.assertNotIn("github.token", build)
         self.assertNotIn("secrets.", build)
         self.assertIn(":app:assembleDebug :app:assembleDebugAndroidTest", build)
         self.assertIn("candidate.py stage", build)
@@ -62,7 +62,8 @@ class FunctionalAndroidWorkflowPolicyTest(unittest.TestCase):
 
     def test_android_build_children_share_the_run_start_deadline(self) -> None:
         build = self.text[self.text.index("  build:"):self.text.index("\n\n  client:")]
-        self.assertIn("WORKFLOW_RUN_STARTED_AT: ${{ github.run_started_at }}", build)
+        self.assertNotIn("WORKFLOW_RUN_STARTED_AT", build)
+        self.assertNotIn("github.run_started_at", self.text)
         self.assertIn("android-build-run-with-deadline.sh", build)
         self.assertIn('android_build_deadline_child configured=', build)
         for command in (
@@ -74,6 +75,29 @@ class FunctionalAndroidWorkflowPolicyTest(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assertIn(command, build)
+
+    def test_android_build_deadline_uses_verified_origin_run_before_untrusted_commands(self) -> None:
+        build = self.text[self.text.index("  build:"):self.text.index("\n\n  client:")]
+        trusted_checkout = build.index("- name: Check out exact trusted Torturer revision")
+        trusted_verify = build.index("- name: Verify exact trusted Torturer helper checkout")
+        deadline = build.index("- name: Establish build run-start deadline")
+        candidate_checkout = build.index("- name: Check out exact untrusted DobbyVPN candidate")
+        self.assertLess(trusted_checkout, trusted_verify)
+        self.assertLess(trusted_verify, deadline)
+        self.assertLess(deadline, candidate_checkout)
+        deadline_block = build[deadline:candidate_checkout]
+        self.assertIn("actions: read", build[:build.index("env:", build.index("  build:"))])
+        self.assertIn("GH_TOKEN: ${{ github.token }}", deadline_block)
+        self.assertIn('private-gh-api.sh" 30 origin-run', deadline_block)
+        self.assertIn('"repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"', deadline_block)
+        self.assertIn('android-build-deadline', deadline_block)
+        self.assertIn('origin-run.json', deadline_block)
+        self.assertIn('value.get("id") != int(os.environ["GITHUB_RUN_ID"])', deadline_block)
+        self.assertIn('value.get("run_started_at")', deadline_block)
+        self.assertIn('deadline = int(started.timestamp()) + 30 * 60', deadline_block)
+        self.assertIn('unset GH_TOKEN', deadline_block)
+        self.assertLess(build.index('unset GH_TOKEN', deadline), candidate_checkout)
+        self.assertNotIn("secrets.", deadline_block)
 
     def test_kvm_emulator_and_provenance_precede_candidate_execution(self) -> None:
         client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
@@ -164,6 +188,7 @@ class FunctionalAndroidWorkflowPolicyTest(unittest.TestCase):
             "platform": "android",
             "source_sha": "d" * 40,
             "state": "issued",
+            "available_until_epoch": 2_000_000_000,
             "services": [
                 {
                     "role": "outline",
@@ -540,6 +565,82 @@ class FunctionalAndroidWorkflowPolicyTest(unittest.TestCase):
             self.assertIn(field, cleanup)
         self.assertIn("android-emulator-exit-summary.txt", self.text)
 
+    def test_android_command_diagnostic_excludes_decoded_command_bodies(self) -> None:
+        start = (
+            '          "$DEADLINE_COMMAND" --reserve 70 10 python3 - '
+            '"$HANDOFF_DIR/hosted-command-raw" "$diagnostic" "$transport_summary" <<\'PY\'\n'
+        )
+        body = self.text.split(start, 1)[1].split("\n          PY\n", 1)[0]
+        diagnostic = self.text[self.text.index("- name: Report safe Android command diagnostics"):self.text.index(
+            "- name: Upload safe Android command diagnostics"
+        )]
+        for forbidden in ("safe_stderr_display", "stderr_display", "json.dumps"):
+            self.assertNotIn(forbidden, diagnostic)
+        for field in (
+            "operation=",
+            "code=",
+            "returncode=",
+            "stdout_bytes=",
+            "stderr_bytes=",
+            "stderr_code=",
+            "stderr_sha256=",
+            "raw_bytes=",
+        ):
+            self.assertIn(field, diagnostic)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw_dir = root / "hosted-command-raw"
+            raw_dir.mkdir()
+            raw = (
+                b"argv=adb shell logcat -d\n"
+                b"returncode=7\n"
+                b"stdout-begin\nstdout-body SECRET_PUBLIC_IP=198.51.100.42\nstdout-end\n"
+                b"stderr-begin\nhttps://profile.example/upload?secret=not-for-public-output\n"
+                b"stderr-end\n"
+            )
+            raw_path = raw_dir / "command-001.raw.log"
+            raw_path.write_bytes(raw)
+            output = root / "diagnostic.txt"
+            summary = root / "summary.txt"
+            script = root / "diagnostic.py"
+            script.write_text(textwrap.dedent(body), encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(script), str(raw_dir), str(output), str(summary)],
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            safe_output = output.read_text(encoding="ascii")
+            safe_summary = summary.read_text(encoding="ascii")
+            for body_text in (
+                "SECRET_PUBLIC_IP",
+                "198.51.100.42",
+                "https://profile.example/upload?secret=not-for-public-output",
+            ):
+                self.assertNotIn(body_text, safe_output)
+                self.assertNotIn(body_text, safe_summary)
+            for field in (
+                "operation=logcat",
+                "code=COMMAND_FAILED",
+                "returncode=7",
+                "stdout_bytes=",
+                "stderr_bytes=",
+                "stderr_code=NONEMPTY",
+                "stderr_sha256=",
+                "raw_bytes=",
+            ):
+                self.assertIn(field, safe_output)
+            self.assertIn("transport_state=ADB_LOGCAT_COMMAND_FAILED", safe_summary)
+            self.assertEqual(raw_path.read_bytes(), raw)
+
+        upload = self.text[self.text.index("- name: Upload safe Android command diagnostics"):self.text.index(
+            "- name: Upload safe Android emulator and transport summary"
+        )]
+        self.assertIn("android-command-diagnostic.txt", upload)
+        self.assertIn("android-transport-summary.txt", upload)
+        self.assertNotIn("hosted-command-raw", upload)
+
     def test_android_emulator_exit_record_is_owner_only_and_atomic(self) -> None:
         client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
         launcher = client[client.index("emulator-launcher.sh"):client.index(
@@ -703,16 +804,25 @@ class FunctionalAndroidWorkflowPolicyTest(unittest.TestCase):
 
     def test_cleanup_and_completion_are_unconditional(self) -> None:
         stop = self.text.index("- name: Stop Android emulator")
-        remove = self.text.index("- name: Remove plaintext handoff material")
+        remove = self.text.index("- name: Remove plaintext handoff material and prepare completion marker")
         result = self.text.index("- name: Upload safe Android functional result")
-        marker = self.text.index("- name: Publish opaque Android completion marker")
+        marker = self.text.index("id: post_lane_marker_prepare")
+        self.assertLess(remove, marker)
+        marker_upload = self.text.index("- name: Upload opaque Android completion marker")
+        diagnostics = self.text.index("- name: Report safe Android command diagnostics")
+        diagnostics_upload = self.text.index("- name: Upload safe Android command diagnostics")
         self.assertLess(stop, remove)
-        self.assertLess(remove, result)
+        self.assertLess(marker, marker_upload)
+        self.assertLess(marker_upload, diagnostics)
+        self.assertLess(diagnostics, diagnostics_upload)
+        self.assertLess(marker_upload, self.text.index("- name: Upload safe Android emulator and transport summary"))
+        self.assertLess(diagnostics_upload, result)
+        self.assertLess(stop, result)
+        self.assertIn("if: always()", self.text[remove:marker_upload])
         self.assertIn("if: always()", self.text[stop:result])
-        self.assertIn("if: always()", self.text[result:marker])
-        self.assertIn("if: always()", self.text[marker:])
+        self.assertIn("if: always()", self.text[result:])
         self.assertIn("android_emulator_shutdown_requested", self.text[stop:result])
-        result_upload = self.text[result:marker]
+        result_upload = self.text[result:self.text.index("\n\n  controller:", result)]
         self.assertNotIn("profile.cms", result_upload)
         self.assertNotIn("upload.cms", result_upload)
         self.assertNotIn("upload-url.txt", result_upload)

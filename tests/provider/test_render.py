@@ -100,6 +100,40 @@ class PartialCreateTransport:
         raise AssertionError((method, path, payload))
 
 
+class LegacyLostCreateTransport:
+    def __init__(self, *, full_page: bool = False, ambiguous: bool = False) -> None:
+        self.full_page = full_page
+        self.ambiguous = ambiguous
+        self.calls: list[tuple[str, str]] = []
+        self.deleted: list[str] = []
+
+    def request(self, method, path, payload, headers):
+        self.calls.append((method, path))
+        if method == "POST" and path == "/services":
+            raise RENDER.RenderAPIError("TRANSPORT_ERROR")
+        if method == "GET" and path.startswith("/services?"):
+            record = {
+                "id": "srv-orphan123",
+                "name": "dobby-test-123",
+                "ownerId": "tea-test123",
+                "type": "web_service",
+                "createdAt": "2026-08-23T00:00:00Z",
+            }
+            if self.full_page:
+                return RENDER.HTTPResponse(
+                    200,
+                    [{"service": record, "cursor": f"cursor-{index}"} for index in range(100)],
+                )
+            records = [record]
+            if self.ambiguous:
+                records.append({**record, "id": "srv-stale123"})
+            return RENDER.HTTPResponse(200, [{"service": value} for value in records])
+        if method == "DELETE":
+            self.deleted.append(path)
+            return RENDER.HTTPResponse(204, {})
+        raise AssertionError((method, path, payload))
+
+
 class PendingTransport(FakeTransport):
     def request(self, method, path, payload, headers):
         if method == "GET" and path == "/services/srv-test123":
@@ -236,6 +270,78 @@ class RenderControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(RENDER.RenderAPIError, "INVALID_SERVICE_LIST"):
             api.list_services("tea-test123")
 
+    def test_cleanup_service_listing_fails_closed_after_its_single_budgeted_page(self) -> None:
+        class FullPageTransport:
+            def request(self, method, path, payload, headers):
+                self.last_path = path
+                record = {
+                    "id": "srv-page123",
+                    "name": "dobby-page-123",
+                    "ownerId": "tea-test123",
+                    "type": "web_service",
+                    "createdAt": "2026-08-23T00:00:00Z",
+                }
+                return RENDER.HTTPResponse(
+                    200,
+                    [
+                        {"service": record, "cursor": f"cursor-{index}"}
+                        for index in range(100)
+                    ],
+                )
+
+        api = RENDER.RenderAPI(
+            "fixture-token",
+            transport=FullPageTransport(),
+            service_list_max_pages=1,
+        )
+        with self.assertRaisesRegex(
+            RENDER.RenderAPIError,
+            "SERVICE_LIST_PAGINATION_LIMIT",
+        ):
+            api.list_services("tea-test123")
+
+    def test_reaper_rejects_more_tagged_candidates_than_the_cleanup_budget(self) -> None:
+        prefix = "dobby-torturer-" + "a" * 32 + "-linux-"
+
+        class CandidateAPI:
+            def __init__(self) -> None:
+                self.deleted: list[str] = []
+
+            def list_services(self, owner_id: str):
+                return (
+                    RENDER.RenderServiceRecord(
+                        "srv-first123",
+                        prefix + "a",
+                        owner_id,
+                        "web_service",
+                        "2026-08-23T00:00:00Z",
+                    ),
+                    RENDER.RenderServiceRecord(
+                        "srv-second123",
+                        prefix + "b",
+                        owner_id,
+                        "web_service",
+                        "2026-08-23T00:00:00Z",
+                    ),
+                )
+
+            def delete_service(self, service_id: str) -> bool:
+                self.deleted.append(service_id)
+                return True
+
+            def exists(self, service_id: str) -> bool:
+                return False
+
+        api = CandidateAPI()
+        with self.assertRaisesRegex(RENDER.RenderAPIError, "REAPER_CANDIDATE_LIMIT"):
+            RENDER.RenderReaper(api).reap_tagged(
+                "tea-test123",
+                prefix,
+                older_than_seconds=0,
+                max_candidates=1,
+            )
+        self.assertEqual(api.deleted, [])
+
     def test_malformed_create_response_triggers_exact_name_cleanup_and_absence_proof(self) -> None:
         transport = PartialCreateTransport()
         api = RENDER.RenderAPI("fixture-token", transport=transport, retry_backoff_seconds=0)
@@ -248,6 +354,48 @@ class RenderControllerTests(unittest.TestCase):
             sum(method == "GET" and path.startswith("/services?") for method, path in transport.calls),
             2,
         )
+
+    def test_legacy_lost_create_recovery_uses_bounded_one_page_cleanup_client(self) -> None:
+        acquisition_transport = LegacyLostCreateTransport()
+        cleanup_transport = LegacyLostCreateTransport(full_page=True)
+        acquisition_api = RENDER.RenderAPI("fixture-token", transport=acquisition_transport)
+        cleanup_api = RENDER.RenderAPI(
+            "fixture-token",
+            transport=cleanup_transport,
+            timeout_seconds=5,
+            retry_attempts=2,
+            retry_backoff_seconds=0.5,
+            service_list_max_pages=1,
+        )
+        controller = RENDER.DisposableRenderController(acquisition_api, cleanup_api=cleanup_api)
+        with self.assertRaisesRegex(RENDER.RenderAPIError, "CREATE_CLEANUP_FAILED"):
+            controller.acquire(spec(), timeout_seconds=5, poll_seconds=1)
+        list_paths = [path for method, path in cleanup_transport.calls if method == "GET"]
+        self.assertEqual(len(list_paths), 1)
+        self.assertTrue(all("cursor=" not in path for path in list_paths))
+        self.assertEqual(cleanup_transport.deleted, [])
+
+    def test_legacy_lost_create_recovery_rejects_ambiguous_candidates_without_delete(self) -> None:
+        acquisition_transport = LegacyLostCreateTransport()
+        cleanup_transport = LegacyLostCreateTransport(ambiguous=True)
+        acquisition_api = RENDER.RenderAPI("fixture-token", transport=acquisition_transport)
+        cleanup_api = RENDER.RenderAPI(
+            "fixture-token",
+            transport=cleanup_transport,
+            timeout_seconds=5,
+            retry_attempts=2,
+            retry_backoff_seconds=0.5,
+            service_list_max_pages=1,
+        )
+        controller = RENDER.DisposableRenderController(acquisition_api, cleanup_api=cleanup_api)
+        with self.assertRaisesRegex(RENDER.RenderAPIError, "CREATE_CLEANUP_FAILED"):
+            controller.acquire(spec(), timeout_seconds=5, poll_seconds=1)
+        self.assertEqual(
+            sum(method == "GET" for method, _path in cleanup_transport.calls),
+            1,
+        )
+        self.assertEqual(cleanup_transport.deleted, [])
+        self.assertTrue(all(method != "DELETE" for method, _path in cleanup_transport.calls))
 
     def test_cancellation_during_readiness_still_deletes_service(self) -> None:
         class Cancelled(BaseException):

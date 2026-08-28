@@ -198,7 +198,7 @@ class HostedMacOSRouteTests(unittest.TestCase):
             with self.assertRaisesRegex(MacOSRouteError, "DEFAULT_ROUTE_BASELINE_MISSING"):
                 decide_restore(None, MacOSRouteProbe(0, None, True), service_dead=True)
 
-    def test_service_probe_is_bound_to_pid_start_identity_and_command(self) -> None:
+    def test_legacy_lstart_identity_is_rejected_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="macos-route-identity-") as directory:
             root = Path(directory)
             probe = root / "service-probe.raw.log"
@@ -214,9 +214,31 @@ class HostedMacOSRouteTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            with self.assertRaisesRegex(
+                MacOSRouteError, "DEFAULT_ROUTE_SERVICE_IDENTITY_INVALID"
+            ):
+                _service_is_dead(123, 10, probe, identity)
+
+    def test_service_probe_uses_precise_native_identity_when_available(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="macos-route-native-identity-") as directory:
+            root = Path(directory)
+            probe = root / "service-probe.raw.log"
+            identity = root / "service.identity.json"
+            identity.write_text(
+                json.dumps({
+                    "pid": 123,
+                    "start": "100.000001",
+                    "native_start": "100.000001",
+                    "command": "/candidate/macos_grpcvpnserver",
+                }),
+                encoding="utf-8",
+            )
+
             def capture(command, path, timeout_seconds):
+                self.assertIn("python3", command)
                 path.write_text(
-                    "123 Wed Aug 27 12:34:56 2026 /candidate/macos_grpcvpnserver -port 50051\n",
+                    "service_identity=123|100.000001\n"
+                    "service_path=/candidate/macos_grpcvpnserver\n",
                     encoding="utf-8",
                 )
                 return 0
@@ -224,20 +246,41 @@ class HostedMacOSRouteTests(unittest.TestCase):
             with mock.patch("torturer_checks.hosted.macos_route._capture", side_effect=capture):
                 self.assertFalse(_service_is_dead(123, 10, probe, identity))
 
+    def test_optional_identity_probe_accepts_normal_absent_process_result(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="macos-route-absent-service-") as directory:
+            probe = Path(directory) / "service-probe.raw.log"
+
+            def capture(command, path, timeout_seconds):
+                self.assertNotIn("python3", command)
+                path.write_text("", encoding="utf-8")
+                return 1
+
+            with mock.patch("torturer_checks.hosted.macos_route._capture", side_effect=capture):
+                self.assertTrue(_service_is_dead(123, 10, probe))
+
+    def test_native_probe_empty_returncode_one_is_probe_failure(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="macos-route-native-probe-failure-") as directory:
+            root = Path(directory)
+            probe = root / "service-probe.raw.log"
+            identity = root / "service.identity.json"
             identity.write_text(
-                json.dumps(
-                    {
-                        "pid": 123,
-                        "start": "Wed Aug 27 12:34:57 2026",
-                        "command": "/candidate/macos_grpcvpnserver -port 50051",
-                    }
-                ),
+                json.dumps({
+                    "pid": 123,
+                    "start": "100.000001",
+                    "native_start": "100.000001",
+                    "command": "/candidate/macos_grpcvpnserver",
+                }),
                 encoding="utf-8",
             )
+
+            def capture(command, path, timeout_seconds):
+                path.write_text("", encoding="utf-8")
+                return 1
+
             with (
                 mock.patch("torturer_checks.hosted.macos_route._capture", side_effect=capture),
                 self.assertRaisesRegex(
-                    MacOSRouteError, "DEFAULT_ROUTE_SERVICE_IDENTITY_MISMATCH"
+                    MacOSRouteError, "DEFAULT_ROUTE_SERVICE_PROBE_FAILED"
                 ),
             ):
                 _service_is_dead(123, 10, probe, identity)

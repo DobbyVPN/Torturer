@@ -28,7 +28,9 @@ The allowed boundary is:
   before any ciphertext is decrypted. The lease/artifact correlation ID is a
   deterministic hash of run, platform, and `source_sha`, so two source
   revisions cannot address the same replay identity. The lease record contains
-  only safe service identity/provenance fields.
+  only safe service identity/provenance fields and the provider's absolute
+  `available_until_epoch` timing value. It contains no endpoint, credential,
+  profile, or configuration bytes.
 - The client decrypts the ciphertext locally, uses the plaintext only from
   owner-only storage, and removes the plaintext and private key unconditionally.
   Raw command and service diagnostics remain private; the public functional

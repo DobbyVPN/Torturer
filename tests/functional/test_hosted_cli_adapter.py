@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import gc
 import hashlib
+import io
 import os
 import signal
 import socket
@@ -15,6 +17,7 @@ import unittest
 import warnings
 from unittest import mock
 
+import torturer_checks.hosted.run as hosted_run
 from torturer_checks.hosted.android import AndroidHostedAdapter
 from torturer_checks.hosted.cli import (
     CommandResult,
@@ -37,6 +40,7 @@ from torturer_checks.hosted.linux import (
     LinuxHostedAdapter,
     LinuxServiceProcessController,
     _SERVICE_LAUNCH_SCRIPT,
+    _parse_linux_process_census,
 )
 from torturer_checks.hosted.factory import (
     adapter_for_platform,
@@ -47,7 +51,9 @@ from torturer_checks.hosted.windows import WindowsHostedAdapter
 from torturer_checks.hosted.run import (
     EXPECTED_UNAVAILABLE_BY_PLATFORM,
     _coverage_contract,
+    _diagnostic_code,
     _expected_unavailable,
+    _finalize_adapter,
     _partition_applicable,
     _qualification_exit_code,
     _run_scenarios,
@@ -636,6 +642,7 @@ class HostedCLIAdapterTests(unittest.TestCase):
             "--source-repository", "DobbyVPN/DobbyVPN", "--source-sha", "a" * 40,
             "--platform-version", "24.04",
             "--candidate-manifest", str(self.cli), "--server-image-digest", "sha256:" + "b" * 64,
+            "--lane-timeout-seconds", "1800",
             "--output", str(self.directory.name + "/result.json"), "--scenario-id",
             "functional.configure", "--scenario-id", "functional.disconnect-cleanup",
             "--expected-unavailable",
@@ -646,6 +653,274 @@ class HostedCLIAdapterTests(unittest.TestCase):
             parsed.expected_unavailable,
             ["functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED"],
         )
+
+    def test_hosted_lane_timeout_is_required_and_strict(self) -> None:
+        arguments = [
+            "--platform", "linux",
+            "--profile", str(self.profile),
+            "--source-repository", "DobbyVPN/DobbyVPN",
+            "--source-sha", "a" * 40,
+            "--platform-version", "24.04",
+            "--candidate-manifest", str(self.cli),
+            "--server-image-digest", "sha256:" + "b" * 64,
+            "--output", str(self.directory.name + "/result.json"),
+        ]
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(arguments)
+        for value in ("0", "-1", "1800.1", "nan", "inf"):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                build_parser().parse_args(arguments + ["--lane-timeout-seconds", value])
+        parsed = build_parser().parse_args(
+            arguments + ["--lane-timeout-seconds", "1800"]
+        )
+        self.assertEqual(parsed.lane_timeout_seconds, 1800.0)
+
+    def test_hosted_lane_timeout_accounts_for_reset_and_finalization_tail(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requested lane bound"):
+            _select_scenarios(["functional.configure"], lane_timeout_seconds=54)
+        self.assertEqual(
+            len(_select_scenarios(["functional.configure"], lane_timeout_seconds=55)),
+            1,
+        )
+        with self.assertRaisesRegex(ValueError, "requested lane bound"):
+            _select_scenarios(None, lane_timeout_seconds=1231)
+        self.assertEqual(
+            _select_scenarios(None, lane_timeout_seconds=1232),
+            scenario_catalog(),
+        )
+
+    def test_hosted_lane_budget_uses_platform_capabilities_and_declared_minimum(self) -> None:
+        all_capabilities = frozenset(Capability)
+        self.assertEqual(
+            _select_scenarios(
+                None,
+                lane_timeout_seconds=1232,
+                capabilities=all_capabilities,
+                platform="linux",
+            ),
+            scenario_catalog(),
+        )
+        with self.assertRaisesRegex(ValueError, "requested lane bound"):
+            _select_scenarios(
+                None,
+                lane_timeout_seconds=1231,
+                capabilities=all_capabilities,
+                platform="linux",
+            )
+
+        desktop_capabilities = all_capabilities - {
+            Capability.NETWORK_TRANSITION,
+            Capability.SLEEP_WAKE,
+        }
+        android_capabilities = all_capabilities - {
+            Capability.NETWORK_TRANSITION,
+            Capability.ENDURANCE,
+        }
+        for platform, capabilities, minimum in (
+            ("linux", desktop_capabilities, 1010),
+            ("windows", desktop_capabilities, 1010),
+            ("macos", desktop_capabilities, 1010),
+            ("android", android_capabilities, 980),
+        ):
+            with self.subTest(platform=platform):
+                self.assertEqual(
+                    len(
+                        _select_scenarios(
+                            None,
+                            lane_timeout_seconds=minimum,
+                            capabilities=capabilities,
+                            platform=platform,
+                        )
+                    ),
+                    10,
+                )
+                with self.assertRaisesRegex(ValueError, "requested lane bound"):
+                    _select_scenarios(
+                        None,
+                        lane_timeout_seconds=minimum - 1,
+                        capabilities=capabilities,
+                        platform=platform,
+                    )
+
+    def test_linux_candidate_identity_probes_share_one_absolute_deadline(self) -> None:
+        class ProbeRunner:
+            def __init__(self) -> None:
+                self.timeouts: list[float] = []
+
+            def run(self, command, *, timeout_seconds):
+                argv = tuple(command)
+                self.timeouts.append(float(timeout_seconds))
+                if argv[2:4] == ("readlink", "-f"):
+                    return CommandResult(argv, 0, b"/synthetic/service\n", b"")
+                if argv[2:4] == ("sh", "-c") and argv[-1] == "731":
+                    return CommandResult(
+                        argv,
+                        0,
+                        b"731 (service) S 1 306 306 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12345\n",
+                        b"",
+                    )
+                raise AssertionError(argv)
+
+        controller = object.__new__(LinuxServiceProcessController)
+        controller.pid = 731
+        controller.binary = Path("/synthetic/service")
+        controller.runner = ProbeRunner()
+        controller._initial_identity = ("12345", 306)
+        controller._replacement_identity = None
+        with mock.patch(
+            "torturer_checks.hosted.linux.time.monotonic",
+            side_effect=[100.0, 100.0, 101.0],
+        ):
+            controller._verify_candidate_pid(5.0)
+        self.assertEqual(controller.runner.timeouts, [5.0, 4.0])
+
+    def test_linux_restart_recomputes_timeout_between_verify_and_kill(self) -> None:
+        controller = object.__new__(LinuxServiceProcessController)
+        controller.pid = 731
+        controller._verify_candidate_pid = mock.Mock()
+        controller._sudo = mock.Mock(
+            return_value=CommandResult(("sudo",), 0, b"", b"")
+        )
+        controller._wait_dead = mock.Mock()
+        controller._start = mock.Mock()
+        with mock.patch(
+            "torturer_checks.hosted.linux.time.monotonic",
+            side_effect=[100.0, 100.0, 101.0, 102.0, 103.0, 104.0],
+        ):
+            controller.restart_after_loss(5.0)
+        self.assertEqual(
+            controller._verify_candidate_pid.call_args_list,
+            [mock.call(5.0), mock.call(4.0)],
+        )
+        self.assertEqual(controller._sudo.call_args.args[1], 3.0)
+        self.assertEqual(controller._wait_dead.call_args.args[0], 2.0)
+        self.assertEqual(controller._start.call_args.args[0], 1.0)
+
+    def test_linux_process_census_rejects_duplicate_or_extra_fields(self) -> None:
+        valid = "731 1 731 S\n"
+        self.assertEqual(len(_parse_linux_process_census(valid)), 1)
+        with self.assertRaises(ValueError):
+            _parse_linux_process_census(valid + valid)
+        with self.assertRaises(ValueError):
+            _parse_linux_process_census("731 1 731 S unexpected\n")
+        with self.assertRaises(ValueError):
+            _parse_linux_process_census("731 1 731 R+\n")
+
+    def test_linux_liveness_does_not_turn_a_ps_probe_error_into_absence(self) -> None:
+        controller = object.__new__(LinuxServiceProcessController)
+        controller.pid = 731
+        controller._sudo = mock.Mock(
+            side_effect=(
+                CommandResult(("sudo",), 0, b"", b""),
+                CommandResult(("sudo",), 1, b"", b""),
+            )
+        )
+        with self.assertRaisesRegex(ScenarioExecutionError, "SERVICE_PROBE_FAILED"):
+            controller._alive(1.0)
+        controller._sudo = mock.Mock(
+            side_effect=(
+                CommandResult(("sudo",), 1, b"", b"permission denied\n"),
+                CommandResult(("sudo",), 1, b"", b""),
+            )
+        )
+        with self.assertRaisesRegex(ScenarioExecutionError, "SERVICE_PROBE_FAILED"):
+            controller._alive(1.0)
+
+    def test_linux_partial_restart_commits_identity_before_readiness(self) -> None:
+        root = Path(self.directory.name)
+        binary = root / "service-partial"
+        binary.write_bytes(b"synthetic service")
+        binary.chmod(0o700)
+        raw_directory = root / "service-partial-raw"
+        raw_directory.mkdir(mode=0o700)
+
+        class Launcher:
+            def run(self, command, *, timeout_seconds):
+                argv = tuple(command)
+                if argv[2:5] == ("sh", "-c", _SERVICE_LAUNCH_SCRIPT):
+                    return CommandResult(argv, 0, b"794\n", b"")
+                if argv[2:4] == ("readlink", "-f"):
+                    return CommandResult(
+                        argv, 0, (str(binary.resolve()) + "\n").encode(), b""
+                    )
+                raise AssertionError(argv)
+
+        controller = object.__new__(LinuxServiceProcessController)
+        controller.pid = 793
+        controller.binary = binary
+        controller.socket = root / "partial.sock"
+        controller.library_path = None
+        controller.pid_file = root / "partial.pid"
+        controller.runner = Launcher()
+        controller.raw_directory = raw_directory
+        controller._restart_number = 0
+        controller._initial_identity = None
+        controller._replacement_identity = None
+        controller._replacement_tree = ()
+        events: list[str] = []
+        controller._candidate_process_identity = mock.Mock(
+            return_value=("12399", 794)
+        )
+        controller._verify_candidate_pid = mock.Mock(
+            side_effect=lambda _timeout: (events.append("verify"), ("12399", 794))[1]
+        )
+        controller._write_pid = mock.Mock(side_effect=lambda _pid: events.append("write"))
+        controller._alive = mock.Mock(return_value=False)
+        with self.assertRaisesRegex(ScenarioExecutionError, "SERVICE_RESTART_EXITED"):
+            controller._start(5.0)
+        controller._verify_candidate_pid.assert_called_once()
+        self.assertEqual(controller._replacement_identity, ("12399", 794))
+        self.assertEqual(events, ["verify", "write"])
+
+    def test_linux_process_identity_probe_requires_explicit_absence_marker(self) -> None:
+        controller = object.__new__(LinuxServiceProcessController)
+        controller.runner = mock.Mock()
+        controller.runner.run.return_value = CommandResult(
+            ("sudo",), 1, b"", b""
+        )
+        with self.assertRaisesRegex(ScenarioExecutionError, "SERVICE_TREE_PROBE_FAILED"):
+            controller._read_process_stat(731, 1.0)
+        controller.runner.run.return_value = CommandResult(
+            ("sudo",), 2, b"service_probe_absent\n", b""
+        )
+        self.assertIsNone(controller._read_process_stat(731, 1.0))
+
+    def test_linux_initial_identity_sidecar_rejects_same_binary_pid_reuse(self) -> None:
+        root = Path(self.directory.name)
+        binary = root / "service-initial-identity"
+        binary.write_bytes(b"synthetic service")
+        binary.chmod(0o700)
+        raw_directory = root / "service-initial-identity-raw"
+        raw_directory.mkdir(mode=0o700)
+        identity_file = root / "service.identity"
+        identity_file.write_text("731|12345|306\n", encoding="ascii")
+        identity_file.chmod(0o600)
+
+        class ReusedPIDRunner:
+            def run(self, command, *, timeout_seconds):
+                argv = tuple(command)
+                if argv[2:4] == ("readlink", "-f"):
+                    return CommandResult(argv, 0, (str(binary) + "\n").encode(), b"")
+                if argv[2:4] == ("sh", "-c"):
+                    return CommandResult(
+                        argv,
+                        0,
+                        b"731 (service) S 1 306 306 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 99999\n",
+                        b"",
+                    )
+                raise AssertionError(argv)
+
+        with self.assertRaisesRegex(HostedAdapterError, "SERVICE_PID_NOT_CANDIDATE"):
+            LinuxServiceProcessController(
+                pid=731,
+                binary=binary,
+                socket=root / "service-initial-identity.sock",
+                library_path=None,
+                pid_file=root / "service-initial-identity.pid",
+                identity_file=identity_file,
+                runner=ReusedPIDRunner(),
+                raw_directory=raw_directory,
+            )
 
     def test_hosted_runner_accounts_for_one_reset_after_every_selected_scenario(self) -> None:
         scenarios = _select_scenarios([
@@ -664,6 +939,10 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertEqual(selected, scenario_catalog())
         total_seconds = sum(item.max_duration_seconds for item in selected) + 5 * len(selected)
         self.assertEqual(total_seconds, 1202)
+        self.assertEqual(
+            total_seconds + hosted_run._FINALIZE_TIMEOUT_SECONDS,
+            1232,
+        )
 
     def test_default_lane_partitions_all_applicable_and_unsupported_scenarios(self) -> None:
         selected = _select_scenarios(None)
@@ -769,6 +1048,33 @@ class HostedCLIAdapterTests(unittest.TestCase):
                     _qualification_exit_code(results, unsupported, [], coverage=coverage),
                     2,
                 )
+
+    def test_unexpected_missing_capability_cannot_become_a_coverage_pass(self) -> None:
+        selected, results, unsupported, expected, _ = self._linux_coverage_fixture()
+        unexpected = next(
+            item for item in results
+            if item["scenario_id"] == "functional.core-connection"
+        )
+        unexpected.update({"outcome": "unavailable", "reason_code": "UNEXPECTED_GAP"})
+        unsupported.append({
+            "scenario_id": "functional.core-connection",
+            "missing_capabilities": ["connect"],
+            "reason_code": "UNEXPECTED_GAP",
+        })
+        coverage = _coverage_contract(
+            "linux",
+            selected,
+            results,
+            unsupported,
+            expected,
+            reset_count=len(selected),
+            reset_failures=0,
+        )
+        self.assertEqual(coverage["status"], "coverage-contract-failed")
+        self.assertEqual(
+            _qualification_exit_code(results, unsupported, [], coverage=coverage),
+            2,
+        )
 
     def test_coverage_result_is_explicitly_incomplete_and_records_exact_pairs(self) -> None:
         _, _, _, _, coverage = self._linux_coverage_fixture()
@@ -909,6 +1215,632 @@ class HostedCLIAdapterTests(unittest.TestCase):
         self.assertEqual(service.timeouts, [])
         self.assertEqual(self.runner.calls, [])
 
+    def test_linux_adapter_finalization_stops_the_deliberately_restarted_service(self) -> None:
+        class FakeService:
+            def __init__(self) -> None:
+                self.timeouts: list[float] = []
+
+            def stop_restarted_service(self, timeout: float) -> None:
+                self.timeouts.append(timeout)
+
+        adapter = LinuxHostedAdapter(
+            cli=self.cli,
+            profile=self.profile,
+            runner=self.runner,
+        )
+        service = FakeService()
+        adapter.service = service  # type: ignore[assignment]
+        adapter.finalize(12.5)
+        self.assertEqual(service.timeouts, [12.5])
+
+    def test_hosted_run_finalization_uses_the_remaining_lane_budget(self) -> None:
+        class FakeAdapter:
+            def __init__(self) -> None:
+                self.timeouts: list[float] = []
+
+            def finalize(self, *, timeout_seconds: float) -> None:
+                self.timeouts.append(timeout_seconds)
+
+        adapter = FakeAdapter()
+        with mock.patch(
+            "torturer_checks.hosted.run.time.monotonic",
+            return_value=100.0,
+        ):
+            _finalize_adapter(adapter, 112.5)
+        self.assertEqual(adapter.timeouts, [12.5])
+
+    def test_hosted_run_passes_the_canonical_absolute_deadline_to_finalizer(self) -> None:
+        class DeadlineAdapter:
+            def __init__(self) -> None:
+                self.deadlines: list[float | None] = []
+
+            def finalize(self, *, timeout_seconds: float, deadline: float | None) -> None:
+                self.deadlines.append(deadline)
+
+        adapter = DeadlineAdapter()
+        with mock.patch(
+            "torturer_checks.hosted.run.time.monotonic",
+            return_value=100.0,
+        ):
+            _finalize_adapter(adapter, 112.5)
+        self.assertEqual(adapter.deadlines, [112.5])
+
+    def test_hosted_run_rejects_an_adapter_without_a_finalizer(self) -> None:
+        with self.assertRaisesRegex(ValueError, "ADAPTER_FINALIZER_UNAVAILABLE"):
+            _finalize_adapter(object(), None)
+
+    def test_hosted_run_diagnostics_keep_only_stable_reason_codes(self) -> None:
+        self.assertEqual(
+            _diagnostic_code(ScenarioExecutionError("SERVICE_FINALIZE_TIMEOUT")),
+            "SERVICE_FINALIZE_TIMEOUT",
+        )
+        self.assertEqual(
+            _diagnostic_code(HostedAdapterError("SERVICE_PID_NOT_CANDIDATE")),
+            "SERVICE_PID_NOT_CANDIDATE",
+        )
+        self.assertEqual(
+            _diagnostic_code(ValueError("path/to/private-profile")),
+            "ValueError",
+        )
+        self.assertEqual(
+            _diagnostic_code(ValueError("THISISASECRETVALUE")),
+            "ValueError",
+        )
+        self.assertEqual(
+            _diagnostic_code(ValueError("HOSTED_LANE_DEADLINE_EXCEEDED before finalization")),
+            "HOSTED_LANE_DEADLINE_EXCEEDED",
+        )
+
+        class TypedFailure(Exception):
+            reason_code = "SCENARIO_FAILED private=credential-value"
+
+        self.assertEqual(_diagnostic_code(TypedFailure()), "SCENARIO_FAILED")
+        self.assertEqual(
+            _diagnostic_code(ValueError("PRIVATE_SECRET upper-case detail")),
+            "ValueError",
+        )
+
+    def test_hosted_run_main_finalizes_adapter_before_returning(self) -> None:
+        root = Path(self.directory.name)
+        raw_directory = root / "main-finalize-raw"
+        raw_directory.mkdir(mode=0o700)
+        output = root / "main-finalize-result.json"
+
+        class MainRunner:
+            def safe_evidence(self):
+                return ()
+
+        class MainAdapter:
+            adapter_id = "hosted-linux-cli"
+            adapter_version = "v2"
+            capabilities = frozenset({Capability.CONFIGURE})
+            capability_unavailable_reasons = {}
+
+            def __init__(self) -> None:
+                self.runner = MainRunner()
+                self.finalized: list[float] = []
+
+            def finalize(self, *, timeout_seconds: float) -> None:
+                self.finalized.append(timeout_seconds)
+
+        adapter = MainAdapter()
+        manifest = {"kind": "source-build-closure", "architecture": "amd64"}
+        arguments = [
+            "--platform", "linux",
+            "--profile", str(self.profile),
+            "--source-repository", "DobbyVPN/DobbyVPN",
+            "--source-sha", "a" * 40,
+            "--platform-version", "24.04",
+            "--candidate-manifest", str(root / "manifest.json"),
+            "--server-image-digest", "sha256:" + "b" * 64,
+            "--lane-timeout-seconds", "60",
+            "--output", str(output),
+            "--raw-log-dir", str(raw_directory),
+            "--scenario-id", "functional.configure",
+        ]
+        with (
+            mock.patch.object(hosted_run, "_git_head", return_value="c" * 40),
+            mock.patch.object(hosted_run, "verify_candidate", return_value=manifest),
+            mock.patch.object(hosted_run, "_sha256", return_value="d" * 64),
+            mock.patch.object(hosted_run, "closure_sha256", return_value="e" * 64),
+            mock.patch.object(hosted_run, "adapter_for_platform", return_value=adapter),
+            mock.patch.object(hosted_run, "_run_scenarios", return_value=([], [], 0)),
+            mock.patch.object(
+                hosted_run,
+                "_coverage_contract",
+                return_value={"status": "supported-subset-with-expected-limitations"},
+            ),
+            mock.patch.object(hosted_run, "_qualification_exit_code", return_value=0),
+        ):
+            code = hosted_run.main(arguments)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(adapter.finalized), 1)
+        self.assertGreater(adapter.finalized[0], 0)
+        self.assertTrue(output.is_file())
+
+    def test_hosted_run_success_path_finalizer_failure_cannot_pass(self) -> None:
+        root = Path(self.directory.name)
+        raw_directory = root / "main-finalizer-failure-raw"
+        raw_directory.mkdir(mode=0o700)
+        output = root / "main-finalizer-failure-result.json"
+
+        class MainRunner:
+            def safe_evidence(self):
+                return ()
+
+        class MainAdapter:
+            adapter_id = "hosted-linux-cli"
+            adapter_version = "v2"
+            capabilities = frozenset({Capability.CONFIGURE})
+            capability_unavailable_reasons = {}
+            runner = MainRunner()
+
+            def finalize(self, *, timeout_seconds: float, deadline: float | None) -> None:
+                raise ValueError("PRIVATE_SECRET=must-not-escape")
+
+        manifest = {"kind": "source-build-closure", "architecture": "amd64"}
+        arguments = [
+            "--platform", "linux", "--profile", str(self.profile),
+            "--source-repository", "DobbyVPN/DobbyVPN", "--source-sha", "a" * 40,
+            "--platform-version", "24.04", "--candidate-manifest", str(root / "manifest.json"),
+            "--server-image-digest", "sha256:" + "b" * 64, "--lane-timeout-seconds", "60",
+            "--output", str(output), "--raw-log-dir", str(raw_directory),
+            "--scenario-id", "functional.configure",
+        ]
+        diagnostics = io.StringIO()
+        with (
+            mock.patch.object(hosted_run, "_git_head", return_value="c" * 40),
+            mock.patch.object(hosted_run, "verify_candidate", return_value=manifest),
+            mock.patch.object(hosted_run, "_sha256", return_value="d" * 64),
+            mock.patch.object(hosted_run, "closure_sha256", return_value="e" * 64),
+            mock.patch.object(hosted_run, "adapter_for_platform", return_value=MainAdapter()),
+            mock.patch.object(hosted_run, "_run_scenarios", return_value=([], [], 0)),
+            mock.patch.object(
+                hosted_run, "_coverage_contract",
+                return_value={"status": "supported-subset-with-expected-limitations"},
+            ),
+            mock.patch.object(hosted_run, "_qualification_exit_code", return_value=0),
+            contextlib.redirect_stderr(diagnostics),
+        ):
+            code = hosted_run.main(arguments)
+
+        self.assertEqual(code, 1)
+        self.assertIn("hosted-functional failed code=ValueError", diagnostics.getvalue())
+        self.assertNotIn("PRIVATE_SECRET", diagnostics.getvalue())
+
+    def test_hosted_run_lane_clock_starts_before_slow_preflight(self) -> None:
+        root = Path(self.directory.name)
+        raw_directory = root / "main-preflight-raw"
+        raw_directory.mkdir(mode=0o700)
+        output = root / "main-preflight-result.json"
+
+        class MainRunner:
+            def safe_evidence(self):
+                return ()
+
+        class MainAdapter:
+            adapter_id = "hosted-linux-cli"
+            adapter_version = "v2"
+            capabilities = frozenset({Capability.CONFIGURE})
+            capability_unavailable_reasons = {}
+
+            def __init__(self) -> None:
+                self.runner = MainRunner()
+                self.finalized: list[float] = []
+
+            def finalize(self, *, timeout_seconds: float) -> None:
+                self.finalized.append(timeout_seconds)
+
+        adapter = MainAdapter()
+        scenario_deadlines: list[float] = []
+
+        def run_scenarios(*_args, deadline: float | None = None, **_kwargs):
+            scenario_deadlines.append(float(deadline))
+            return [], [], 0
+
+        clock = [100.0]
+
+        def monotonic() -> float:
+            return clock[0]
+
+        def slow_preflight(*_args, **_kwargs) -> str:
+            clock[0] = 130.0
+            return "c" * 40
+
+        manifest = {"kind": "source-build-closure", "architecture": "amd64"}
+        arguments = [
+            "--platform", "linux",
+            "--profile", str(self.profile),
+            "--source-repository", "DobbyVPN/DobbyVPN",
+            "--source-sha", "a" * 40,
+            "--platform-version", "24.04",
+            "--candidate-manifest", str(root / "manifest.json"),
+            "--server-image-digest", "sha256:" + "b" * 64,
+            "--lane-timeout-seconds", "60",
+            "--output", str(output),
+            "--raw-log-dir", str(raw_directory),
+            "--scenario-id", "functional.configure",
+        ]
+        with (
+            mock.patch.object(hosted_run.time, "monotonic", side_effect=monotonic),
+            mock.patch.object(hosted_run, "_git_head", side_effect=slow_preflight),
+            mock.patch.object(hosted_run, "verify_candidate", return_value=manifest),
+            mock.patch.object(hosted_run, "_sha256", return_value="d" * 64),
+            mock.patch.object(hosted_run, "closure_sha256", return_value="e" * 64),
+            mock.patch.object(hosted_run, "adapter_for_platform", return_value=adapter),
+            mock.patch.object(hosted_run, "_run_scenarios", side_effect=run_scenarios),
+            mock.patch.object(
+                hosted_run,
+                "_coverage_contract",
+                return_value={"status": "supported-subset-with-expected-limitations"},
+            ),
+            mock.patch.object(hosted_run, "_qualification_exit_code", return_value=0),
+        ):
+            code = hosted_run.main(arguments)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(scenario_deadlines, [130.0])
+        self.assertEqual(adapter.finalized, [30.0])
+
+    def test_hosted_run_main_catch_path_finalizes_and_redacts_finalizer_failure(self) -> None:
+        root = Path(self.directory.name)
+        raw_directory = root / "main-catch-raw"
+        raw_directory.mkdir(mode=0o700)
+        output = root / "main-catch-result.json"
+
+        class MainRunner:
+            def safe_evidence(self):
+                return ()
+
+        class MainAdapter:
+            adapter_id = "hosted-linux-cli"
+            adapter_version = "v2"
+            capabilities = frozenset({Capability.CONFIGURE})
+            capability_unavailable_reasons = {}
+
+            def __init__(self) -> None:
+                self.runner = MainRunner()
+                self.finalized: list[float] = []
+
+            def finalize(self, *, timeout_seconds: float) -> None:
+                self.finalized.append(timeout_seconds)
+                raise ValueError("private-profile=/owner/secret/profile.toml")
+
+        adapter = MainAdapter()
+        scenario_deadlines: list[float] = []
+
+        def fail_scenarios(*_args, deadline: float | None = None, **_kwargs):
+            scenario_deadlines.append(float(deadline))
+            raise ScenarioExecutionError("SCENARIO_FAILED private detail")
+
+        manifest = {"kind": "source-build-closure", "architecture": "amd64"}
+        arguments = [
+            "--platform", "linux",
+            "--profile", str(self.profile),
+            "--source-repository", "DobbyVPN/DobbyVPN",
+            "--source-sha", "a" * 40,
+            "--platform-version", "24.04",
+            "--candidate-manifest", str(root / "manifest.json"),
+            "--server-image-digest", "sha256:" + "b" * 64,
+            "--lane-timeout-seconds", "60",
+            "--output", str(output),
+            "--raw-log-dir", str(raw_directory),
+            "--scenario-id", "functional.configure",
+        ]
+        diagnostics = io.StringIO()
+        with (
+            mock.patch.object(hosted_run, "_git_head", return_value="c" * 40),
+            mock.patch.object(hosted_run, "verify_candidate", return_value=manifest),
+            mock.patch.object(hosted_run, "_sha256", return_value="d" * 64),
+            mock.patch.object(hosted_run, "closure_sha256", return_value="e" * 64),
+            mock.patch.object(hosted_run, "adapter_for_platform", return_value=adapter),
+            mock.patch.object(hosted_run, "_run_scenarios", side_effect=fail_scenarios),
+            mock.patch.object(hosted_run, "_MAX_LANE_SECONDS", 60),
+            contextlib.redirect_stderr(diagnostics),
+        ):
+            code = hosted_run.main(arguments)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(len(adapter.finalized), 1)
+        self.assertEqual(len(scenario_deadlines), 1)
+        self.assertAlmostEqual(adapter.finalized[0], 30.0, delta=0.5)
+        self.assertIn("adapter-finalization-failed code=ValueError", diagnostics.getvalue())
+        self.assertIn("hosted-functional failed code=SCENARIO_FAILED", diagnostics.getvalue())
+        self.assertNotIn("private-profile", diagnostics.getvalue())
+        self.assertNotIn("/owner/secret/profile.toml", diagnostics.getvalue())
+
+    def test_linux_service_finalization_verifies_and_stops_the_exact_restart(self) -> None:
+        root = Path(self.directory.name)
+        binary = root / "service-finalize"
+        binary.write_bytes(b"synthetic service")
+        binary.chmod(0o700)
+        pid_file = root / "service-finalize.pid"
+        raw_directory = root / "service-finalize-raw"
+        raw_directory.mkdir(mode=0o700)
+
+        class ServiceRunner:
+            def __init__(self) -> None:
+                self.alive = True
+                self.calls: list[tuple[str, ...]] = []
+
+            def run(self, command, *, timeout_seconds):
+                argv = tuple(command)
+                self.calls.append(argv)
+                if argv[2:4] == ("sh", "-c") and argv[-1] == "789":
+                    return CommandResult(
+                        argv,
+                        0 if self.alive else 2,
+                        b"789 (service) S 1 300 300 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12345\n" if self.alive else b"service_probe_absent\n",
+                        b"",
+                    )
+                if argv[2:4] == ("readlink", "-f"):
+                    return CommandResult(
+                        argv,
+                        0 if self.alive else 1,
+                        (str(binary.resolve()) + "\n").encode() if self.alive else b"",
+                        b"",
+                    )
+                if argv[2:4] == ("kill", "-0"):
+                    return CommandResult(argv, 0 if self.alive else 1, b"", b"")
+                if argv[2:4] == ("ps", "-o"):
+                    return CommandResult(
+                        argv,
+                        0 if self.alive else 1,
+                        b"S\n" if self.alive else b"",
+                        b"",
+                    )
+                if argv[2:4] == ("ps", "-axo"):
+                    return CommandResult(
+                        argv,
+                        0,
+                        b"789 1 300 S\n" if self.alive else b"",
+                        b"",
+                    )
+                if argv[2:4] == ("kill", "-TERM"):
+                    self.alive = False
+                    return CommandResult(argv, 0, b"", b"")
+                raise AssertionError(argv)
+
+        runner = ServiceRunner()
+        controller = LinuxServiceProcessController(
+            pid=789,
+            binary=binary,
+            socket=root / "service-finalize.sock",
+            library_path=None,
+            pid_file=pid_file,
+            runner=runner,
+            raw_directory=raw_directory,
+        )
+        controller._restart_number = 1
+        controller._replacement_identity = ("12345", 300)
+        controller.stop_restarted_service(10.0)
+
+        self.assertFalse(runner.alive)
+        self.assertIn(("sudo", "-n", "kill", "-TERM", "--", "-300"), runner.calls)
+        self.assertNotIn(("sudo", "-n", "kill", "-KILL", "--", "-300"), runner.calls)
+
+    def test_linux_service_finalization_escalates_a_resistant_restart_to_kill(self) -> None:
+        root = Path(self.directory.name)
+        binary = root / "service-finalize-resistant"
+        binary.write_bytes(b"synthetic service")
+        binary.chmod(0o700)
+        raw_directory = root / "service-finalize-resistant-raw"
+        raw_directory.mkdir(mode=0o700)
+
+        class ServiceRunner:
+            def __init__(self) -> None:
+                self.alive = True
+                self.calls: list[tuple[str, ...]] = []
+
+            def run(self, command, *, timeout_seconds):
+                argv = tuple(command)
+                self.calls.append(argv)
+                if argv[2:4] == ("sh", "-c") and argv[-1] == "790":
+                    return CommandResult(
+                        argv,
+                        0 if self.alive else 2,
+                        b"790 (service) S 1 301 301 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12346\n" if self.alive else b"service_probe_absent\n",
+                        b"",
+                    )
+                if argv[2:4] == ("sh", "-c") and argv[-1] == "7910":
+                    return CommandResult(
+                        argv,
+                        0 if self.alive else 2,
+                        b"7910 (worker) S 790 301 301 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12347\n" if self.alive else b"service_probe_absent\n",
+                        b"",
+                    )
+                if argv[2:4] == ("readlink", "-f"):
+                    return CommandResult(
+                        argv,
+                        0,
+                        (str(binary.resolve()) + "\n").encode(),
+                        b"",
+                    )
+                if argv[2:4] == ("kill", "-0"):
+                    return CommandResult(argv, 0 if self.alive else 1, b"", b"")
+                if argv[2:4] == ("ps", "-o"):
+                    return CommandResult(argv, 0 if self.alive else 1, b"S\n" if self.alive else b"", b"")
+                if argv[2:4] == ("ps", "-axo"):
+                    return CommandResult(
+                        argv,
+                        0,
+                        b"790 1 301 S\n7910 790 301 S\n" if self.alive else b"",
+                        b"",
+                    )
+                if argv[2:4] == ("kill", "-TERM"):
+                    return CommandResult(argv, 0, b"", b"")
+                if argv[2:4] == ("kill", "-KILL"):
+                    self.alive = False
+                    return CommandResult(argv, 0, b"", b"")
+                raise AssertionError(argv)
+
+        runner = ServiceRunner()
+        controller = LinuxServiceProcessController(
+            pid=790,
+            binary=binary,
+            socket=root / "service-finalize-resistant.sock",
+            library_path=None,
+            pid_file=root / "service-finalize-resistant.pid",
+            runner=runner,
+            raw_directory=raw_directory,
+        )
+        controller._restart_number = 1
+        controller._replacement_identity = ("12346", 301)
+        with mock.patch.object(
+            controller,
+            "_wait_replacement_tree",
+            side_effect=[HostedAdapterError("SERVICE_FINALIZE_TIMEOUT"), ()],
+        ):
+            controller.stop_restarted_service(10.0)
+
+        self.assertFalse(runner.alive)
+        self.assertIn(("sudo", "-n", "kill", "-TERM", "--", "-301"), runner.calls)
+        self.assertIn(("sudo", "-n", "kill", "-KILL", "--", "-301"), runner.calls)
+
+    def test_linux_service_finalization_refuses_a_reused_pid(self) -> None:
+        root = Path(self.directory.name)
+        binary = root / "service-finalize-identity"
+        binary.write_bytes(b"synthetic service")
+        binary.chmod(0o700)
+        raw_directory = root / "service-finalize-identity-raw"
+        raw_directory.mkdir(mode=0o700)
+
+        class ServiceRunner:
+            def __init__(self) -> None:
+                self.readlinks = 0
+                self.calls: list[tuple[str, ...]] = []
+
+            def run(self, command, *, timeout_seconds):
+                argv = tuple(command)
+                self.calls.append(argv)
+                if argv[2:4] == ("readlink", "-f"):
+                    self.readlinks += 1
+                    return CommandResult(
+                        argv,
+                        0,
+                        (str(binary.resolve()) + "\n").encode(),
+                        b"",
+                    )
+                if argv[2:4] == ("sh", "-c") and argv[-1] == "791":
+                    return CommandResult(
+                        argv,
+                        0,
+                        b"791 (service) S 1 302 302 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 99999\n",
+                        b"",
+                    )
+                if argv[2:4] == ("kill", "-0"):
+                    return CommandResult(argv, 0, b"", b"")
+                if argv[2:4] == ("ps", "-o"):
+                    return CommandResult(argv, 0, b"S\n", b"")
+                raise AssertionError(argv)
+
+        runner = ServiceRunner()
+        controller = LinuxServiceProcessController(
+            pid=791,
+            binary=binary,
+            socket=root / "service-finalize-identity.sock",
+            library_path=None,
+            pid_file=root / "service-finalize-identity.pid",
+            runner=runner,
+            raw_directory=raw_directory,
+        )
+        controller._restart_number = 1
+        controller._replacement_identity = ("12345", 302)
+        with self.assertRaisesRegex(HostedAdapterError, "SERVICE_PID_NOT_CANDIDATE"):
+            controller.stop_restarted_service(10.0)
+
+        self.assertFalse(any(call[2:4] in {("kill", "-TERM"), ("kill", "-KILL")} for call in runner.calls))
+
+    def test_linux_service_finalization_does_not_pass_on_root_disappearance(self) -> None:
+        root = Path(self.directory.name)
+        binary = root / "service-finalize-root-gone"
+        binary.write_bytes(b"synthetic service")
+        binary.chmod(0o700)
+        raw_directory = root / "service-finalize-root-gone-raw"
+        raw_directory.mkdir(mode=0o700)
+
+        class ServiceRunner:
+            def __init__(self) -> None:
+                self.alive = True
+
+            def run(self, command, *, timeout_seconds):
+                argv = tuple(command)
+                if argv[2:4] == ("readlink", "-f"):
+                    return CommandResult(argv, 0, (str(binary.resolve()) + "\n").encode(), b"")
+                if argv[2:4] == ("sh", "-c") and argv[-1] == "793":
+                    return CommandResult(
+                        argv,
+                        0 if self.alive else 2,
+                        b"793 (service) S 1 306 306 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12351\n"
+                        if self.alive else b"service_probe_absent\n",
+                        b"",
+                    )
+                if argv[2:4] == ("kill", "-0"):
+                    return CommandResult(argv, 0 if self.alive else 1, b"", b"")
+                if argv[2:4] == ("ps", "-o"):
+                    return CommandResult(
+                        argv,
+                        0 if self.alive else 1,
+                        b"S\n" if self.alive else b"",
+                        b"",
+                    )
+                raise AssertionError(argv)
+
+        runner = ServiceRunner()
+        controller = LinuxServiceProcessController(
+            pid=793,
+            binary=binary,
+            socket=root / "service-finalize-root-gone.sock",
+            library_path=None,
+            pid_file=root / "service-finalize-root-gone.pid",
+            runner=runner,
+            raw_directory=raw_directory,
+        )
+        controller._restart_number = 1
+        controller._replacement_identity = ("12351", 306)
+        runner.alive = False
+        with self.assertRaisesRegex(HostedAdapterError, "SERVICE_TREE_PROBE_FAILED"):
+            controller.stop_restarted_service(10.0)
+
+    def test_linux_service_finalization_fails_closed_on_timed_out_liveness_probe(self) -> None:
+        root = Path(self.directory.name)
+        binary = root / "service-finalize-timeout"
+        binary.write_bytes(b"synthetic service")
+        binary.chmod(0o700)
+        raw_directory = root / "service-finalize-timeout-raw"
+        raw_directory.mkdir(mode=0o700)
+
+        class ServiceRunner:
+            def run(self, command, *, timeout_seconds):
+                argv = tuple(command)
+                if argv[2:4] == ("readlink", "-f"):
+                    return CommandResult(argv, 0, (str(binary.resolve()) + "\n").encode(), b"")
+                if argv[2:4] == ("sh", "-c") and argv[-1] == "792":
+                    return CommandResult(
+                        argv,
+                        0,
+                        b"792 (service) S 1 303 303 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12347\n",
+                        b"",
+                    )
+                if argv[2:4] == ("kill", "-0"):
+                    return CommandResult(argv, 0, b"", b"", timed_out=True)
+                raise AssertionError(argv)
+
+        controller = LinuxServiceProcessController(
+            pid=792,
+            binary=binary,
+            socket=root / "service-finalize-timeout.sock",
+            library_path=None,
+            pid_file=root / "service-finalize-timeout.pid",
+            runner=ServiceRunner(),
+            raw_directory=raw_directory,
+        )
+        controller._restart_number = 1
+        controller._replacement_identity = ("12347", 303)
+        with self.assertRaisesRegex(ScenarioExecutionError, "SERVICE_PROBE_FAILED"):
+            controller.stop_restarted_service(10.0)
+
     def test_linux_restart_launcher_tracks_exact_child_pid(self) -> None:
         root = Path(self.directory.name)
         binary = root / "service"
@@ -944,8 +1876,24 @@ class HostedCLIAdapterTests(unittest.TestCase):
                         (str(binary.resolve()) + "\n").encode(),
                         b"",
                     )
+                if argv[2:4] == ("sh", "-c") and argv[-1] == "123":
+                    return CommandResult(
+                        argv,
+                        0,
+                        b"123 (service) S 1 303 303 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12348\n",
+                        b"",
+                    )
+                if argv[2:4] == ("sh", "-c") and argv[-1] == "456":
+                    return CommandResult(
+                        argv,
+                        0,
+                        b"456 (service) S 1 304 304 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12349\n",
+                        b"",
+                    )
                 if argv[2:4] == ("kill", "-0"):
                     return CommandResult(argv, 0, b"", b"")
+                if argv[2:4] == ("ps", "-o"):
+                    return CommandResult(argv, 0, b"S\n", b"")
                 raise AssertionError(argv)
 
         runner = ServiceRunner()
@@ -960,7 +1908,7 @@ class HostedCLIAdapterTests(unittest.TestCase):
         )
         with mock.patch(
             "torturer_checks.hosted.linux.time.monotonic",
-            side_effect=[100.0, 101.0, 102.0, 103.0],
+            return_value=100.0,
         ):
             controller._start(10.0)
 
@@ -1012,8 +1960,24 @@ class HostedCLIAdapterTests(unittest.TestCase):
                 self.probe_calls.append(argv)
                 if argv[2:4] == ("kill", "-0"):
                     return CommandResult(argv, 0, b"", b"")
+                if argv[2:4] == ("ps", "-o"):
+                    return CommandResult(argv, 0, b"S\n", b"")
                 if argv[2:4] == ("readlink", "-f"):
                     return CommandResult(argv, 0, (str(binary.resolve()) + "\n").encode(), b"")
+                if argv[2:4] == ("sh", "-c") and argv[-1] == "123":
+                    return CommandResult(
+                        argv,
+                        0,
+                        b"123 (service) S 1 304 304 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12348\n",
+                        b"",
+                    )
+                if argv[2:4] == ("sh", "-c") and argv[-1] == "789":
+                    return CommandResult(
+                        argv,
+                        0,
+                        b"789 (service) S 1 305 305 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12350\n",
+                        b"",
+                    )
                 raise AssertionError(argv)
 
         runner = DetachedServiceRunner()

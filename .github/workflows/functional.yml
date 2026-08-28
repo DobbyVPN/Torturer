@@ -124,6 +124,9 @@ jobs:
             printf 'SERVICE_DIR=%s\n' "$RUNNER_TEMP/dobbyvpn-service"
             printf 'RESULT_PATH=%s\n' "$RUNNER_TEMP/dobbyvpn-render-handoff/functional-result.json"
             printf 'LEASE_RUN_ID=unassigned\n'
+            printf 'POST_LANE_DEADLINE_EPOCH=unvalidated\n'
+            printf 'POST_LANE_STEP_TIMEOUT_SECONDS=60\n'
+            printf 'POST_LANE_MARKER_RESERVE_SECONDS=180\n'
           } >> "$GITHUB_ENV"
 
       - name: Validate trusted functional inputs
@@ -395,12 +398,19 @@ jobs:
               "source_sha": os.environ["SOURCE_SHA"],
               "state": "issued",
           }
-          expected_keys = set(expected) | {"services"}
+          expected_keys = set(expected) | {"services", "available_until_epoch"}
           if set(value) != expected_keys:
               raise SystemExit("Linux safe lease record has an unsafe shape")
           for key, wanted in expected.items():
               if value.get(key) != wanted:
                   raise SystemExit(f"lease field {key} is invalid")
+          available_until_epoch = value.get("available_until_epoch")
+          if (
+              isinstance(available_until_epoch, bool)
+              or not isinstance(available_until_epoch, int)
+              or available_until_epoch <= 0
+          ):
+              raise SystemExit("lease availability deadline is invalid")
           services = value.get("services")
           if not isinstance(services, list) or len(services) != 2:
               raise SystemExit("Linux lease service bundle is invalid")
@@ -463,6 +473,32 @@ jobs:
           print("upload_handoff=validated")
           PY
 
+      - name: Establish validated post-lane provider deadline
+        if: always()
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          lease_file="${LEASE_RESPONSE_DIR:-}/lease.json"
+          if [ -z "${LEASE_RESPONSE_DIR:-}" ] || [ ! -f "$lease_file" ]; then
+            printf '%s\n' 'post-lane provider deadline unavailable: no validated lease exists; server hard cleanup remains authoritative' >&2
+            exit 1
+          fi
+          available_until_epoch="$(python3 - "$lease_file" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          deadline = value.get("available_until_epoch")
+          if isinstance(deadline, bool) or not isinstance(deadline, int) or deadline <= 0:
+              raise SystemExit("lease availability deadline is invalid")
+          print(deadline)
+          PY
+          )"
+          printf 'POST_LANE_DEADLINE_EPOCH=%s\nPOST_LANE_STEP_TIMEOUT_SECONDS=60\nPOST_LANE_MARKER_RESERVE_SECONDS=180\n' \
+            "$((available_until_epoch - 5))" >> "$GITHUB_ENV"
+          printf 'validated_post_lane_provider_deadline=%s marker_reserve_seconds=180\n' "$available_until_epoch"
+
       - name: Start the candidate Linux service
         run: |
           set -euo pipefail
@@ -487,6 +523,7 @@ jobs:
           chmod 600 "$service_log"
           expected_service="$GITHUB_WORKSPACE/candidate/ubuntu_grpcvpnserver"
           expected_exe="$(readlink -f "$expected_service")"
+          service_identity_file="$HANDOFF_DIR/service.identity"
           peer_uid="$(id -u)"
           launch_log="$HANDOFF_DIR/service-launch.raw.log"
           : > "$launch_log"
@@ -530,13 +567,75 @@ jobs:
           case "$service_pid" in
             ""|0|*[!0-9]*) printf 'candidate service returned invalid pid=%s\n' "$service_pid" >&2; exit 1 ;;
           esac
+          identity_probe="$HANDOFF_DIR/service-identity.raw.log"
+          identity_probe_status=0
+          identity_probe_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 120 - 1))
+          identity_probe_timeout=10
+          if [ "$identity_probe_timeout" -gt "$identity_probe_remaining" ]; then identity_probe_timeout="$identity_probe_remaining"; fi
+          if [ "$identity_probe_timeout" -le 0 ]; then
+            printf 'candidate service identity reached cleanup reserve: remaining=%s\n' "$identity_probe_remaining" >&2
+            exit 1
+          fi
+          timeout --foreground --signal=TERM --kill-after=1s "${identity_probe_timeout}s" \
+            sudo -n sh -c 'set -eu; cat "/proc/$1/stat"' dobbyvpn-process-stat "$service_pid" > "$identity_probe" 2>&1 || identity_probe_status=$?
+          emit_private_evidence service-identity "$identity_probe"
+          if [ "$identity_probe_status" -ne 0 ]; then
+            printf 'candidate_service_launch=failed code=IDENTITY_PROBE status=%s\n' "$identity_probe_status" >&2
+            emit_private_evidence service-log "$service_log"
+            exit 1
+          fi
+          python3 - "$identity_probe" "$service_identity_file" "$service_pid" <<'PY'
+          from pathlib import Path
+          import sys
+
+          raw = Path(sys.argv[1]).read_text(encoding="ascii", errors="strict").strip()
+          expected_pid = int(sys.argv[3])
+          try:
+              prefix, fields = raw.rsplit(") ", 1)
+              pid = int(prefix.split("(", 1)[0].strip())
+              columns = fields.split()
+              state = columns[0]
+              process_group = int(columns[2])
+              start = columns[19]
+          except (ValueError, IndexError):
+              raise SystemExit("Linux service identity probe is incomplete")
+          if (
+              pid != expected_pid
+              or len(state) != 1
+              or process_group <= 0
+              or not start.isdigit()
+              or int(start) <= 0
+              or state.upper() == "Z"
+          ):
+              raise SystemExit("Linux service identity probe is invalid")
+          destination = Path(sys.argv[2])
+          destination.write_text(f"{pid}|{start}|{process_group}\n", encoding="ascii")
+          destination.chmod(0o600)
+          PY
+          identity_exe_status=0
+          identity_exe_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 120 - 1))
+          identity_exe_timeout=5
+          if [ "$identity_exe_timeout" -gt "$identity_exe_remaining" ]; then identity_exe_timeout="$identity_exe_remaining"; fi
+          if [ "$identity_exe_timeout" -le 0 ]; then
+            printf 'candidate service executable proof reached cleanup reserve: remaining=%s\n' "$identity_exe_remaining" >&2
+            exit 1
+          fi
+          actual_exe="$(timeout --foreground --signal=TERM --kill-after=1s "${identity_exe_timeout}s" sudo -n readlink -f "/proc/$service_pid/exe")" || identity_exe_status=$?
+          if [ "$identity_exe_status" -ne 0 ] || [ "$actual_exe" != "$expected_exe" ]; then
+            printf 'candidate_service_launch=failed code=EXECUTABLE_IDENTITY status=%s\n' "$identity_exe_status" >&2
+            emit_private_evidence service-log "$service_log"
+            exit 1
+          fi
           service_pid_file="$HANDOFF_DIR/service.pid"
           printf '%s\n' "$service_pid" > "$service_pid_file"
           chmod 600 "$service_pid_file"
           {
             printf 'SERVICE_PID=%s\n' "$service_pid"
             printf 'SERVICE_PID_FILE=%s\n' "$service_pid_file"
+            printf 'SERVICE_IDENTITY_FILE=%s\n' "$service_identity_file"
+            printf 'SERVICE_BINARY=%s\n' "$expected_service"
             printf 'SERVICE_SOCKET=%s\n' "$control_socket"
+            printf 'SERVICE_IDENTITY_FILE=%s\n' "$service_identity_file"
             printf 'DOBBYVPN_CONTROL_SOCKET=%s\n' "$control_socket"
             printf 'SERVICE_LOG=%s\n' "$service_log"
           } >> "$GITHUB_ENV"
@@ -593,22 +692,49 @@ jobs:
         working-directory: torturer
         run: |
           set -euo pipefail
-          remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 120))
+          remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 300))
           # Eight applicable scenarios plus ten resets require 950 seconds;
           # keep a deliberate 60-second scheduling margin inside the 1,200s cap.
+          if [ "$remaining" -gt 1200 ]; then
+            remaining=1200
+          fi
+          available_until_epoch="$(python3 - "$LEASE_RESPONSE_DIR/lease.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          print(value["available_until_epoch"])
+          PY
+          )"
+          case "$available_until_epoch" in
+            ''|*[!0-9]*) printf 'lease availability deadline is invalid\n' >&2; exit 1 ;;
+          esac
+          server_remaining=$((available_until_epoch - $(date +%s)))
+          client_post_lane_reserve_seconds=300
+          lane_start_margin_seconds=5
+          server_lane_remaining=$((server_remaining - client_post_lane_reserve_seconds - lane_start_margin_seconds))
+          if [ "$server_lane_remaining" -le 0 ]; then
+            printf 'insufficient Render lease lifetime before functional lane: seconds=%s reserve=%s margin=%s\n' \
+              "$server_remaining" "$client_post_lane_reserve_seconds" "$lane_start_margin_seconds" >&2
+            exit 1
+          fi
+          if [ "$remaining" -gt "$server_lane_remaining" ]; then
+            remaining="$server_lane_remaining"
+          fi
           if [ "$remaining" -lt 1010 ]; then
             printf 'insufficient Linux canonical budget before cleanup reserve: seconds=%s required=1010\n' "$remaining" >&2
             exit 1
           fi
-          if [ "$remaining" -gt 1200 ]; then
-            remaining=1200
-          fi
+          printf 'render_lease_lifetime_for_lane_seconds=%s required=%s reserve=%s margin=%s\n' \
+            "$server_remaining" "$remaining" "$client_post_lane_reserve_seconds" "$lane_start_margin_seconds"
           printf 'canonical_lane_timeout_seconds=%s\n' "$remaining"
           upload_url="$(cat "$HANDOFF_DIR/upload-url.txt")"
           test -n "$upload_url"
           PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.deadline \
             --timeout-seconds "$remaining" --kill-grace-seconds 30 \
             env PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.run \
+            --lane-timeout-seconds "$remaining" \
             --platform linux \
             --cli "$GITHUB_WORKSPACE/candidate/dobby-cli" \
             --profile "$HANDOFF_DIR/profile.toml" \
@@ -625,11 +751,14 @@ jobs:
             --service-socket "$SERVICE_SOCKET" \
             --service-library-path "$GITHUB_WORKSPACE/candidate" \
             --service-pid-file "$SERVICE_PID_FILE" \
+            --service-identity-file "$SERVICE_IDENTITY_FILE" \
             --expected-unavailable functional.network-transition=HOSTED_LINUX_INTERFACE_REQUIRED \
             --expected-unavailable functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED
 
       - name: Stop candidate service and verify process cleanup
+        id: essential_cleanup
         if: always()
+        timeout-minutes: 1
         run: |
           set -euo pipefail
           umask 077
@@ -647,8 +776,33 @@ jobs:
             fi
           }
           service_pid="${SERVICE_PID:-}"
+          service_identity_file="${SERVICE_IDENTITY_FILE:-}"
+          service_binary="${SERVICE_BINARY:-$GITHUB_WORKSPACE/candidate/ubuntu_grpcvpnserver}"
+          service_identity=""
+          expected_start=""
+          expected_group=""
+          if [ -n "$service_identity_file" ] && [ -f "$service_identity_file" ]; then
+            service_identity="$(tr -d '\r\n' < "$service_identity_file")"
+          fi
+          if [ -n "$service_pid" ] || [ -n "$service_identity" ]; then
+            if ! [[ "$service_identity" =~ ^([1-9][0-9]{0,9})\|([1-9][0-9]+)\|([1-9][0-9]+)$ ]]; then
+              emit_private_evidence service-identity "$service_identity_file"
+              printf 'candidate_service_cleanup=failed code=IDENTITY_UNAVAILABLE\n' >&2
+              exit 1
+            fi
+            service_pid="${BASH_REMATCH[1]}"
+            expected_start="${BASH_REMATCH[2]}"
+            expected_group="${BASH_REMATCH[3]}"
+          fi
           if [ -f "${SERVICE_PID_FILE:-}" ]; then
-            service_pid="$(cat "$SERVICE_PID_FILE")"
+            if [ -z "$service_identity" ]; then
+              service_pid="$(cat "$SERVICE_PID_FILE")"
+            fi
+          fi
+          if [ -n "$service_pid" ] && [ -z "$expected_start" ]; then
+            emit_private_evidence service-identity "$service_identity_file"
+            printf 'candidate_service_cleanup=failed code=IDENTITY_UNAVAILABLE\n' >&2
+            exit 1
           fi
           case "$service_pid" in
             "") ;;
@@ -658,6 +812,39 @@ jobs:
           cleanup_deadline_hit=false
           service_state_probe="$HANDOFF_DIR/service-state-probes.raw.log"
           : > "$service_state_probe"
+          identity_matches() {
+            local identity_status=0 identity_remaining identity_timeout actual_exe stat_record
+            identity_remaining=$((cleanup_deadline_epoch - $(date +%s) - 1))
+            if [ "$identity_remaining" -le 0 ]; then cleanup_deadline_hit=true; return 1; fi
+            identity_timeout=5
+            if [ "$identity_timeout" -gt "$identity_remaining" ]; then identity_timeout="$identity_remaining"; fi
+            actual_exe="$(timeout --foreground --signal=TERM --kill-after=1s "${identity_timeout}s" sudo -n readlink -f "/proc/$service_pid/exe" 2>>"$service_state_probe")" || identity_status=$?
+            printf 'identity_probe_pid=%s status=%s exe=%s\n' "$service_pid" "$identity_status" "$actual_exe" >> "$service_state_probe"
+            if [ "$identity_status" -ne 0 ] || [ "$actual_exe" != "$(readlink -f "$service_binary")" ]; then return 1; fi
+            identity_remaining=$((cleanup_deadline_epoch - $(date +%s) - 1))
+            if [ "$identity_remaining" -le 0 ]; then cleanup_deadline_hit=true; return 1; fi
+            identity_timeout=5
+            if [ "$identity_timeout" -gt "$identity_remaining" ]; then identity_timeout="$identity_remaining"; fi
+            stat_record="$(timeout --foreground --signal=TERM --kill-after=1s "${identity_timeout}s" sudo -n sh -c 'cat "/proc/$1/stat"' dobbyvpn-process-stat "$service_pid" 2>>"$service_state_probe")" || identity_status=$?
+            printf 'identity_stat_pid=%s status=%s\n%s\n' "$service_pid" "$identity_status" "$stat_record" >> "$service_state_probe"
+            if [ "$identity_status" -ne 0 ]; then return 1; fi
+            python3 - "$stat_record" "$service_pid" "$expected_start" "$expected_group" <<'PY'
+          from pathlib import Path
+          import sys
+
+          raw, expected_pid, expected_start, expected_group = sys.argv[1:]
+          try:
+              prefix, fields = raw.strip().rsplit(") ", 1)
+              pid = int(prefix.split("(", 1)[0].strip())
+              columns = fields.split()
+              process_group = int(columns[2])
+              start = columns[19]
+          except (ValueError, IndexError):
+              raise SystemExit(1)
+          if pid != int(expected_pid) or start != expected_start or process_group != int(expected_group):
+              raise SystemExit(1)
+          PY
+          }
           process_is_live() {
             local pid="$1" state probe_status=0 remaining probe_timeout kill_timeout kill_status=0
             remaining=$((cleanup_deadline_epoch - $(date +%s) - 1))
@@ -685,6 +872,10 @@ jobs:
             esac
           }
           if [ -n "$service_pid" ] && process_is_live "$service_pid"; then
+            if ! identity_matches; then
+              printf 'candidate_service_cleanup=failed code=IDENTITY_MISMATCH\n' >&2
+              exit 1
+            fi
             remaining=$((cleanup_deadline_epoch - $(date +%s) - 1))
             if [ "$remaining" -le 0 ]; then printf 'candidate_service_cleanup=failed code=CLEANUP_DEADLINE\n' >&2; exit 1; fi
             term_timeout=10
@@ -703,6 +894,10 @@ jobs:
               sleep 1
             done; fi
             if [ "$stopped" != true ]; then
+              if ! identity_matches; then
+                printf 'candidate_service_cleanup=failed code=IDENTITY_MISMATCH\n' >&2
+                exit 1
+              fi
               kill_status=0
               remaining=$((cleanup_deadline_epoch - $(date +%s) - 1))
               kill_timeout=10
@@ -749,28 +944,47 @@ jobs:
           fi
           emit_private_evidence service-state-probes "$service_state_probe"
 
-      - name: Upload safe functional result
+      - name: Remove plaintext handoff material and prepare completion marker
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
-        with:
-          name: functional-result-${{ env.LEASE_RUN_ID }}-linux
-          path: ${{ env.RESULT_PATH }}
-          if-no-files-found: warn
-          retention-days: 1
-
-      - name: Publish opaque completion marker for trusted cleanup
-        if: always()
+        timeout-minutes: 1
+        id: post_lane_marker_prepare
         env:
           FUNCTIONAL_OUTCOME: ${{ steps.functional.outcome }}
         run: |
           set -euo pipefail
+          # Plaintext handoff material is removed even when timing metadata is
+          # unavailable; marker publication itself still fails closed.
+          if [ -n "${HANDOFF_DIR:-}" ]; then
+            rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/upload-url.txt" "$HANDOFF_DIR/recipient.key"
+          else
+            printf '%s\n' 'post-lane plaintext removal skipped: handoff directory was never initialized' >&2
+          fi
+          run_deadline="${RUN_DEADLINE_EPOCH:-}"
+          provider_deadline="${POST_LANE_DEADLINE_EPOCH:-}"
+          post_lane_marker_reserve="${POST_LANE_MARKER_RESERVE_SECONDS:-}"
+          if [ -z "${HANDOFF_DIR:-}" ] || ! [[ "$run_deadline" =~ ^[0-9]+$ ]] || ! [[ "$provider_deadline" =~ ^[0-9]+$ ]] || ! [[ "$post_lane_marker_reserve" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' 'post-lane marker preparation skipped: functional lane did not establish valid origin/provider deadlines' >&2
+            exit 1
+          fi
+          if [ "$run_deadline" -le "$provider_deadline" ]; then
+            post_deadline="$run_deadline"
+          else
+            post_deadline="$provider_deadline"
+          fi
+          post_remaining=$((post_deadline - $(date +%s)))
+          if [ "$post_remaining" -lt "$post_lane_marker_reserve" ]; then
+            printf 'post-lane marker preparation cannot fit before origin/provider deadline: remaining=%s required=%s\n' \
+              "$post_remaining" "$post_lane_marker_reserve" >&2
+            exit 1
+          fi
           marker_dir="$HANDOFF_DIR/completion"
           mkdir -p "$marker_dir"
           printf 'schema=1\nrun_id=%s\nplatform=linux\nfunctional_outcome=%s\n' \
             "$LEASE_RUN_ID" "$FUNCTIONAL_OUTCOME" > "$marker_dir/completion.marker"
 
       - name: Upload opaque completion marker
-        if: always()
+        timeout-minutes: 1
+        if: always() && steps.essential_cleanup.outcome == 'success' && steps.post_lane_marker_prepare.outcome == 'success'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: render-complete-${{ env.LEASE_RUN_ID }}-linux
@@ -778,12 +992,15 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      - name: Remove plaintext handoff material
+      - name: Upload safe functional result
+        timeout-minutes: 1
         if: always()
-        run: |
-          set -euo pipefail
-          rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/upload-url.txt" "$HANDOFF_DIR/recipient.key"
-
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: functional-result-${{ env.LEASE_RUN_ID }}-linux
+          path: ${{ env.RESULT_PATH }}
+          if-no-files-found: warn
+          retention-days: 1
 
   controller:
     name: Dispatch isolated Render lease controller

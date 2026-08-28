@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 import hashlib
 import os
 import time
@@ -12,16 +13,23 @@ from torturer_checks.hosted.cli import CommandResult, HostedAdapterError, _evide
 from torturer_checks.hosted.factory import adapter_for_platform
 from torturer_checks.hosted.macos import (
     MacOSHostedAdapter,
+    _MACOS_SERVICE_LAUNCH_SCRIPT,
     _default_control_socket,
     _macos_process_tree,
+    _parse_macos_process_identity,
     _parse_macos_process_census,
+    _parse_macos_process_census_strict,
 )
 from torturer_checks.hosted.windows import (
     WindowsHostedAdapter,
+    WindowsServiceProcessController,
     _WINDOWS_PORT_READY_SCRIPT,
     _WINDOWS_PROCESS_ALIVE_SCRIPT,
+    _WINDOWS_PROCESS_IDENTITY_SCRIPT,
     _WINDOWS_PROCESS_TREE_SNAPSHOT_SCRIPT,
     _WINDOWS_PROCESS_TREE_VERIFY_SCRIPT,
+    _parse_windows_process_identity,
+    _parse_windows_tree_snapshot,
     _parse_windows_tree_identities,
 )
 from torturer_contract.functional.capabilities import Capability
@@ -39,8 +47,14 @@ class HostedDesktopProcessRunner:
         self.timeouts: list[float] = []
         self.raw_directory: Path | None = None
         self.service_alive = True
+        self.mac_child_alive = True
+        self.service_pid = 123
+        self.identity_reused = False
+        self.probe_error = False
         self.tree_survivor = False
         self.tree_identity_mismatch = False
+        self.tree_partial = False
+        self.mac_descendant_binary: Path | None = None
         self.external_evidence: list[dict[str, object]] = []
         self.connected = False
         self.external_calls = 0
@@ -68,35 +82,107 @@ class HostedDesktopProcessRunner:
             return CommandResult(argv, 0, b"terminated\n", b"")
         if argv[0] == "kill":
             if argv[1] == "-KILL":
-                self.service_alive = False
+                if self.platform == "macos" and len(argv) > 2:
+                    if argv[2].startswith("-") or argv[2] == str(self.service_pid):
+                        self.service_alive = False
+                        self.mac_child_alive = False
+                    else:
+                        self.mac_child_alive = False
+                else:
+                    self.service_alive = False
                 return CommandResult(argv, 0, b"", b"")
             if argv[1] == "-0":
                 return CommandResult(argv, 0 if self.service_alive else 1, b"", b"")
         if argv[0] == "sh" and argv[1] == "-c":
             self.service_alive = True
+            self.mac_child_alive = True
+            self.service_pid = 456
             return CommandResult(argv, 0, b"456\n", b"")
+        if argv[0] == "python3" and len(argv) > 2 and "proc_pidinfo" in argv[2]:
+            identity_pid = int(argv[3])
+            ticks = "2000.000001" if self.identity_reused else "1000.000001"
+            alive = self.service_alive if identity_pid == self.service_pid else self.mac_child_alive
+            identity_path = self.binary.resolve()
+            if identity_pid != self.service_pid and self.mac_descendant_binary is not None:
+                identity_path = self.mac_descendant_binary.resolve()
+            return CommandResult(
+                argv,
+                0 if alive else 2,
+                f"service_identity={identity_pid}|{ticks}\nservice_path={identity_path}\n".encode()
+                if alive else b"service_probe_absent\n",
+                b"" if alive else b"",
+            )
+        if argv[0] == "python3" and len(argv) > 2 and "service_probe_pid" in argv[2]:
+            if self.probe_error:
+                return CommandResult(argv, 1, b"service_probe_error\n", b"")
+            return CommandResult(
+                argv,
+                0 if self.service_alive else 2,
+                (
+                    f"service_probe_pid={self.service_pid}\n"
+                    if self.service_alive
+                    else "service_probe_absent\n"
+                ).encode(),
+                b"",
+            )
         if argv[0] == "python3":
             return CommandResult(argv, 0 if self.service_alive else 1, b"", b"")
         if argv[0] == "ps":
-            if argv[1:3] == ("-axo", "pid=,ppid=,lstart="):
-                if not self.service_alive:
+            if argv[1:3] == ("-axo", "pid=,ppid=,pgid=,state="):
+                if not self.service_alive and not (self.platform == "macos" and self.mac_child_alive):
                     return CommandResult(argv, 0, b"", b"")
+                if self.platform == "macos" and not self.service_alive:
+                    return CommandResult(
+                        argv,
+                        0,
+                        b"456 123 123 R\n",
+                        b"",
+                    )
+                if self.platform == "macos":
+                    child_pid = "456" if self.service_pid == 123 else "789"
+                    child_parent = str(self.service_pid)
+                    return CommandResult(
+                        argv,
+                        0,
+                        (
+                            f"{self.service_pid} 1 {self.service_pid} R\n"
+                            f"{child_pid} {child_parent} {self.service_pid} R\n"
+                        ).encode(),
+                        b"",
+                    )
                 return CommandResult(
                     argv,
                     0,
-                    b"123 1 Mon Aug 23 10:00:00 2026\n"
-                    b"456 123 Mon Aug 23 10:00:01 2026\n",
+                    b"123 1 123 R\n456 123 123 R\n",
+                    b"",
+                )
+            if argv[1:3] == ("-p", str(self.service_pid)):
+                if self.probe_error:
+                    return CommandResult(argv, 1, b"", b"permission denied\n")
+                if not self.service_alive:
+                    return CommandResult(argv, 1, b"", b"")
+                if argv[-1] == "pid=":
+                    return CommandResult(argv, 0, f"{self.service_pid}\n".encode(), b"")
+                start = "Mon Aug 23 10:00:01 2026" if self.identity_reused else "Mon Aug 23 10:00:00 2026"
+                return CommandResult(
+                    argv,
+                    0,
+                    f"{self.service_pid} {start} {self.binary.resolve()}\n".encode(),
                     b"",
                 )
             return CommandResult(argv, 0, (str(self.binary.resolve()) + "\n").encode(), b"")
         if argv[0] == "powershell.exe":
             script = argv[argv.index("-Command") + 1]
             if "tree_pid=" in script:
+                if self.tree_partial:
+                    return CommandResult(argv, 0, b"tree_pid=123\nmalformed-tree-row\n", b"")
                 return CommandResult(
                     argv,
                     0,
-                    b"tree_pid=123\ntree_identity=123|100\n"
-                    b"tree_pid=456\ntree_identity=456|200\n",
+                    (
+                        f"tree_pid={self.service_pid}\n"
+                        f"tree_identity={self.service_pid}|100\n"
+                    ).encode(),
                     b"",
                 )
             if "survivor_pid=" in script:
@@ -117,18 +203,40 @@ class HostedDesktopProcessRunner:
                 )
             if "Start-Process" in script:
                 self.service_alive = True
+                self.service_pid = 456
                 Path(argv[7]).write_bytes(b"windows service stdout\n")
                 Path(argv[8]).write_bytes(b"windows service stderr\n")
                 Path(argv[7]).chmod(0o600)
                 Path(argv[8]).chmod(0o600)
                 return CommandResult(argv, 0, b"456\n", b"")
+            if script == _WINDOWS_PROCESS_IDENTITY_SCRIPT:
+                if not self.service_alive:
+                    return CommandResult(argv, 1, b"", b"")
+                ticks = 200 if self.identity_reused else 100
+                return CommandResult(
+                    argv,
+                    0,
+                    f"service_identity={self.service_pid}|{ticks}\nservice_path={self.binary.resolve()}\n".encode(),
+                    b"",
+                )
             if "Get-CimInstance" in script:
                 return CommandResult(
                     argv, 0 if self.service_alive else 1,
                     (str(self.binary.resolve()) + "\n").encode(), b"",
                 )
             if "Get-Process" in script:
-                return CommandResult(argv, 0 if self.service_alive else 1, b"", b"")
+                if self.probe_error:
+                    return CommandResult(argv, 1, b"service_probe_error\n", b"")
+                return CommandResult(
+                    argv,
+                    0 if self.service_alive else 2,
+                    (
+                        f"service_probe_pid={self.service_pid}\n"
+                        if self.service_alive
+                        else "service_probe_absent\n"
+                    ).encode(),
+                    b"",
+                )
             if "Test-NetConnection" in script:
                 return CommandResult(argv, 0 if self.service_alive else 1, b"True\n", b"")
 
@@ -184,7 +292,13 @@ class HostedDesktopAdapterTests(unittest.TestCase):
             capabilities=frozenset(item.value for item in adapter.capabilities),
         )
 
-    def _adapter(self, platform: str, runner: HostedDesktopProcessRunner):
+    def _adapter(
+        self,
+        platform: str,
+        runner: HostedDesktopProcessRunner,
+        *,
+        identity_file: Path | None = None,
+    ):
         root = Path(self.directory.name)
         return adapter_for_platform(
             platform,
@@ -194,6 +308,7 @@ class HostedDesktopAdapterTests(unittest.TestCase):
             service_pid=123,
             service_binary=self.cli,
             service_pid_file=root / f"{platform}.pid",
+            service_identity_file=identity_file,
             service_socket=(
                 Path("127.0.0.1:50051")
                 if platform == "windows"
@@ -231,8 +346,11 @@ class HostedDesktopAdapterTests(unittest.TestCase):
                 self.assertTrue(any(call[:2] == ("ps", "-axo") for call in privileged))
                 self.assertGreaterEqual(
                     sum(call[:2] == ("kill", "-KILL") for call in privileged),
-                    2,
+                    1,
                 )
+                self.assertTrue(any(
+                    call[:3] == ("kill", "-KILL", "-123") for call in privileged
+                ))
                 self.assertTrue(any(call[:2] == ("sh", "-c") for call in privileged))
                 self.assertTrue(any(call[:2] == ("python3", "-c") for call in runner.calls))
                 launch = next(call for call in privileged if call[:2] == ("sh", "-c"))
@@ -254,6 +372,74 @@ class HostedDesktopAdapterTests(unittest.TestCase):
             ),
         )
 
+    def test_macos_strict_census_requires_unique_pid_group_and_state_fields(self) -> None:
+        census = _parse_macos_process_census_strict(
+            "123 1 123 R\n456 123 123 S\n"
+        )
+        self.assertEqual(census[123].process_group, 123)
+        self.assertEqual(census[456].state, "S")
+        for value in (
+            "123 1 123 R\n123 1 123 S\n",
+            "123 1 123 R extra\n",
+            "123 1 0 R\n",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _parse_macos_process_census_strict(value)
+    def test_macos_cleanup_recenses_late_descendant_before_group_signal(self) -> None:
+        class LateChildRunner(HostedDesktopProcessRunner):
+            def __init__(self, binary: Path) -> None:
+                super().__init__(platform="macos", binary=binary)
+                self.census_count = 0
+
+            def run(self, command, *, timeout_seconds):
+                argv = tuple(command)
+                if argv[:4] == ("sudo", "-n", "ps", "-axo") and argv[4] == "pid=,ppid=,pgid=,state=":
+                    self.census_count += 1
+                    if self.census_count >= 2 and self.service_alive:
+                        self.mac_child_alive = True
+                result = super().run(command, timeout_seconds=timeout_seconds)
+                if (
+                    argv[:4] == ("sudo", "-n", "ps", "-axo")
+                    and argv[4] == "pid=,ppid=,pgid=,state="
+                    and self.census_count >= 2
+                    and result.returncode == 0
+                    and result.stdout
+                    and self.service_alive
+                ):
+                    result = CommandResult(
+                        result.command,
+                        result.returncode,
+                        result.stdout + f"789 {self.service_pid} {self.service_pid} R\n".encode(),
+                        result.stderr,
+                    )
+                return result
+
+        runner = LateChildRunner(self.cli)
+        runner.raw_directory = Path(self.directory.name) / "macos-late-child-raw"
+        adapter = self._adapter("macos", runner)
+        assert adapter.service is not None
+        adapter.service._terminate(5.0)
+        self.assertGreaterEqual(runner.census_count, 2)
+        self.assertTrue(any(
+            call[:5] == ("sudo", "-n", "kill", "-KILL", "-123")
+            for call in runner.calls
+        ))
+
+    def test_macos_cleanup_binds_different_binary_descendant_to_owned_group(self) -> None:
+        helper = Path(self.directory.name) / "service-helper"
+        helper.write_bytes(b"synthetic helper executable")
+        helper.chmod(0o700)
+        runner = HostedDesktopProcessRunner(platform="macos", binary=self.cli)
+        runner.raw_directory = Path(self.directory.name) / "macos-helper-child-raw"
+        runner.mac_descendant_binary = helper
+        adapter = self._adapter("macos", runner)
+        assert adapter.service is not None
+        adapter.service._terminate(5.0)
+        self.assertTrue(any(
+            call[:5] == ("sudo", "-n", "kill", "-KILL", "-123")
+            for call in runner.calls
+        ))
+
     def test_windows_process_probes_preserve_diagnostics(self) -> None:
         self.assertNotIn("Out-Null", _WINDOWS_PROCESS_ALIVE_SCRIPT)
         self.assertIn("Write-Output", _WINDOWS_PROCESS_ALIVE_SCRIPT)
@@ -267,6 +453,15 @@ class HostedDesktopAdapterTests(unittest.TestCase):
         self.assertIn("identity_mismatch_pid=", _WINDOWS_PROCESS_TREE_VERIFY_SCRIPT)
         self.assertNotIn("$pid =", _WINDOWS_PROCESS_TREE_SNAPSHOT_SCRIPT)
 
+    def test_macos_identity_probe_uses_precise_native_start_token(self) -> None:
+        from torturer_checks.hosted.macos import _MACOS_PROCESS_IDENTITY_SCRIPT
+
+        self.assertIn("proc_pidinfo", _MACOS_PROCESS_IDENTITY_SCRIPT)
+        self.assertIn("pbi_start_tvusec", _MACOS_PROCESS_IDENTITY_SCRIPT)
+        self.assertIn("proc_pidpath", _MACOS_PROCESS_IDENTITY_SCRIPT)
+        self.assertIn("os.kill(pid, 0)", _MACOS_PROCESS_IDENTITY_SCRIPT)
+        self.assertIn("os.setsid()", _MACOS_SERVICE_LAUNCH_SCRIPT)
+
     def test_windows_tree_identity_rejects_malformed_and_accepts_creation_time(self) -> None:
         self.assertEqual(
             _parse_windows_tree_identities(
@@ -277,6 +472,46 @@ class HostedDesktopAdapterTests(unittest.TestCase):
             ),
             ("123|100",),
         )
+
+    def test_native_identity_parsers_reject_duplicates_extras_and_bad_macos_usec(self) -> None:
+        windows = "service_identity=123|100\nservice_path=C:\\candidate.exe\n"
+        self.assertEqual(
+            _parse_windows_process_identity(windows, 123),
+            ("123|100", "C:\\candidate.exe"),
+        )
+        for value in (
+            windows + "service_path=other.exe\n",
+            windows + "unexpected=field\n",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _parse_windows_process_identity(value, 123)
+
+        macos = "service_identity=123|100.999999\nservice_path=/candidate\n"
+        self.assertEqual(
+            _parse_macos_process_identity(macos, 123),
+            ("123|100.999999", "/candidate"),
+        )
+        for value in (
+            macos + "service_identity=123|100.999999\n",
+            "service_identity=123|100.1000000\nservice_path=/candidate\n",
+            macos + "unexpected=field\n",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _parse_macos_process_identity(value, 123)
+
+    def test_windows_cleanup_rejects_partial_tree_snapshot(self) -> None:
+        identities, complete = _parse_windows_tree_snapshot(
+            "tree_pid=123\nmalformed-tree-row\n"
+        )
+        self.assertEqual(identities, ())
+        self.assertFalse(complete)
+        runner = HostedDesktopProcessRunner(platform="windows", binary=self.cli)
+        runner.raw_directory = Path(self.directory.name) / "windows-partial-tree-raw"
+        runner.tree_partial = True
+        adapter = self._adapter("windows", runner)
+        with self.assertRaisesRegex(ScenarioExecutionError, "SERVICE_TREE_PROBE_FAILED"):
+            adapter.service._terminate(5.0)
+        self.assertFalse(any(call[0] == "taskkill.exe" for call in runner.calls))
 
     def test_windows_service_process_reuse_is_not_a_survivor(self) -> None:
         runner = HostedDesktopProcessRunner(platform="windows", binary=self.cli)
@@ -364,6 +599,215 @@ class HostedDesktopAdapterTests(unittest.TestCase):
             runner.raw_directory = Path(self.directory.name) / f"{platform}-factory-raw"
             adapter = self._adapter(platform, runner)
             self.assertIn(Capability.PROCESS_LOSS, adapter.capabilities)
+
+    def test_adapter_finalization_stops_only_the_restarted_desktop_service(self) -> None:
+        for platform in ("windows", "macos"):
+            with self.subTest(platform=platform):
+                runner = HostedDesktopProcessRunner(platform=platform, binary=self.cli)
+                raw = Path(self.directory.name) / f"{platform}-finalize-raw"
+                raw.mkdir(mode=0o700)
+                runner.raw_directory = raw
+                adapter = self._adapter(platform, runner)
+                service = adapter.service
+                self.assertIsNotNone(service)
+                assert service is not None
+
+                # The initial service remains host-owned.  Only a process-loss
+                # restart opts the controller into adapter-owned finalization.
+                adapter.finalize(5.0)
+                self.assertFalse(any(
+                    call[0] in {"taskkill.exe", "kill"} for call in runner.calls
+                ))
+                service._restart_number = 1
+                if platform == "windows":
+                    service._replacement_identity = "123|100"
+                    stdout = raw / "service.stdout.raw.log"
+                    stderr = raw / "service.stderr.raw.log"
+                    stdout.write_bytes(b"stdout\n")
+                    stderr.write_bytes(b"stderr\n")
+                    stdout.chmod(0o600)
+                    stderr.chmod(0o600)
+                    service._service_evidence_paths = (stdout, stderr)
+                else:
+                    service._replacement_identity = "123|1000.000001"
+
+                adapter.finalize(5.0)
+                self.assertTrue(any(
+                    call[0] in {"taskkill.exe", "kill"} for call in runner.calls
+                ))
+                if platform == "windows":
+                    self.assertEqual(len(runner.external_evidence), 2)
+
+    def test_desktop_finalization_refuses_same_path_reused_root_pid(self) -> None:
+        for platform in ("windows", "macos"):
+            with self.subTest(platform=platform):
+                runner = HostedDesktopProcessRunner(platform=platform, binary=self.cli)
+                raw = Path(self.directory.name) / f"{platform}-reused-root-raw"
+                raw.mkdir(mode=0o700)
+                runner.raw_directory = raw
+                adapter = self._adapter(platform, runner)
+                assert adapter.service is not None
+                service = adapter.service
+                service._restart_number = 1
+                service._replacement_identity = (
+                    "123|100"
+                    if platform == "windows"
+                    else "123|1000.000001"
+                )
+                if platform == "windows":
+                    stdout = raw / "service.stdout.raw.log"
+                    stderr = raw / "service.stderr.raw.log"
+                    stdout.write_bytes(b"stdout\n")
+                    stderr.write_bytes(b"stderr\n")
+                    stdout.chmod(0o600)
+                    stderr.chmod(0o600)
+                    service._service_evidence_paths = (stdout, stderr)
+                runner.identity_reused = True
+                with self.assertRaisesRegex(
+                    (ScenarioExecutionError, HostedAdapterError),
+                    "SERVICE_PID_NOT_CANDIDATE",
+                ):
+                    adapter.finalize(5.0)
+                self.assertFalse(any(
+                    call[0] in {"taskkill.exe", "kill"} for call in runner.calls
+                ))
+
+    def test_desktop_finalization_refuses_an_unowned_partial_restart(self) -> None:
+        for platform in ("windows", "macos"):
+            with self.subTest(platform=platform):
+                runner = HostedDesktopProcessRunner(platform=platform, binary=self.cli)
+                runner.raw_directory = Path(self.directory.name) / f"{platform}-partial-raw"
+                adapter = self._adapter(platform, runner)
+                assert adapter.service is not None
+                adapter.service._restart_number = 1
+                with self.assertRaisesRegex(ScenarioExecutionError, "SERVICE_PID_PROBE_FAILED"):
+                    adapter.finalize(5.0)
+                self.assertFalse(any(
+                    call[0] in {"taskkill.exe", "kill"} for call in runner.calls
+                ))
+
+    def test_desktop_process_loss_refuses_a_reused_initial_pid(self) -> None:
+        for platform in ("windows", "macos"):
+            with self.subTest(platform=platform):
+                runner = HostedDesktopProcessRunner(platform=platform, binary=self.cli)
+                runner.raw_directory = Path(self.directory.name) / f"{platform}-initial-reuse-raw"
+                adapter = self._adapter(platform, runner)
+                assert adapter.service is not None
+                runner.identity_reused = True
+                with self.assertRaisesRegex(ScenarioExecutionError, "SERVICE_PID_NOT_CANDIDATE"):
+                    adapter.service.restart_after_loss(5.0)
+                self.assertFalse(any(
+                    call[0] in {"taskkill.exe", "kill"} for call in runner.calls
+                ))
+
+    def test_desktop_liveness_probe_error_is_not_absence(self) -> None:
+        for platform in ("windows", "macos"):
+            with self.subTest(platform=platform):
+                runner = HostedDesktopProcessRunner(platform=platform, binary=self.cli)
+                raw = Path(self.directory.name) / f"{platform}-probe-error-raw"
+                raw.mkdir(mode=0o700)
+                runner.raw_directory = raw
+                adapter = self._adapter(platform, runner)
+                assert adapter.service is not None
+                runner.probe_error = True
+                with self.assertRaisesRegex(ScenarioExecutionError, "SERVICE_PROBE_FAILED"):
+                    adapter.service._alive(1.0)
+
+    def test_windows_absence_marker_with_stderr_is_probe_failure(self) -> None:
+        controller = object.__new__(WindowsServiceProcessController)
+        controller.pid = 123
+        controller._probe = mock.Mock(
+            return_value=CommandResult(
+                ("powershell.exe",), 2, b"service_probe_absent\n", b"warning\n"
+            )
+        )
+        with self.assertRaisesRegex(ScenarioExecutionError, "SERVICE_PROBE_FAILED"):
+            controller._alive(1.0)
+
+    def test_desktop_restart_uses_detached_launcher_when_runner_provides_one(self) -> None:
+        class DetachedRunner(HostedDesktopProcessRunner):
+            def __init__(self, platform: str, binary: Path) -> None:
+                super().__init__(platform=platform, binary=binary)
+                self.detached_calls: list[tuple[str, ...]] = []
+
+            def run_detached(self, command, *, timeout_seconds):
+                self.detached_calls.append(tuple(command))
+                return self.run(command, timeout_seconds=timeout_seconds)
+
+        for platform in ("windows", "macos"):
+            with self.subTest(platform=platform):
+                runner = DetachedRunner(platform, self.cli)
+                runner.raw_directory = Path(self.directory.name) / f"{platform}-detached-raw"
+                runner.raw_directory.mkdir(mode=0o700)
+                adapter = self._adapter(platform, runner)
+                assert adapter.service is not None
+                adapter.service._start(5.0)
+                self.assertEqual(len(runner.detached_calls), 1)
+                if platform == "macos":
+                    self.assertEqual(runner.detached_calls[0][2], "sh")
+                    self.assertEqual(runner.detached_calls[0][3], "-c")
+                    self.assertIn("binary=$1", runner.detached_calls[0][4])
+                else:
+                    self.assertEqual(runner.detached_calls[0][0], "powershell.exe")
+                    self.assertIn("Start-Process", runner.detached_calls[0][5])
+
+    def test_pid_file_write_failure_retains_owned_identity_for_finalization(self) -> None:
+        for platform in ("windows", "macos"):
+            with self.subTest(platform=platform):
+                runner = HostedDesktopProcessRunner(platform=platform, binary=self.cli)
+                raw = Path(self.directory.name) / f"{platform}-pid-write-failure-raw"
+                raw.mkdir(mode=0o700)
+                runner.raw_directory = raw
+                identity_file = raw / (
+                    "service.identity.json" if platform == "macos" else "service.identity"
+                )
+                adapter = self._adapter(platform, runner, identity_file=identity_file)
+                assert adapter.service is not None
+                service = adapter.service
+                observed_sidecars: list[str] = []
+                verify = service._verify_candidate_pid
+
+                def verify_after_sidecar_invalidation(timeout: float):
+                    observed_sidecars.append(identity_file.read_text(encoding="utf-8"))
+                    return verify(timeout)
+
+                with mock.patch.object(
+                    service, "_verify_candidate_pid", side_effect=verify_after_sidecar_invalidation
+                ):
+                    with mock.patch.object(
+                        service, "_write_pid", side_effect=OSError("injected pid-file failure")
+                    ):
+                        with self.assertRaises(OSError):
+                            service._start(5.0)
+                self.assertEqual(observed_sidecars, ["pending\n"])
+                self.assertIsNotNone(service._replacement_identity)
+                if platform == "windows":
+                    self.assertEqual(identity_file.read_text(encoding="ascii").strip(), "456|100")
+                else:
+                    self.assertEqual(
+                        json.loads(identity_file.read_text(encoding="utf-8"))["native_start"],
+                        "1000.000001",
+                    )
+                # The catch/finalizer path must stop the proven replacement,
+                # even though the authoritative PID file was not updated.
+                adapter.finalize(5.0)
+
+    def test_desktop_identity_file_is_explicit_not_ambient_environment(self) -> None:
+        for platform in ("windows", "macos"):
+            with self.subTest(platform=platform):
+                runner = HostedDesktopProcessRunner(platform=platform, binary=self.cli)
+                runner.raw_directory = Path(self.directory.name) / f"{platform}-explicit-raw"
+                runner.raw_directory.mkdir(mode=0o700)
+                identity_file = runner.raw_directory / "explicit.identity"
+                ambient_file = runner.raw_directory / "ambient.identity"
+                with mock.patch.dict(
+                    os.environ, {"SERVICE_IDENTITY_FILE": str(ambient_file)}, clear=False
+                ):
+                    adapter = self._adapter(platform, runner, identity_file=identity_file)
+                assert adapter.service is not None
+                self.assertEqual(adapter.service.identity_file, identity_file)
+                self.assertTrue(identity_file.exists())
+                self.assertFalse(ambient_file.exists())
 
     def test_desktop_process_seam_fails_closed_on_incomplete_or_unsafe_configuration(self) -> None:
         runner = HostedDesktopProcessRunner(platform="windows", binary=self.cli)
