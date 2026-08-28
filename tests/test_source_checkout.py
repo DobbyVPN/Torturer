@@ -278,6 +278,39 @@ class SourceCheckoutTest(unittest.TestCase):
         with patch.object(source_checkout.os, "kill", side_effect=PermissionError):
             self.assertTrue(source_checkout._pid_alive(os.getpid()))
 
+    def test_windows_liveness_uses_complete_census_for_alive_and_gone(self) -> None:
+        pid = 2460
+        census = {pid: (1, 0, "creation-time", "R")}
+        with (
+            patch.object(source_checkout.os, "name", "nt"),
+            patch("torturer_checks.hosted.cli._process_snapshot", return_value=census),
+            patch.object(
+                source_checkout.os,
+                "kill",
+                side_effect=OSError(87, "The parameter is incorrect"),
+            ) as kill,
+        ):
+            self.assertTrue(source_checkout._pid_alive(pid))
+            kill.assert_not_called()
+
+        with (
+            patch.object(source_checkout.os, "name", "nt"),
+            patch("torturer_checks.hosted.cli._process_snapshot", return_value={}),
+        ):
+            self.assertFalse(source_checkout._pid_alive(pid))
+
+    def test_windows_liveness_census_error_is_unproven(self) -> None:
+        pid = 2460
+        with (
+            patch.object(source_checkout.os, "name", "nt"),
+            patch(
+                "torturer_checks.hosted.cli._process_snapshot",
+                side_effect=OSError(87, "The parameter is incorrect"),
+            ),
+        ):
+            # A census error must not be converted into a clean disappearance.
+            self.assertTrue(source_checkout._pid_alive(pid))
+
     def test_windows_leader_exit_without_descendant_census_fails_closed(self) -> None:
         class ExitedProcess:
             pid = 12345

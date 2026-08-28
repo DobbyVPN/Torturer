@@ -527,6 +527,24 @@ def _pid_alive(pid: int, *, deadline: float | None = None) -> bool:
         # An unperformed deadline-bound probe cannot prove that the PID is
         # gone. Keep it in the survivor set so cleanup fails closed.
         return True
+    if os.name == "nt":
+        # ``os.kill(pid, 0)`` is not a liveness probe on Windows.  CPython's
+        # Windows implementation can raise ERROR_INVALID_PARAMETER (87) for
+        # this signal even when the PID has already exited.  Use the bounded
+        # Toolhelp census shared by the hosted adapter instead.  A missing PID
+        # is a gone observation only when the census itself completed; an
+        # unavailable census remains unproven and therefore alive.
+        try:
+            from torturer_checks.hosted.cli import _process_snapshot
+
+            snapshot = _process_snapshot(deadline=deadline)
+        except (ImportError, OSError, TypeError, ValueError):
+            return True
+        if snapshot is None:
+            return True
+        if deadline is not None and time.monotonic() > deadline:
+            return True
+        return pid in snapshot
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
