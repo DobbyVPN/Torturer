@@ -94,8 +94,24 @@ def _safe_stem(value: str) -> str:
     return stem or "preflight"
 
 
-def _validate_evidence_path(directory: Path, *, allow_missing_final: bool = False) -> None:
-    """Reject symlinked/non-directory ancestors and unsafe final directories."""
+def _validate_evidence_path(
+    directory: Path,
+    *,
+    allow_missing_final: bool = False,
+    host_os: str | None = None,
+) -> None:
+    """Reject unsafe evidence paths with platform-correct permissions.
+
+    The default evidence directory is created by ``tempfile.mkdtemp`` and
+    resolved by ``_evidence_directory`` before validation, allowing an
+    OS-managed alias such as macOS ``/var``. Explicit configured paths still
+    receive the strict symlink checks below. Windows ACLs are not represented
+    by POSIX mode bits, so Unix owner/mode checks are intentionally skipped on
+    that platform while path-target checks remain enforced.
+    """
+
+    validation_os = host_os or os.name
+    posix_permissions = validation_os == "posix"
 
     if not directory.is_absolute():
         raise SourceCheckoutError(f"preflight evidence directory must be absolute: {directory}")
@@ -113,7 +129,12 @@ def _validate_evidence_path(directory: Path, *, allow_missing_final: bool = Fals
             raise SourceCheckoutError(f"preflight evidence path contains a symlink: {current}")
         if not stat.S_ISDIR(info.st_mode):
             raise SourceCheckoutError(f"preflight evidence path is not a directory: {current}")
-        if current != directory and (info.st_mode & stat.S_IWOTH) and not (info.st_mode & stat.S_ISVTX):
+        if (
+            posix_permissions
+            and current != directory
+            and (info.st_mode & stat.S_IWOTH)
+            and not (info.st_mode & stat.S_ISVTX)
+        ):
             raise SourceCheckoutError(f"preflight evidence ancestor is world-writable: {current}")
 
     try:
@@ -126,9 +147,9 @@ def _validate_evidence_path(directory: Path, *, allow_missing_final: bool = Fals
         raise SourceCheckoutError(f"preflight evidence directory must not be a symlink: {directory}")
     if not stat.S_ISDIR(info.st_mode):
         raise SourceCheckoutError(f"preflight evidence path is not a directory: {directory}")
-    if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+    if posix_permissions and hasattr(os, "geteuid") and info.st_uid != os.geteuid():
         raise SourceCheckoutError(f"preflight evidence directory is not owner-controlled: {directory}")
-    if info.st_mode & 0o077:
+    if posix_permissions and info.st_mode & 0o077:
         raise SourceCheckoutError(f"preflight evidence directory must be mode 0700: {directory}")
 
 
@@ -140,7 +161,10 @@ def _evidence_directory(requested: Path | None) -> Path:
         # Keep a local original even when a caller did not provide its normal
         # retained-results directory. It is owner-only and intentionally not
         # removed by this helper, so a failed run remains diagnosable.
-        directory = Path(tempfile.mkdtemp(prefix="torturer-preflight-evidence-"))
+        # macOS exposes its temporary root through /var -> /private/var. The
+        # directory was just created by mkdtemp, so resolving only this
+        # OS-managed path is safe and does not weaken explicit-path checks.
+        directory = Path(tempfile.mkdtemp(prefix="torturer-preflight-evidence-")).resolve()
     if not directory.is_absolute():
         raise SourceCheckoutError(f"preflight evidence directory must be absolute: {directory}")
     _validate_evidence_path(directory, allow_missing_final=True)

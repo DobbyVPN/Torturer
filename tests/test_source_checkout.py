@@ -20,7 +20,9 @@ from torturer_checks.source_checkout import (
     MAX_PREFLIGHT_SECONDS,
     SourceCheckoutError,
     TreeCleanup,
+    _evidence_directory,
     _proc_descendants,
+    _validate_evidence_path,
     _wait_for_tree,
     run_bounded_preflight,
     verify_source_checkout,
@@ -238,6 +240,39 @@ class SourceCheckoutTest(unittest.TestCase):
                     ("python3", "-c", "print('not-run')"),
                     evidence_directory=Path("relative-evidence"),
                 )
+
+    def test_default_evidence_resolves_os_managed_temp_aliases(self) -> None:
+        """macOS's /var -> /private/var alias must not reject preflight evidence."""
+
+        with tempfile.TemporaryDirectory(prefix="preflight-temp-alias-") as temporary:
+            root = Path(temporary)
+            real_temp = root / "private" / "var" / "folders"
+            real_temp.mkdir(parents=True)
+            aliased_temp = root / "var"
+            aliased_temp.symlink_to(root / "private" / "var", target_is_directory=True)
+            generated = aliased_temp / "folders" / "torturer"
+            generated.mkdir(mode=0o700)
+            with patch.object(source_checkout.tempfile, "mkdtemp", return_value=str(generated)):
+                evidence = _evidence_directory(None)
+            self.assertEqual(evidence, generated.resolve())
+            self.assertFalse(evidence.is_symlink())
+            self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o700)
+
+    def test_explicit_evidence_target_symlink_is_still_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="preflight-explicit-evidence-") as temporary:
+            root = Path(temporary)
+            real = root / "real"
+            real.mkdir()
+            link = root / "link"
+            link.symlink_to(real, target_is_directory=True)
+            with self.assertRaisesRegex(SourceCheckoutError, "contains a symlink"):
+                _validate_evidence_path(link)
+
+    def test_windows_evidence_validation_does_not_apply_posix_mode_bits(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="preflight-windows-evidence-") as temporary:
+            directory = Path(temporary) / "evidence"
+            directory.mkdir(mode=0o755)
+            _validate_evidence_path(directory, host_os="nt")
 
     def test_permission_denial_is_unproven_liveness(self) -> None:
         with patch.object(source_checkout.os, "kill", side_effect=PermissionError):

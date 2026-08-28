@@ -39,6 +39,7 @@ from torturer_checks.linux_slice import (
     require_success,
     service_environment,
     stop_service,
+    _open_owner_only_service_log,
     verify_expected_process,
     wait_for_socket,
 )
@@ -247,10 +248,23 @@ class LinuxSliceHelperTest(unittest.TestCase):
 
     def test_service_diagnostics_are_binary_retained_and_not_truncated(self) -> None:
         source = (TORTURER_ROOT / "torturer_checks" / "linux_slice.py").read_text(encoding="utf-8")
-        self.assertIn('service_log_path.open("xb", buffering=0)', source)
+        self.assertIn('path.open("xb", buffering=0)', source)
+        self.assertIn("os.fchmod(service_log.fileno(), 0o600)", source)
+        self.assertNotIn("service_log.chmod", source)
         self.assertIn("service.combined.raw.log", source)
         self.assertIn("path.read_bytes()", source)
         self.assertNotIn("logs[-", source)
+
+    def test_service_log_creation_enforces_owner_only_mode_on_path(self) -> None:
+        """Exercise the FileIO permission boundary used by the service launch."""
+
+        with tempfile.TemporaryDirectory(prefix="linux-service-log-") as temporary:
+            path = Path(temporary) / "service.combined.log"
+            with _open_owner_only_service_log(path) as service_log:
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                service_log.write(b"complete service diagnostic\n")
+                service_log.flush()
+            self.assertEqual(path.read_bytes(), b"complete service diagnostic\n")
 
     def test_canonical_linux_primitives_require_state_repair_and_process_proofs(self) -> None:
         source = (TORTURER_ROOT / "torturer_checks" / "linux_slice.py").read_text(encoding="utf-8")

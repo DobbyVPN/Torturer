@@ -84,6 +84,44 @@ class SliceFailure(RuntimeError):
     """One required public-contract assertion did not hold."""
 
 
+_FAILURE_URL = re.compile(r"(?i)\b(?:https?|wss?)://[^\s]+")
+_FAILURE_AUTH_SCHEME = re.compile(r"(?i)\b(?:bearer|basic)\s+[^\s,;]+")
+_FAILURE_SECRET = re.compile(
+    r'''(?ix)
+    (?P<label>
+        ["']?
+        \b(?:
+            token|access[_-]?token|refresh[_-]?token|id[_-]?token|
+            password|passwd|secret|client[_-]?secret|credential|
+            api[_-]?key|private[_-]?key|authorization|cookie
+        )\b
+        ["']?
+        \s*[:=]\s*
+    )
+    (?:(?:bearer|basic)\s+)?
+    (?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)
+    '''
+)
+
+
+def safe_failure_reason(error: BaseException) -> str:
+    """Return useful failure detail while keeping hosted output secretless.
+
+    The first line is the contract-level failure summary. Later lines may
+    contain ``CommandResult.describe()`` output and therefore remain only in
+    the retained evidence instead of crossing the public workflow boundary.
+    Defensively remove URLs and common credential forms from the summary too.
+    """
+
+    message = str(error).splitlines()[0].strip() if str(error) else ""
+    if not message:
+        return "unspecified failure"
+    message = _FAILURE_URL.sub("<redacted-url>", message)
+    message = _FAILURE_SECRET.sub(r"\g<label><redacted>", message)
+    message = _FAILURE_AUTH_SCHEME.sub("<redacted-auth>", message)
+    return message
+
+
 @dataclass(frozen=True)
 class CommandResult:
     command: tuple[str, ...]
@@ -328,7 +366,22 @@ def _safe_evidence_stem(label: str) -> str:
     return stem or "command"
 
 
-def _validate_evidence_directory(directory: Path, *, allow_missing_final: bool = False) -> None:
+def _validate_evidence_directory(
+    directory: Path,
+    *,
+    allow_missing_final: bool = False,
+    host_os: str | None = None,
+) -> None:
+    """Validate evidence without treating Windows mode bits as ACLs.
+
+    The default directory is created by ``tempfile.mkdtemp`` and resolved by
+    ``_prepare_evidence_directory`` before reaching this validator.  This
+    accommodates OS-managed aliases such as macOS ``/var`` while preserving
+    strict symlink checks for explicitly configured paths.
+    """
+
+    validation_os = host_os or os.name
+    posix_permissions = validation_os == "posix"
     if not directory.is_absolute():
         raise SliceFailure(f"desktop evidence directory must be absolute: {directory}")
     current = Path(directory.anchor)
@@ -342,7 +395,12 @@ def _validate_evidence_directory(directory: Path, *, allow_missing_final: bool =
             raise SliceFailure(f"desktop evidence path contains a symlink: {current}")
         if not stat.S_ISDIR(details.st_mode):
             raise SliceFailure(f"desktop evidence path is not a directory: {current}")
-        if current != directory and (details.st_mode & stat.S_IWOTH) and not (details.st_mode & stat.S_ISVTX):
+        if (
+            posix_permissions
+            and current != directory
+            and (details.st_mode & stat.S_IWOTH)
+            and not (details.st_mode & stat.S_ISVTX)
+        ):
             raise SliceFailure(f"desktop evidence ancestor is world-writable: {current}")
     try:
         details = os.lstat(directory)
@@ -354,9 +412,9 @@ def _validate_evidence_directory(directory: Path, *, allow_missing_final: bool =
         raise SliceFailure(f"desktop evidence directory must not be a symlink: {directory}")
     if not stat.S_ISDIR(details.st_mode):
         raise SliceFailure(f"desktop evidence path is not a directory: {directory}")
-    if hasattr(os, "geteuid") and details.st_uid != os.geteuid():
+    if posix_permissions and hasattr(os, "geteuid") and details.st_uid != os.geteuid():
         raise SliceFailure(f"desktop evidence directory is not owner-controlled: {directory}")
-    if details.st_mode & 0o077:
+    if posix_permissions and details.st_mode & 0o077:
         raise SliceFailure(f"desktop evidence directory must be mode 0700: {directory}")
 
 
@@ -364,7 +422,10 @@ def _prepare_evidence_directory(configured: Path | str | None) -> Path:
     if configured:
         directory = Path(configured).expanduser()
     else:
-        directory = Path(tempfile.mkdtemp(prefix="torturer-desktop-evidence-"))
+        # The OS owns the temp-root alias (for example macOS ``/var``).  The
+        # directory itself was just created by mkdtemp, so resolving only this
+        # generated path preserves strict checks for explicit caller paths.
+        directory = Path(tempfile.mkdtemp(prefix="torturer-desktop-evidence-")).resolve()
     _validate_evidence_directory(directory, allow_missing_final=True)
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     _validate_evidence_directory(directory)
@@ -1517,7 +1578,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout_seconds=args.timeout,
         )
     except SliceFailure as error:
-        print(f"desktop_slice status=failed code={type(error).__name__}", file=sys.stderr)
+        print(
+            "desktop_slice status=failed "
+            f"code={type(error).__name__} reason={safe_failure_reason(error)}",
+            file=sys.stderr,
+        )
         return 1
     print(
         "Torturer desktop slice passed: source builds, safe CLI lifecycle, "

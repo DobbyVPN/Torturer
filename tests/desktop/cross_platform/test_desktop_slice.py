@@ -43,7 +43,10 @@ from torturer_checks.desktop_slice import (
     service_build_command,
     service_command,
     service_environment,
+    safe_failure_reason,
     stop_service,
+    _prepare_evidence_directory,
+    _validate_evidence_directory,
     validate_target,
     wait_for_tcp,
     wait_for_unix_socket,
@@ -419,6 +422,39 @@ class DesktopSliceHelperTest(unittest.TestCase):
                 evidence_label="default-persistent",
             )
 
+    def test_default_evidence_resolves_os_managed_temp_aliases(self) -> None:
+        """macOS's /var -> /private/var alias must not reject fresh evidence."""
+
+        with tempfile.TemporaryDirectory(prefix="desktop-temp-alias-") as temporary:
+            root = Path(temporary)
+            real_temp = root / "private" / "var" / "folders"
+            real_temp.mkdir(parents=True)
+            aliased_temp = root / "var"
+            aliased_temp.symlink_to(root / "private" / "var", target_is_directory=True)
+            generated = aliased_temp / "folders" / "torturer"
+            generated.mkdir(mode=0o700)
+            with patch.object(desktop_slice.tempfile, "mkdtemp", return_value=str(generated)):
+                evidence = _prepare_evidence_directory(None)
+            self.assertEqual(evidence, generated.resolve())
+            self.assertFalse(evidence.is_symlink())
+            self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o700)
+
+    def test_explicit_evidence_target_symlink_is_still_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="desktop-explicit-evidence-") as temporary:
+            root = Path(temporary)
+            real = root / "real"
+            real.mkdir()
+            link = root / "link"
+            link.symlink_to(real, target_is_directory=True)
+            with self.assertRaisesRegex(SliceFailure, "contains a symlink"):
+                _validate_evidence_directory(link)
+
+    def test_windows_evidence_validation_does_not_apply_posix_mode_bits(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="desktop-windows-evidence-") as temporary:
+            directory = Path(temporary) / "evidence"
+            directory.mkdir(mode=0o755)
+            _validate_evidence_directory(directory, host_os="nt")
+
     def test_run_budget_enforces_1800_seconds_and_preserves_cleanup_reserve(self) -> None:
         self.assertEqual(MAX_RUN_SECONDS, 1800)
         self.assertGreater(CLEANUP_RESERVE_SECONDS, 0)
@@ -459,6 +495,69 @@ class DesktopSliceHelperTest(unittest.TestCase):
             require_success(failure, "phase")
         with self.assertRaisesRegex(SliceFailure, "unexpectedly succeeded"):
             require_nonzero(CommandResult(("tool",), 0, "", ""), "phase")
+
+    def test_safe_failure_reason_preserves_contract_detail_without_secrets(self) -> None:
+        reason = safe_failure_reason(
+            SliceFailure(
+                "service exited before readiness (exit code 1); "
+                "token=private-token Authorization: Bearer private-bearer "
+                '\"password\": \"private-json\" '
+                "access_token=private-access refresh-token=private-refresh "
+                "id_token=private-id client_secret=private-client "
+                "private_key=private-key Bearer private-unlabelled "
+                "https://profile.example.test/config?secret=private"
+            )
+        )
+        self.assertIn("service exited before readiness (exit code 1)", reason)
+        self.assertIn("token=<redacted>", reason)
+        self.assertIn("Authorization: <redacted>", reason)
+        self.assertIn('\"password\": <redacted>', reason)
+        self.assertIn("<redacted-url>", reason)
+        self.assertNotIn("private-token", reason)
+        self.assertNotIn("private-bearer", reason)
+        self.assertNotIn("private-json", reason)
+        self.assertNotIn("private-access", reason)
+        self.assertNotIn("private-refresh", reason)
+        self.assertNotIn("private-id", reason)
+        self.assertNotIn("private-client", reason)
+        self.assertNotIn("private-key", reason)
+        self.assertNotIn("private-unlabelled", reason)
+        self.assertNotIn("profile.example.test", reason)
+
+    def test_safe_failure_reason_never_publishes_retained_command_streams(self) -> None:
+        reason = safe_failure_reason(
+            SliceFailure(
+                "CLI status failed\n"
+                "command=('tool',) returncode=1 stdout='private-output' "
+                "stderr='private-error'"
+            )
+        )
+        self.assertEqual(reason, "CLI status failed")
+        self.assertNotIn("private-output", reason)
+        self.assertNotIn("private-error", reason)
+
+    def test_main_publishes_safe_failure_reason_instead_of_only_exception_type(self) -> None:
+        captured_stderr = io.StringIO()
+        failure = SliceFailure("service exited before readiness (exit code 7)")
+        with patch.object(desktop_slice, "run_slice", side_effect=failure):
+            with redirect_stderr(captured_stderr):
+                result = desktop_slice.main(
+                    [
+                        "--candidate",
+                        "/candidate",
+                        "--commit-sha",
+                        "0123456789abcdef0123456789abcdef01234567",
+                        "--platform",
+                        "macos",
+                        "--arch",
+                        "arm64",
+                    ]
+                )
+        self.assertEqual(result, 1)
+        self.assertIn(
+            "desktop_slice status=failed code=SliceFailure reason=service exited before readiness (exit code 7)",
+            captured_stderr.getvalue(),
+        )
 
     def test_candidate_path_requires_both_gradle_launchers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
