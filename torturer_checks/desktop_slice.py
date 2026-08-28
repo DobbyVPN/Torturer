@@ -97,6 +97,77 @@ class SliceFailure(RuntimeError):
     """One required public-contract assertion did not hold."""
 
 
+SERVICE_STARTUP_CONTROL_AUTH_FAILED = "CONTROL_AUTH_INIT_FAILED"
+SERVICE_STARTUP_LOOPBACK_LISTEN_FAILED = "LOOPBACK_LISTEN_FAILED"
+SERVICE_STARTUP_INTERRUPTED_STATE_RECOVERY_FAILED = "INTERRUPTED_STATE_RECOVERY_FAILED"
+SERVICE_STARTUP_SECURE_LOCAL_LOGGING_FAILED = "SECURE_LOCAL_LOGGING_FAILED"
+SERVICE_STARTUP_GRPC_SERVE_FAILED = "GRPC_SERVE_FAILED"
+SERVICE_STARTUP_EMPTY = "EMPTY"
+SERVICE_STARTUP_UNCLASSIFIED = "UNCLASSIFIED"
+
+# These are exact, stable fragments emitted by DobbyVPN's public Go desktop
+# startup paths.  The classifier returns only the fixed values above; it never
+# returns a service-log fragment.  Keep the order aligned with startup so a
+# single malformed log cannot make the public reason depend on arbitrary text.
+_SERVICE_STARTUP_RULES = (
+    (b"failed to initialize secure local logging", SERVICE_STARTUP_SECURE_LOCAL_LOGGING_FAILED),
+    (b"failed to recover interrupted product state", SERVICE_STARTUP_INTERRUPTED_STATE_RECOVERY_FAILED),
+    (b"failed to prepare control authentication", SERVICE_STARTUP_CONTROL_AUTH_FAILED),
+    (b"failed to listen", SERVICE_STARTUP_LOOPBACK_LISTEN_FAILED),
+    (b"failed to serve", SERVICE_STARTUP_GRPC_SERVE_FAILED),
+)
+
+
+def classify_service_startup_log(payload: bytes) -> str:
+    """Map private service-startup bytes to one fixed public-safe class.
+
+    The complete payload remains owner-only evidence.  This function must stay
+    deliberately boring: it accepts bytes, performs only fixed substring
+    checks, and returns an allow-listed value.  In particular, no candidate
+    path, user name, endpoint, URL, credential, or other log text is returned.
+    Callers that read a file should handle read failures and use
+    ``SERVICE_STARTUP_UNCLASSIFIED`` while preserving the original failure.
+    """
+
+    if not isinstance(payload, bytes):
+        return SERVICE_STARTUP_UNCLASSIFIED
+    lowered = payload.lower()
+    for needle, classification in _SERVICE_STARTUP_RULES:
+        if needle in lowered:
+            return classification
+    return SERVICE_STARTUP_EMPTY if not lowered.strip(b"\x00\t\r\n ") else SERVICE_STARTUP_UNCLASSIFIED
+
+
+def _service_startup_class_from_path(path: Path) -> str:
+    """Read a private startup log for classification without masking a failure."""
+
+    try:
+        return classify_service_startup_log(path.read_bytes())
+    except Exception:
+        # The service failure and the original complete log-retention path are
+        # still handled by the caller/finally block.  A diagnostic read issue
+        # must never turn a real startup failure into an exception from this
+        # best-effort classifier.
+        return SERVICE_STARTUP_UNCLASSIFIED
+
+
+def _is_service_exit_before_readiness(error: BaseException) -> bool:
+    """Identify only the readiness early-exit assertion for startup decoding."""
+
+    first_line = str(error).splitlines()[0].strip() if str(error) else ""
+    return first_line.startswith("service exited before readiness (exit code ")
+
+
+def _service_failure_summary(error: BaseException, service_log_path: Path) -> str:
+    """Add a fixed startup class without exposing service bytes or masking error."""
+
+    startup_detail = ""
+    if _is_service_exit_before_readiness(error):
+        startup_class = _service_startup_class_from_path(service_log_path)
+        startup_detail = f"; startup_failure_class={startup_class}"
+    return f"{error}{startup_detail}; complete service diagnostics retained privately"
+
+
 _FAILURE_URL = re.compile(r"(?i)\b(?:https?|wss?)://[^\s]+")
 _FAILURE_AUTH_SCHEME = re.compile(r"(?i)\b(?:bearer|basic)\s+[^\s,;]+")
 _FAILURE_SECRET = re.compile(
@@ -1597,8 +1668,12 @@ def run_slice(
             port = reserve_loopback_port() if target_platform == "windows" else None
             environment = service_environment(target_platform, runtime, port)
             service_log_path = runtime.root / "service.combined.log"
-            with service_log_path.open("wb", buffering=0) as service_log:
-                try:
+            try:
+                # Close the parent's copy immediately after launch.  The child
+                # retains its redirected handle, while Windows evidence reads
+                # and temporary-directory cleanup are no longer exposed to a
+                # parent-held sharing violation.
+                with service_log_path.open("wb", buffering=0) as service_log:
                     process = popen_with_windows_job(
                         subprocess.Popen,
                         service_command(service, target_platform, port),
@@ -1612,46 +1687,43 @@ def run_slice(
                         stage=f"desktop-service-{target_platform}",
                         deadline=budget.deadline,
                     )
-                except WindowsJobError as error:
-                    service_log.flush()
-                    if evidence_root is not None:
-                        _emit_and_retain_service_log(service_log_path, evidence_root)
-                    raise SliceFailure(str(error)) from error
-                process._torturer_tracked = {process.pid}  # type: ignore[attr-defined]
+            except WindowsJobError as error:
+                if evidence_root is not None:
+                    _emit_and_retain_service_log(service_log_path, evidence_root)
+                raise SliceFailure(str(error)) from error
+            process._torturer_tracked = {process.pid}  # type: ignore[attr-defined]
+            try:
+                if target_platform == "macos":
+                    if runtime.socket_path is None:  # Defensive narrowing for type checkers.
+                        raise SliceFailure("macOS runtime has no control socket path")
+                    wait_for_unix_socket(runtime.socket_path, process, budget.operation_timeout(timeout_seconds))
+                else:
+                    if port is None:
+                        raise SliceFailure("Windows runtime has no loopback TCP port")
+                    wait_for_tcp(port, process, budget.operation_timeout(timeout_seconds))
+                    assert_windows_token_path(runtime)
+                assert_cli_contract(
+                    root,
+                    target_platform,
+                    environment,
+                    runtime.fixture,
+                    budget=budget,
+                    evidence_directory=evidence_root,
+                )
+            except SliceFailure as error:
+                raise SliceFailure(
+                    _service_failure_summary(error, service_log_path)
+                ) from error
+            finally:
                 try:
-                    if target_platform == "macos":
-                        if runtime.socket_path is None:  # Defensive narrowing for type checkers.
-                            raise SliceFailure("macOS runtime has no control socket path")
-                        wait_for_unix_socket(runtime.socket_path, process, budget.operation_timeout(timeout_seconds))
-                    else:
-                        if port is None:
-                            raise SliceFailure("Windows runtime has no loopback TCP port")
-                        wait_for_tcp(port, process, budget.operation_timeout(timeout_seconds))
-                        assert_windows_token_path(runtime)
-                    assert_cli_contract(
-                        root,
-                        target_platform,
-                        environment,
-                        runtime.fixture,
-                        budget=budget,
+                    stop_service(
+                        process,
+                        runtime.socket_path,
+                        timeout_seconds=budget.cleanup_timeout(),
                         evidence_directory=evidence_root,
                     )
-                except SliceFailure as error:
-                    service_log.flush()
-                    raise SliceFailure(
-                        f"{error}; complete service diagnostics retained privately"
-                    ) from error
                 finally:
-                    try:
-                        stop_service(
-                            process,
-                            runtime.socket_path,
-                            timeout_seconds=budget.cleanup_timeout(),
-                            evidence_directory=evidence_root,
-                        )
-                    finally:
-                        service_log.flush()
-                        _emit_and_retain_service_log(service_log_path, evidence_root)
+                    _emit_and_retain_service_log(service_log_path, evidence_root)
     if runtime_root is not None and runtime_root.exists():
         raise SliceFailure(f"private {target_platform} runtime resources remained after cleanup: {runtime_root}")
     budget.assert_within_deadline()
