@@ -497,11 +497,13 @@ def _proc_descendants(
         }
         if root_pid in unknown or unknown.intersection(descendants):
             reliable = False
+            identity_unavailable_pids = sorted(
+                {root_pid} | unknown.intersection(descendants)
+            )
             census_diagnostics.extend(
                 b"windows-census-identity-unavailable="
-                + ",".join(
-                    str(pid).encode("ascii")
-                    for pid in sorted({root_pid} | unknown.intersection(descendants))
+                + ",".join(str(pid) for pid in identity_unavailable_pids).encode(
+                    "ascii"
                 )
                 + b"\n"
             )

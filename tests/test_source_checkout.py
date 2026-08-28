@@ -307,6 +307,29 @@ class SourceCheckoutTest(unittest.TestCase):
             self.assertFalse(_wait_for_tree(process, set(), 0.0))  # type: ignore[arg-type]
             self.assertFalse(process._torturer_tree_census_observed)
 
+    def test_windows_census_keeps_identity_diagnostic_bytes_without_type_loss(self) -> None:
+        class Process:
+            pass
+
+        process = Process()
+        snapshot = {
+            123: (1, 1, "root-start", "R"),
+            124: (123, 1, "", "R"),
+            125: (124, 1, "child-start", "R"),
+        }
+        with patch.object(source_checkout.os, "name", "nt"), patch(
+            "torturer_checks.hosted.cli._process_snapshot",
+            return_value=snapshot,
+        ):
+            descendants = _proc_descendants(123, process=process)
+
+        self.assertEqual(descendants, {124, 125})
+        self.assertFalse(process._torturer_tree_census_observed)
+        self.assertEqual(
+            process._torturer_tree_census_diagnostics,
+            b"windows-census-identity-unavailable=123,124\n",
+        )
+
     @unittest.skipIf(os.name == "nt", "the detached descendant regression uses POSIX sessions")
     def test_zero_exit_leader_cleans_detached_resistant_descendant(self) -> None:
         with tempfile.TemporaryDirectory(prefix="preflight-zero-exit-", dir="/tmp") as temporary:
