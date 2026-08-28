@@ -146,6 +146,7 @@ jobs:
             "$(cygpath -w "$service" | tr -d '\r')"
           printf 'HANDOFF_DIR=%s\nSERVICE_DIR=%s\nRESULT_PATH=%s\nLEASE_RUN_ID=unassigned\n' \
             "$handoff" "$service" "$handoff/functional-result.json" >> "$GITHUB_ENV"
+          printf 'POST_LANE_DEADLINE_EPOCH=unvalidated\nPOST_LANE_STEP_TIMEOUT_SECONDS=60\nPOST_LANE_MARKER_RESERVE_SECONDS=180\n' >> "$GITHUB_ENV"
 
       - name: Prove Windows client runner architecture and elevation
         shell: bash
@@ -735,6 +736,10 @@ jobs:
           cleanup_deadline_epoch=$((RUN_DEADLINE_EPOCH - 60))
           service_identity=""
           if [ -f "$service_identity_file" ]; then service_identity="$(tr -d '\r\n' < "$service_identity_file")"; fi
+          # The native identity sidecar is authoritative.  A controller may
+          # have committed a replacement identity immediately before a PID-file
+          # write failed; never discard that identity or rediscover a broader
+          # same-binary candidate merely because the PID file is stale.
           if ! [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\|[1-9][0-9]+$ ]] && [ -n "$service_binary" ]; then
             if ! [[ "$launch_started_epoch" =~ ^[0-9]+$ ]]; then
               printf 'preflight cleanup cannot perform exact candidate discovery without launch identity\n' >&2
@@ -939,11 +944,16 @@ jobs:
               "source_sha": os.environ["SOURCE_SHA"],
               "state": "issued",
           }
-          expected_keys = set(expected) | {"services"}
+          expected_keys = set(expected) | {"services", "available_until_epoch"}
           if set(value) != expected_keys:
               raise SystemExit("Windows safe lease record has an unsafe shape")
           for key, wanted in expected.items():
               if value.get(key) != wanted: raise SystemExit(f"lease field {key} is invalid")
+          available_until_epoch = value.get("available_until_epoch")
+          if (isinstance(available_until_epoch, bool)
+                  or not isinstance(available_until_epoch, int)
+                  or available_until_epoch <= 0):
+              raise SystemExit("lease availability deadline is invalid")
           services = value.get("services")
           if not isinstance(services, list) or len(services) != 2:
               raise SystemExit("Windows lease service bundle is invalid")
@@ -1000,6 +1010,33 @@ jobs:
               raise SystemExit("encrypted upload URL is invalid")
           print("upload_handoff=validated")
           PY
+
+      - name: Establish validated post-lane provider deadline
+        if: always()
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          lease_file="${LEASE_RESPONSE_DIR:-}/lease.json"
+          if [ -z "${LEASE_RESPONSE_DIR:-}" ] || [ ! -f "$lease_file" ]; then
+            printf '%s\n' 'post-lane provider deadline unavailable: no validated lease exists; server hard cleanup remains authoritative' >&2
+            exit 1
+          fi
+          available_until_epoch="$(python - "$lease_file" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          deadline = value.get("available_until_epoch")
+          if isinstance(deadline, bool) or not isinstance(deadline, int) or deadline <= 0:
+              raise SystemExit("lease availability deadline is invalid")
+          print(deadline)
+          PY
+          )"
+          printf 'POST_LANE_DEADLINE_EPOCH=%s\nPOST_LANE_STEP_TIMEOUT_SECONDS=60\nPOST_LANE_MARKER_RESERVE_SECONDS=180\n' \
+            "$((available_until_epoch - 5))" >> "$GITHUB_ENV"
+          printf 'validated_post_lane_provider_deadline=%s marker_reserve_seconds=180\n' "$available_until_epoch"
 
       - name: Start exact Windows functional candidate
         shell: bash
@@ -1271,27 +1308,53 @@ jobs:
         working-directory: torturer
         run: |
           set -euo pipefail
-          remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 120))
+          remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 300))
           # Eight applicable scenarios plus ten resets require 950 seconds;
           # keep a deliberate 60-second scheduling margin inside the 1,200s cap.
-          if [ "$remaining" -lt 1010 ]; then printf 'insufficient Windows canonical budget before cleanup reserve: seconds=%s required=1010\n' "$remaining" >&2; exit 1; fi
           if [ "$remaining" -gt 1200 ]; then remaining=1200; fi
+          available_until_epoch="$(python - "$LEASE_RESPONSE_DIR/lease.json" <<'PY'
+          import json, sys
+          from pathlib import Path
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          print(value["available_until_epoch"])
+          PY
+          )"
+          case "$available_until_epoch" in
+            ''|*[!0-9]*) printf 'lease availability deadline is invalid\n' >&2; exit 1 ;;
+          esac
+          server_remaining=$((available_until_epoch - $(date +%s)))
+          client_post_lane_reserve_seconds=300
+          lane_start_margin_seconds=5
+          server_lane_remaining=$((server_remaining - client_post_lane_reserve_seconds - lane_start_margin_seconds))
+          if [ "$server_lane_remaining" -le 0 ]; then
+            printf 'insufficient Render lease lifetime before functional lane: seconds=%s reserve=%s margin=%s\n' \
+              "$server_remaining" "$client_post_lane_reserve_seconds" "$lane_start_margin_seconds" >&2
+            exit 1
+          fi
+          if [ "$remaining" -gt "$server_lane_remaining" ]; then remaining="$server_lane_remaining"; fi
+          if [ "$remaining" -lt 1010 ]; then printf 'insufficient Windows canonical budget before cleanup reserve: seconds=%s required=1010\n' "$remaining" >&2; exit 1; fi
+          printf 'render_lease_lifetime_for_lane_seconds=%s required=%s reserve=%s margin=%s\n' \
+            "$server_remaining" "$remaining" "$client_post_lane_reserve_seconds" "$lane_start_margin_seconds"
           printf 'canonical_lane_timeout_seconds=%s\n' "$remaining"
           upload_url="$(cat "$HANDOFF_DIR/upload-url.txt")"
           test -n "$upload_url"
           python -m torturer_checks.hosted.deadline --timeout-seconds "$remaining" --kill-grace-seconds 30 \
             python -m torturer_checks.hosted.run --platform windows --cli "$GITHUB_WORKSPACE/candidate/dobby-cli.exe" \
+            --lane-timeout-seconds "$remaining" \
             --profile "$HANDOFF_DIR/profile.toml" --source-repository "$SOURCE_REPOSITORY" --source-sha "$SOURCE_SHA" \
             --platform-version "windows-2022" \
             --candidate-manifest "$GITHUB_WORKSPACE/candidate/manifest.json" --server-image-digest "$SERVER_IMAGE_DIGEST" --output "$RESULT_PATH" \
             --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" --upload-url "$upload_url" \
             --service-pid "$SERVICE_PID" --service-binary "$SERVICE_BINARY" \
             --service-socket "$SERVICE_CONTROL_ADDRESS" --service-pid-file "$SERVICE_PID_FILE" \
+            --service-identity-file "$SERVICE_IDENTITY_FILE" \
             --expected-unavailable functional.network-transition=HOSTED_WINDOWS_UPLINK_TOGGLE_UNSUPPORTED \
             --expected-unavailable functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED
 
       - name: Stop exact Windows service and verify cleanup
+        id: essential_cleanup
         if: always()
+        timeout-minutes: 1
         shell: bash
         run: |
           set -euo pipefail
@@ -1312,11 +1375,14 @@ jobs:
           # Never trust a bare PID: verify the PID plus creation identity and
           # executable path immediately before sending any termination signal.
           service_identity_file="${SERVICE_IDENTITY_FILE:-$HANDOFF_DIR/service.identity}"
+          service_pid_file="${SERVICE_PID_FILE:-$HANDOFF_DIR/service.pid}"
           service_binary="${SERVICE_BINARY:-}"
           launch_started_epoch="${SERVICE_LAUNCH_STARTED_EPOCH:-}"
           service_identity=""
           discovery_status=2
           if [ -f "$service_identity_file" ]; then service_identity="$(tr -d '\r\n' < "$service_identity_file")"; fi
+          # The native identity sidecar remains authoritative when the PID file
+          # still names the predecessor after a replacement write failure.
           if ! [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\|[1-9][0-9]+$ ]] && [ -n "$service_binary" ]; then
             if ! [[ "$launch_started_epoch" =~ ^[0-9]+$ ]]; then
               printf 'cleanup cannot perform exact candidate discovery without launch identity\n' >&2
@@ -1402,27 +1468,46 @@ jobs:
           fi
           test "$stopped" = true
 
-      - name: Upload safe Windows functional result
+      - name: Remove plaintext handoff material and prepare completion marker
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
-        with:
-          name: functional-result-${{ env.LEASE_RUN_ID }}-windows
-          path: ${{ env.RESULT_PATH }}
-          if-no-files-found: warn
-          retention-days: 1
-
-      - name: Publish opaque Windows completion marker
-        if: always()
+        timeout-minutes: 1
+        id: post_lane_marker_prepare
         shell: bash
         env:
           FUNCTIONAL_OUTCOME: ${{ steps.functional.outcome }}
         run: |
           set -euo pipefail
+          # Plaintext handoff material is removed even when timing metadata is
+          # unavailable; marker publication itself still fails closed.
+          if [ -n "${HANDOFF_DIR:-}" ]; then
+            rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/upload-url.txt" "$HANDOFF_DIR/recipient.key"
+          else
+            printf '%s\n' 'post-lane plaintext removal skipped: handoff directory was never initialized' >&2
+          fi
+          run_deadline="${RUN_DEADLINE_EPOCH:-}"
+          provider_deadline="${POST_LANE_DEADLINE_EPOCH:-}"
+          post_lane_marker_reserve="${POST_LANE_MARKER_RESERVE_SECONDS:-}"
+          if [ -z "${HANDOFF_DIR:-}" ] || ! [[ "$run_deadline" =~ ^[0-9]+$ ]] || ! [[ "$provider_deadline" =~ ^[0-9]+$ ]] || ! [[ "$post_lane_marker_reserve" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' 'post-lane marker preparation skipped: functional lane did not establish valid origin/provider deadlines' >&2
+            exit 1
+          fi
+          if [ "$run_deadline" -le "$provider_deadline" ]; then
+            post_deadline="$run_deadline"
+          else
+            post_deadline="$provider_deadline"
+          fi
+          post_remaining=$((post_deadline - $(date +%s)))
+          if [ "$post_remaining" -lt "$post_lane_marker_reserve" ]; then
+            printf 'post-lane marker preparation cannot fit before origin/provider deadline: remaining=%s required=%s\n' \
+              "$post_remaining" "$post_lane_marker_reserve" >&2
+            exit 1
+          fi
           mkdir -p "$HANDOFF_DIR/completion"
           printf 'schema=1\nrun_id=%s\nplatform=windows\nfunctional_outcome=%s\n' "$LEASE_RUN_ID" "$FUNCTIONAL_OUTCOME" > "$HANDOFF_DIR/completion/completion.marker"
 
       - name: Upload opaque Windows completion marker
-        if: always()
+        timeout-minutes: 1
+        if: always() && steps.essential_cleanup.outcome == 'success' && steps.post_lane_marker_prepare.outcome == 'success'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: render-complete-${{ env.LEASE_RUN_ID }}-windows
@@ -1430,12 +1515,15 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      - name: Remove plaintext handoff material
+      - name: Upload safe Windows functional result
+        timeout-minutes: 1
         if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/upload-url.txt" "$HANDOFF_DIR/recipient.key"
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: functional-result-${{ env.LEASE_RUN_ID }}-windows
+          path: ${{ env.RESULT_PATH }}
+          if-no-files-found: warn
+          retention-days: 1
 
   controller:
     name: Dispatch isolated Windows Render lease controller

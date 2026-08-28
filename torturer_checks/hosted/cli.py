@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import ipaddress
+import inspect
 import json
 import os
 from pathlib import Path
@@ -40,6 +41,18 @@ _PROCESS_TREE_PROOF_RESERVE_SECONDS = 0.05
 _PROCESS_TREE_MONITOR_STOP_RESERVE_SECONDS = 0.01
 _ROUTE_CONVERGENCE_POLL_SECONDS = 0.5
 _SUBREAPER_STATUS_LIMIT = 1024
+
+
+def _call_with_deadline(method, timeout: float, deadline: float | None):
+    """Call a lifecycle hook with the canonical deadline when supported."""
+
+    try:
+        accepts_deadline = "deadline" in inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        accepts_deadline = False
+    if accepts_deadline:
+        return method(timeout, deadline=deadline)
+    return method(timeout)
 
 
 def _opaque_evidence_id() -> str:
@@ -2640,6 +2653,7 @@ class HostedServiceProcessController:
         pid: int,
         binary: Path,
         pid_file: Path | None,
+        identity_file: Path | None = None,
         runner: CommandRunner,
         raw_directory: Path,
     ) -> None:
@@ -2648,6 +2662,8 @@ class HostedServiceProcessController:
         if not binary.is_file() or binary.is_symlink():
             raise HostedAdapterError("SERVICE_BINARY_UNAVAILABLE")
         if pid_file is not None and not pid_file.is_absolute():
+            raise HostedAdapterError("SERVICE_PATH_INVALID")
+        if identity_file is not None and not identity_file.is_absolute():
             raise HostedAdapterError("SERVICE_PATH_INVALID")
         if not raw_directory.is_absolute():
             raise HostedAdapterError("SERVICE_EVIDENCE_PATH_INVALID")
@@ -2658,6 +2674,15 @@ class HostedServiceProcessController:
         self.runner = runner
         self.raw_directory = raw_directory
         self._restart_number = 0
+        # Identity authority is an explicit constructor input.  Do not read it
+        # from ambient environment state: an outer workflow can carry a stale
+        # or attacker-controlled value across a replacement.
+        self.identity_file = identity_file
+        # Platform controllers fill this with the native start-time token for
+        # the host-owned process.  It is deliberately cleared before a
+        # replacement launch so a partially launched, unowned process can
+        # never be finalized as if it were the original service.
+        self._initial_identity: object | None = None
 
     @staticmethod
     def _remaining(deadline: float, failure: str) -> float:
@@ -2703,6 +2728,28 @@ class HostedServiceProcessController:
         temporary.replace(self.pid_file)
         self.pid_file.chmod(0o600)
 
+    def _invalidate_identity_file(self) -> None:
+        """Remove predecessor authority before launching a replacement.
+
+        A replacement may fail after launch but before its native identity is
+        persisted.  Publishing an invalid marker first prevents an outer
+        always-run cleanup from treating the predecessor's sidecar as the
+        replacement authority; platform workflows then rediscover or fail
+        closed.
+        """
+
+        if self.identity_file is None:
+            return
+        temporary = self.identity_file.with_name(f".{self.identity_file.name}.tmp")
+        try:
+            self.identity_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            temporary.write_text("pending\n", encoding="ascii")
+            temporary.chmod(0o600)
+            temporary.replace(self.identity_file)
+            self.identity_file.chmod(0o600)
+        except OSError as error:
+            raise ScenarioExecutionError("SERVICE_IDENTITY_PERSIST_FAILED") from error
+
     def _wait_dead(self, deadline: float) -> None:
         while time.monotonic() < deadline:
             if not self._alive(self._remaining(deadline, "SERVICE_LOSS_TIMEOUT")):
@@ -2715,14 +2762,62 @@ class HostedServiceProcessController:
         if timeout <= 0:
             raise ScenarioExecutionError("PROCESS_LOSS_TIMEOUT")
         deadline = time.monotonic() + timeout
-        self._terminate(self._remaining(deadline, "SERVICE_KILL_FAILED"))
+        verify = getattr(self, "_verify_candidate_pid", None)
+        if not callable(verify):
+            raise ScenarioExecutionError("SERVICE_PID_PROBE_FAILED")
+        # Process-loss termination is destructive.  Re-prove the original
+        # PID's identity immediately before the platform-specific kill so a
+        # reused PID cannot terminate an unrelated host process.
+        verify(self._remaining(deadline, "SERVICE_PID_PROBE_FAILED"))
+        self._terminate(
+            self._remaining(deadline, "SERVICE_KILL_FAILED"),
+            deadline=deadline,
+        )
         self._wait_dead(deadline)
         self._start(self._remaining(deadline, "SERVICE_RESTART_TIMEOUT"))
+
+    def finalize_restarted_service(
+        self, timeout_seconds: float, *, deadline: float | None = None
+    ) -> None:
+        """Stop only the replacement service owned by this controller.
+
+        The initial service belongs to the host/workflow and is intentionally
+        left alone.  Once process-loss has created a replacement, subclasses'
+        platform-specific ``_terminate`` implementations provide the exact
+        identity/tree proof required before anything is killed.
+        """
+
+        if timeout_seconds <= 0:
+            raise ScenarioExecutionError("INVALID_FINALIZE_TIMEOUT")
+        if self._restart_number == 0:
+            return
+        # A launcher may have produced a PID but failed before readiness and
+        # native identity validation.  That process is not controller-owned;
+        # never finalize it as a replacement based on a path or PID alone.
+        if getattr(self, "_replacement_identity", None) is None:
+            raise ScenarioExecutionError("SERVICE_PID_PROBE_FAILED")
+        if deadline is None:
+            deadline = time.monotonic() + timeout_seconds
+        elif deadline <= time.monotonic():
+            raise ScenarioExecutionError("SERVICE_FINALIZE_TIMEOUT")
+        alive = self._alive(self._remaining(deadline, "SERVICE_FINALIZE_TIMEOUT"))
+        if alive:
+            verify = getattr(self, "_verify_candidate_pid", None)
+            if not callable(verify):
+                raise ScenarioExecutionError("SERVICE_PID_PROBE_FAILED")
+            verify(self._remaining(deadline, "SERVICE_FINALIZE_TIMEOUT"))
+        # A missing root is not proof that its descendants are gone.  Let the
+        # platform tree finalizer establish that fact (or fail closed) before
+        # returning success.
+        self._terminate(
+            self._remaining(deadline, "SERVICE_FINALIZE_TIMEOUT"),
+            deadline=deadline,
+        )
 
     def _alive(self, timeout: float) -> bool:
         raise NotImplementedError
 
-    def _terminate(self, timeout: float) -> None:
+    def _terminate(self, timeout: float, *, deadline: float | None = None) -> None:
         raise NotImplementedError
 
     def _start(self, timeout: float) -> None:
@@ -2885,6 +2980,16 @@ class HostedCLIAdapter:
         finally:
             self._baseline_ip = None
             self._tunneled_ips.clear()
+
+    def finalize(
+        self, timeout_seconds: float = 30.0, *, deadline: float | None = None
+    ) -> None:
+        """Release adapter-owned run resources inside the canonical lane."""
+
+        if timeout_seconds <= 0:
+            raise HostedAdapterError("INVALID_FINALIZE_TIMEOUT")
+        if deadline is not None and deadline <= time.monotonic():
+            raise HostedAdapterError("SERVICE_FINALIZE_TIMEOUT")
 
     def _command(self, arguments: Sequence[str], timeout: float, failure: str) -> CommandResult:
         command = (str(self.cli), *arguments)

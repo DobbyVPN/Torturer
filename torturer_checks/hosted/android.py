@@ -413,6 +413,21 @@ class AndroidHostedAdapter:
             "ANDROID_RESET_FAILED",
         )
 
+    def finalize(
+        self, timeout_seconds: float = 30.0, *, deadline: float | None = None
+    ) -> None:
+        """Complete the shared hosted-adapter lifecycle contract.
+
+        Android instrumentation finalizes its diagnostics and device state at
+        the end of every scenario.  No run-scoped process remains to release,
+        but the common runner still requires a validated finalization hook.
+        """
+
+        if timeout_seconds <= 0:
+            raise HostedAdapterError("INVALID_FINALIZE_TIMEOUT")
+        if deadline is not None and deadline <= time.monotonic():
+            raise HostedAdapterError("SERVICE_FINALIZE_TIMEOUT")
+
     def _run_instrumentation(self, command_name: str, deadline: float) -> CommandResult:
         arguments = (
             "shell", "am", "instrument", "-w", "-r", "-e", "dobby.real_profile", "1",

@@ -21,6 +21,7 @@ import sys
 from typing import Sequence
 
 from .cli import _ensure_owner_only_directory
+from .macos import _MACOS_PROCESS_IDENTITY_SCRIPT, _parse_macos_process_identity
 
 
 _ABSENT_MARKER = re.compile(r"\bnot in table\b", re.IGNORECASE)
@@ -257,22 +258,47 @@ def _service_is_dead(
             value = json.loads(identity_file.read_text(encoding="utf-8"))
             if not isinstance(value, dict):
                 raise ValueError("identity is not an object")
+            if set(value) != {"command", "native_start", "pid", "start"}:
+                raise ValueError("native identity fields are incomplete")
             expected_identity = value
-            if int(value.get("pid", 0)) != pid:
+            if (
+                isinstance(value.get("pid"), bool)
+                or not isinstance(value.get("pid"), int)
+                or value["pid"] != pid
+            ):
                 raise ValueError("identity PID does not match service PID")
-            if not all(isinstance(value.get(key), str) and value[key] for key in ("start", "command")):
+            if (
+                not isinstance(value["command"], str)
+                or not Path(value["command"]).is_absolute()
+                or not isinstance(value["start"], str)
+                or not isinstance(value["native_start"], str)
+                or re.fullmatch(r"[1-9][0-9]*\.[0-9]{6}", value["native_start"]) is None
+                or int(value["native_start"].split(".", 1)[1]) >= 1_000_000
+                or value["start"] != value["native_start"]
+            ):
                 raise ValueError("identity fields are incomplete")
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise MacOSRouteError("DEFAULT_ROUTE_SERVICE_IDENTITY_INVALID") from error
     try:
-        returncode = _capture(
-            (
-                "sudo", "-n", "ps", "-p", str(pid), "-o",
-                "pid=,lstart=,command=" if expected_identity is not None else "pid=",
-            ),
-            evidence_file,
-            timeout_seconds,
-        )
+        native_start = expected_identity["native_start"] if expected_identity is not None else None
+        if expected_identity is not None:
+            returncode = _capture(
+                (
+                    "sudo", "-n", "python3", "-c",
+                    _MACOS_PROCESS_IDENTITY_SCRIPT, str(pid),
+                ),
+                evidence_file,
+                timeout_seconds,
+            )
+        else:
+            returncode = _capture(
+                (
+                    "sudo", "-n", "ps", "-p", str(pid), "-o",
+                    "pid=",
+                ),
+                evidence_file,
+                timeout_seconds,
+            )
         output = evidence_file.read_text(encoding="utf-8", errors="replace")
     except MacOSRouteError as error:
         if error.code == "DEFAULT_ROUTE_COMMAND_TIMEOUT":
@@ -280,23 +306,21 @@ def _service_is_dead(
         raise MacOSRouteError("DEFAULT_ROUTE_SERVICE_PROBE_UNAVAILABLE") from error
     except OSError as error:
         raise MacOSRouteError("DEFAULT_ROUTE_SERVICE_PROBE_UNAVAILABLE") from error
-    if returncode == 1 and not output.strip():
+    if returncode == 1 and expected_identity is None and not output.strip():
         return True
     if returncode == 0 and expected_identity is None and output.strip() == str(pid):
         return False
-    if returncode == 0 and expected_identity is not None:
-        lines = [line for line in output.splitlines() if line.strip()]
-        fields = lines[0].split(maxsplit=6) if len(lines) == 1 else []
-        if len(fields) >= 7 and fields[0].isdigit():
-            actual_pid = int(fields[0])
-            actual_start = " ".join(fields[1:6])
-            actual_command = fields[6]
-            if (
-                actual_pid == pid
-                and actual_start == expected_identity["start"]
-                and actual_command == expected_identity["command"]
-            ):
-                return False
+    if returncode == 2 and native_start is not None and output.strip() == "service_probe_absent":
+        return True
+    if returncode == 0 and native_start is not None:
+        try:
+            identity, command = _parse_macos_process_identity(output, pid)
+        except ValueError as error:
+            raise MacOSRouteError("DEFAULT_ROUTE_SERVICE_IDENTITY_MISMATCH") from error
+        expected = f"{pid}|{native_start}"
+        expected_command = str(expected_identity["command"])
+        if identity == expected and command == expected_command:
+            return False
         raise MacOSRouteError("DEFAULT_ROUTE_SERVICE_IDENTITY_MISMATCH")
     raise MacOSRouteError("DEFAULT_ROUTE_SERVICE_PROBE_FAILED")
 

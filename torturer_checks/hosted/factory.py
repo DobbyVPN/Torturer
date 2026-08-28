@@ -83,6 +83,7 @@ def adapter_for_platform(
     service_socket: Path | None = None,
     service_library_path: Path | None = None,
     service_pid_file: Path | None = None,
+    service_identity_file: Path | None = None,
     network_interface: str | None = None,
 ) -> Any:
     try:
@@ -114,6 +115,7 @@ def adapter_for_platform(
             ("service_socket", service_socket),
             ("service_library_path", service_library_path),
             ("service_pid_file", service_pid_file),
+            ("service_identity_file", service_identity_file),
             ("network_interface", network_interface),
         ):
             if value is not None:
@@ -136,6 +138,7 @@ def adapter_for_platform(
                 "service_socket": service_socket,
                 "service_library_path": service_library_path,
                 "service_pid_file": service_pid_file,
+                "service_identity_file": service_identity_file,
                 "network_interface": network_interface,
             })
         elif platform in {"windows", "macos"}:
@@ -143,6 +146,7 @@ def adapter_for_platform(
                 "service_pid": service_pid,
                 "service_binary": service_binary,
                 "service_pid_file": service_pid_file,
+                "service_identity_file": service_identity_file,
                 "service_socket": service_socket,
             })
     return adapter_class(**kwargs)

@@ -35,7 +35,7 @@ macOS, and Android against one disposable Outline WebSocket server per
 platform. A secretless build job produces and hashes an allow-listed candidate
 closure. The client job proves that closure and its platform is ready before it
 publishes an opaque lease request. A separate controller dispatches the
-provider workflow, which creates the Render service and encrypts the generated
+provider workflow, which creates the Render bundle and encrypts the generated
 profile to the client's ephemeral certificate. Candidate execution begins only
 after token-bearing GitHub operations finish; it never receives the Render
 credential or a repository-control token.
@@ -72,12 +72,36 @@ The hosted result records `coverage.status` as
 workflow supplies an explicit scenario/reason allowlist, and the run fails
 closed unless the observed unavailable pairs match that allowlist exactly.
 
-Each platform workflow has one total 30-minute deadline measured from the
-workflow run start, including source build, client readiness, lease
-coordination, scenarios, evidence, and cleanup. Android requires `/dev/kvm` and
-always launches its emulator headlessly. The provider workflow cleans and
-independently verifies deletion of the exact tagged Render service even when a
-client fails or never publishes its completion marker.
+Candidate functional execution, essential service, route, and emulator cleanup,
+and provider-release marker publication share one absolute deadline: the
+originating workflow run's `run_started_at` plus 30 minutes. Build elapsed time
+and earlier client setup consume that same origin-run budget, reducing the time
+available to the functional lane. This shared deadline does not promise that the
+multi-job GitHub workflow, including GitHub-managed artifact uploads, finishes
+within 30 wall-clock minutes. The provider job and each functional workflow's
+controller job have independent 30-minute hard bounds; the functional client job
+has its own 30-minute hard bound, while build jobs retain their separate build
+bound. The functional lane is admitted only when the
+Render lease leaves a common 300-second post-lane reserve plus a five-second
+start margin. Essential service, route, and emulator cleanup runs after the
+canonical scenarios and before the provider-release marker. Plaintext handoff
+material is removed first even if timing metadata is invalid; marker preparation
+and its next one-minute upload must fit inside the 180-second marker tail before
+Render deletion may begin. The common 300-second reserve covers up to 120
+seconds of essential cleanup plus that marker tail; Android's proved 65-second
+emulator cleanup leaves 55 seconds of additional margin. The marker is published
+only when those essential cleanup proofs succeed. It is a provider-release/
+cleanup signal, not a functional pass result: the overall workflow result and
+canonical functional result remain authoritative, including failures in later
+evidence steps. Bounded safe evidence uploads and other non-semantic local
+cleanup may finish afterward under their own bounded client-job steps; they do
+not hold provider deletion. Android requires
+`/dev/kvm` and always launches its emulator
+headlessly. The provider workflow cleans and independently verifies deletion
+of both exact tagged Render services even when a client fails or never publishes
+its completion marker. If a client fails before a validated lease deadline is
+established, marker publication is reported as unavailable and skipped while
+the server's hard cleanup remains authoritative.
 
 The repository contains a pinned public iOS Simulator core lane. It proves the
 exact clean candidate identity, verifies the H1 evidence helper, runs tests

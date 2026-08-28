@@ -286,6 +286,7 @@ class RenderLease:
         wall_clock: Callable[[], float] = time.time,
         monotonic_clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
+        cleanup_api: RenderAPI | None = None,
     ) -> None:
         if spec.name != descriptor.service_name or spec.image_digest != descriptor.image_digest:
             raise ValueError("service specification does not match lease descriptor")
@@ -295,7 +296,17 @@ class RenderLease:
         self.journal = journal
         self._wall_clock = wall_clock
         self._monotonic_clock = monotonic_clock
-        self._controller = DisposableRenderController(api, clock=monotonic_clock, sleeper=sleeper)
+        # Acquisition and cleanup have different operational budgets. Keep
+        # the readiness controller on the acquisition client, while every
+        # cleanup/recovery operation uses the explicitly bounded client when
+        # one is supplied.
+        self.cleanup_api = api if cleanup_api is None else cleanup_api
+        self._controller = DisposableRenderController(
+            api,
+            clock=monotonic_clock,
+            sleeper=sleeper,
+            cleanup_api=self.cleanup_api,
+        )
         self.state = LeaseState.ABSENT
         self.handle: RenderServiceHandle | None = None
         self.ready: RenderServiceReady | None = None
@@ -373,8 +384,16 @@ class RenderLease:
                 # A create response can be lost after Render has accepted the
                 # request. The run-scoped random namespace is the only safe
                 # fallback selector when no exact service ID exists.
-                self.reap_orphans(active_service_ids=active_service_ids, older_than_seconds=0)
-                RenderReaper(self.api).assert_tagged_absent(
+                # One create request can produce at most one service whose
+                # response was lost.  Refuse an ambiguous namespace before
+                # deleting anything; a second candidate is stale state, not
+                # evidence that this request created two services.
+                self.reap_orphans(
+                    active_service_ids=active_service_ids,
+                    older_than_seconds=0,
+                    max_candidates=1,
+                )
+                RenderReaper(self.cleanup_api).assert_tagged_absent(
                     self.spec.owner_id,
                     self.descriptor.service_prefix,
                     active_service_ids=active_service_ids,
@@ -386,8 +405,8 @@ class RenderLease:
             return
         if self.state is not LeaseState.DELETING:
             self._transition(LeaseState.DELETING)
-        self.api.delete_service(self.handle.service_id)
-        if self.api.exists(self.handle.service_id):
+        self.cleanup_api.delete_service(self.handle.service_id)
+        if self.cleanup_api.exists(self.handle.service_id):
             raise LeaseCleanupError("service deletion was not verified")
         self._transition(LeaseState.ABSENT, "verified")
 
@@ -396,15 +415,22 @@ class RenderLease:
             return
         self._cleanup_after_failure(active_service_ids=active_service_ids)
 
-    def reap_orphans(self, *, active_service_ids: tuple[str, ...] = (), older_than_seconds: float = 900.0) -> tuple[str, ...]:
+    def reap_orphans(
+        self,
+        *,
+        active_service_ids: tuple[str, ...] = (),
+        older_than_seconds: float = 900.0,
+        max_candidates: int | None = None,
+    ) -> tuple[str, ...]:
         """Reap only this descriptor's random namespace, never a broad prefix."""
 
-        reaper = RenderReaper(self.api)
+        reaper = RenderReaper(self.cleanup_api)
         return reaper.reap_tagged(
             self.spec.owner_id,
             self.descriptor.service_prefix,
             active_service_ids=active_service_ids,
             older_than_seconds=older_than_seconds,
+            max_candidates=max_candidates,
         )
 
 
@@ -505,6 +531,26 @@ class RenderLeaseBundle:
                 failures.append(error)
         if failures:
             raise LeaseCleanupError("lease bundle cleanup was not verified") from failures[0]
+        # Exact-ID deletion above is necessary but insufficient for a schema-2
+        # bundle: a lost create response or stale provider state can leave a
+        # second service in this run/platform namespace. Reuse the bounded,
+        # fail-closed reaper contract used by lease_cli. With no active IDs,
+        # any matching candidate is unexpected; max_candidates=0 therefore
+        # refuses to delete or silently ignore it.
+        reaper = RenderReaper(self.outline.cleanup_api)
+        try:
+            reaper.reap_tagged(
+                self.outline.spec.owner_id,
+                self.outline.descriptor.service_prefix,
+                older_than_seconds=0,
+                max_candidates=0,
+            )
+            reaper.assert_tagged_absent(
+                self.outline.spec.owner_id,
+                self.outline.descriptor.service_prefix,
+            )
+        except BaseException as error:
+            raise LeaseCleanupError("lease bundle namespace cleanup was not verified") from error
 
 
 __all__ = [

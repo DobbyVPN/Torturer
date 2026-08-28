@@ -195,8 +195,20 @@ sets, not from the count of scenarios that happen to be executed: Linux needs
 950 seconds, Windows/macOS need 950 seconds, and Android needs 920 seconds
 including ten five-second resets. These values include the reviewed
 network-transition gaps. Each workflow adds a deliberate 60-second scheduling
-margin, keeps the inner lane at or below 1,200 seconds, and retains the outer
-120-second evidence/cleanup reserve.
+margin, keeps the inner lane at or below 1,200 seconds, and reserves a common
+300 seconds after the canonical lane for essential local cleanup and the
+provider-release marker tail. The reserve covers up to 120 seconds of service,
+route, or emulator cleanup, followed by a 180-second marker tail: 60 seconds
+for plaintext removal/marker preparation, 60 seconds for marker upload, and a
+60-second scheduling margin. Android's measured 65-second emulator cleanup
+therefore leaves 55 seconds of additional margin inside the same 300 seconds.
+The marker follows the essential product/resource cleanup and is only a
+provider-release/cleanup signal; it is not a functional pass or release result.
+Only after it is uploaded do safe evidence uploads and other non-semantic local
+cleanup run. Those later operations do not hold provider deletion and are
+bounded by the client hard deadline; the overall workflow result and canonical
+functional result remain authoritative, including failures in later evidence
+steps.
 
 The Android sleep/wake operation is a real emulator power boundary: the adapter
 sends bounded ADB `KEYCODE_SLEEP`/`KEYCODE_WAKEUP` events, proves
@@ -256,8 +268,8 @@ network-denial behaviour, and absence of obvious embedded credentials. They
 never receive a VPN profile or provider credential.
 
 The separately dispatched trusted functional workflows may create one
-short-lived synthetic Outline WebSocket profile and disposable Render service
-for Linux, Windows, macOS, or Android. Those workflows verify external routing
+short-lived synthetic Outline WebSocket profile and disposable two-service Render
+bundle for Linux, Windows, macOS, or Android. Those workflows verify external routing
 identity, bounded traffic measurements, reconnect, cleanup, and every other
 canonical capability the selected adapter can actually observe. Their public
 result schema excludes profiles, endpoints, URLs, keys, tokens, raw logs, and
@@ -306,38 +318,6 @@ Every `verify.yml` helper checkout is pinned to the immutable H1 SHA. DobbyVPN
 may update its immutable Torturer workflow pin only to a reviewed H2-or-later
 commit.
 
-## Hosted capability coverage contract
-
-The Linux hosted workflow selects and emits all ten canonical scenarios. An
-unavailable scenario is not a pass and is never silently removed. This
-workflow has one reviewed platform limitation, declared literally as
-`functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED`. The reason means
-that suspending the GitHub-hosted runner would suspend the job's control host;
-it cannot provide the guest-level suspend/resume proof required by the
-canonical scenario.
-
-The hosted result retains the unavailable per-scenario record and adds a
-top-level coverage envelope with `status` set to
-`supported-subset-with-expected-limitations` and `complete` set to `false`.
-`selected_scenario_count` and `result_scenario_count` must both be ten, with
-unique IDs matching the canonical catalog. The envelope records the declared,
-expected, and observed `(scenario_id, reason_code)` pairs.
-
-The Linux lane exits successfully only when the workflow's explicit
-`--expected-unavailable` declaration exactly matches the reviewed pair, the
-declared and observed pairs match it exactly, all other scenarios pass, and
-every scenario reset succeeds. A missing, duplicate, extra, failed, changed,
-or unexpected unavailable scenario fails closed while preserving the result
-envelope for release reporting. The exception is hosted-only: the private
-Harness Linux VM must execute and pass `functional.sleep-wake`; local
-unavailability is never accepted as the equivalent.
-
-The workflow checks out the exact `$GITHUB_SHA` and records it as
-`TORTURER_SHA`; the literal command-line declaration and this contract are
-therefore pinned to the reviewed Torturer revision. A future implementation of
-hosted suspend/wake must remove the exception and update the contract rather
-than leave a stale allowlist.
-
 ## Trusted hosted adapter boundary
 
 The hosted functional entry point is `python3 -m
@@ -381,7 +361,8 @@ than being produced after its evidence references are frozen.
 
 `python3 -m torturer_provider.lease_cli acquire` and `cleanup` are trusted
 provider operations, not public candidate steps. The request contains only an
-opaque run ID, platform, and immutable image digest. Acquisition creates one
+opaque run ID, platform, full lowercase `source_sha`, and immutable image digest.
+Acquisition creates one
 schema-2 bundle containing a random WSS profile backed by a tagged Outline
 service and a separately pinned HTTPS measurement-sink service for every hosted
 platform. The bundle binds each role to its exact service ID and image digest,
@@ -397,7 +378,9 @@ Acquisition also writes a strict, public-safe command result containing only
 `completed`/`failed` and a stable uppercase code. An unconditional workflow
 step validates and prints that record, so the private deadline wrapper can
 retain complete raw child streams without reducing a provider failure to an
-opaque digest alone.
+opaque digest alone. The schema-2 lease record also carries the provider's
+absolute `available_until_epoch`; this is a safe timing value, not an endpoint
+or credential.
 Schema 1 is retained solely so old single-service journals can be cleaned up;
 new acquisition never emits it. Render credentials are read only from the
 protected workflow environment. Both immutable images carry their required
@@ -428,10 +411,17 @@ independently verified. The fixed account-wide concurrency group on
 `server-lease.yml` is an admission guard against overlapping leases, not a
 matrix queue; sequencing remains an explicit controller responsibility.
 
-Every platform deadline is measured from the workflow run start and ends after
-at most 30 minutes, including build, readiness, lease coordination, scenarios,
-diagnostics, evidence, and cleanup. The canonical runner selects the complete
-scenario catalog, partitions it by the adapter's proved capabilities, and
+Candidate functional execution, essential service/process, route, and emulator
+cleanup, and provider-release marker publication use one absolute deadline: the
+originating workflow run's `run_started_at` plus 30 minutes. Build elapsed time
+and earlier client setup consume that same origin-run budget, reducing the time
+available to the functional lane. This shared semantic deadline is not a promise
+that the multi-job GitHub workflow, including GitHub-managed artifact uploads,
+finishes within 30 wall-clock minutes. The provider job and each functional
+workflow's controller job have independent 30-minute hard bounds; the functional
+client job has its own 30-minute hard bound, while build jobs retain their
+separate build bound. The canonical runner selects the
+complete scenario catalog, partitions it by the adapter's proved capabilities, and
 records every unsupported scenario explicitly. It rejects a selected set whose
 declared scenario maxima plus one bounded reset per scenario exceed the active
 functional budget. A final cleanup reserve remains outside the functional
@@ -439,16 +429,48 @@ subprocess but inside the same 30-minute deadline. This rule also applies to
 the trusted `server-lease.yml` provider controller: its Render acquisition,
 completion-marker wait, diagnostic output, encrypted handoff, deletion, exact
 absence proof, and safe journal publication all share one 30-minute job bound.
-The controller reserves 680 seconds for finalization and refuses to start or
+The controller reserves 240 seconds for finalization and refuses to start or
 continue work once that reserve is reached; it has no longer provider-job
-exception or separate 40-minute allowance. The reserve is partitioned into a
-600-second provider cleanup budget, its 1-second termination grace, a 4-second
-plaintext removal budget, its 1-second termination grace, a 60-second safe
+exception or separate 40-minute allowance. The server publishes
+`available_until_epoch` as its own hard deadline minus the 240-second
+finalization reserve. Immediately before starting its canonical functional
+subprocess, each client subtracts that same full 300-second post-lane reserve
+from its own absolute `RUN_DEADLINE_EPOCH` budget and validates the provider
+deadline, failing closed unless the remaining provider lifetime covers its
+selected lane (capped at 1,200 seconds), the common 300-second post-lane
+reserve, and a five-second start margin. If the
+provider lifetime is shorter, the client caps the lane and then applies the
+platform minimum; a lane that would fall below that minimum is rejected before
+it starts. Before the canonical step, a separate validated post-lane deadline
+step publishes the provider deadline into the job environment. Essential
+service/process, route, and emulator cleanup runs before the marker. The
+plaintext handoff is removed first, even if timing metadata is invalid; marker
+preparation then requires the remaining 180 seconds for its bounded preparation,
+upload, and scheduling margin inside that aggregate reserve. The marker is
+published only after the essential cleanup steps succeed, and its following
+one-minute upload is the provider-release/cleanup signal, not the functional
+result. If no validated lease exists, or essential cleanup fails, marker
+publication is skipped and the server's hard cleanup remains authoritative.
+Safe evidence uploads and other non-semantic local cleanup run after marker
+publication, each with its own one- or two-minute hard bound under the client
+deadline; they may finish after the shared functional/marker deadline and do
+not check or depend on provider availability or hold provider deletion. The
+overall workflow result and canonical functional result remain authoritative,
+and a later evidence-step failure still fails the workflow. The server waits for
+the client's opaque provider-release marker until the same availability boundary.
+Consequently, marker publication can never overlap provider deletion; a late or
+malformed lease is rejected before the lane starts. The reserve is partitioned
+into a 150-second provider cleanup budget, its 1-second termination grace, a
+4-second plaintext removal budget, its 1-second termination grace, a 60-second safe
 journal upload budget, and 10 seconds of bounded finalization overhead. Their
-sum is 676 seconds and is enforced by workflow policy tests; the outer job
+sum is 226 seconds and is enforced by workflow policy tests; the outer job
 timeout is not the cleanup mechanism. The provider budget covers the bounded
 worst-case two-service stale-absence repair path: eight Render API calls at
-61.5 seconds each, including the configured retries and backoff.
+16.5 seconds each, using a cleanup-only 5-second transport timeout, two retries,
+and 0.5/1-second backoff. Cleanup service discovery is limited to one API page
+and no more missing-role candidates than the journal permits; exceeding either
+bound fails closed instead of escaping the stated budget. Acquisition keeps its
+independent readiness budget.
 
 Linux, Windows, and macOS start the exact source-built product service and drive
 the public CLI. Their workflows provide the exact service PID, binary, control
@@ -458,7 +480,18 @@ from that single handoff, so hosted qualification does not depend on unrelated
 public identity or transfer providers. The sink marks GET responses `no-store`;
 its identity response uses the client address supplied by Render's Cloudflare
 edge, while its download response is exactly one MiB. This keeps process-loss
-recovery and bounded endurance as real capabilities. Connected and disconnected
+recovery and bounded endurance as real capabilities. When Linux process-loss
+qualification deliberately starts a replacement service as a detached child,
+the platform adapter verifies and stops that exact replacement before the hosted
+scenario process exits. Linux treats a replacement zombie as exited only after
+the process-state probe proves it, while Windows and macOS use their exact
+process-tree identity mechanisms. The hosted adapter's exact replacement-tree
+finalizer, together with the overall failed workflow and canonical outcome on
+any finalization error, is authoritative for proving replacement cleanup. The
+workflow's unconditional service/process cleanup remains an independent
+safeguard for the originally launched service; it does not by itself prove that
+an escaped descendant was absent. Finalization failures retain their stable
+uppercase reason code in the top-level diagnostic. Connected and disconnected
 route observations allow the identity to converge only within their existing
 scenario deadlines; every probe remains in the runner-local raw command record.
 Linux may advertise network-transition only when the workflow supplies an exact

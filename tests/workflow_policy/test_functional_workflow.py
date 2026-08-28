@@ -29,11 +29,12 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
         self.assertNotRegex(self.text, r"(?m)^  (?:push|pull_request|pull_request_target|schedule):")
         self.assertIn("deadline = int(started.timestamp()) + 30 * 60", self.text)
         self.assertIn("RUN_DEADLINE_EPOCH", self.text)
-        self.assertIn("RUN_DEADLINE_EPOCH - $(date +%s) - 120", self.text)
+        self.assertIn("RUN_DEADLINE_EPOCH - $(date +%s) - 300", self.text)
         self.assertIn("if int(datetime.datetime.now(datetime.timezone.utc).timestamp()) >= deadline:", self.text)
         self.assertIn("readiness_reserve_seconds=120", self.text)
         self.assertIn("torturer_checks.hosted.deadline", self.text)
         self.assertIn('--timeout-seconds "$remaining" --kill-grace-seconds 30', self.text)
+        self.assertIn('--lane-timeout-seconds "$remaining"', self.text)
         self.assertIn("PLATFORM: linux", self.text)
 
     def test_linux_lane_runs_every_applicable_canonical_scenario(self) -> None:
@@ -45,8 +46,12 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
             "--upload-url", "--service-pid",
             "--service-binary", "--service-socket", "--service-library-path",
             "--service-pid-file",
+            "--service-identity-file",
         ):
             self.assertIn(option, block)
+        self.assertIn("SERVICE_IDENTITY_FILE", self.text)
+        self.assertIn("service-identity.raw.log", self.text)
+        self.assertIn("candidate_service_cleanup=failed code=IDENTITY_MISMATCH", self.text)
         self.assertNotIn("--network-interface", block)
         self.assertNotIn("Discover physical default-route interface", self.text)
         self.assertIn(
@@ -181,11 +186,17 @@ class FunctionalWorkflowPolicyTest(unittest.TestCase):
     def test_cleanup_marker_and_plaintext_removal_are_unconditional(self) -> None:
         stop = self.text.index("- name: Stop candidate service and verify process cleanup")
         result = self.text.index("- name: Upload safe functional result")
-        marker = self.text.index("- name: Publish opaque completion marker")
-        remove = self.text.index("- name: Remove plaintext handoff material")
+        marker = self.text.index("id: post_lane_marker_prepare")
+        remove = self.text.index("- name: Remove plaintext handoff material and prepare completion marker")
+        self.assertLess(remove, marker)
+        marker_upload = self.text.index("- name: Upload opaque completion marker")
+        self.assertLess(marker, marker_upload)
+        self.assertLess(stop, remove)
+        self.assertLess(marker_upload, result)
+        self.assertLess(stop, result)
+        self.assertIn("if: always()", self.text[remove:marker_upload])
         self.assertIn("if: always()", self.text[stop:result])
-        self.assertIn("if: always()", self.text[result:marker])
-        self.assertIn("if: always()", self.text[marker:remove])
+        self.assertIn("if: always()", self.text[result:])
         self.assertIn(
             'rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/upload-url.txt" "$HANDOFF_DIR/recipient.key"',
             self.text,

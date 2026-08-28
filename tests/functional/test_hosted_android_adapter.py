@@ -414,6 +414,11 @@ class HostedAndroidAdapterTests(unittest.TestCase):
         self.assertIsInstance(adapter, AndroidHostedAdapter)
         self.assertEqual(adapter.capabilities, self.adapter.capabilities)
 
+    def test_finalizer_completes_the_shared_adapter_contract(self) -> None:
+        self.adapter.finalize(12.5)
+        with self.assertRaisesRegex(HostedAdapterError, "INVALID_FINALIZE_TIMEOUT"):
+            self.adapter.finalize(0)
+
     def test_factory_derives_android_endpoints_from_disposable_upload_url(self) -> None:
         token = "a" * 32
         adapter = adapter_for_platform(
@@ -559,6 +564,7 @@ class HostedAndroidAdapterTests(unittest.TestCase):
             "service_socket": Path("/unexpected"),
             "service_library_path": Path("/unexpected"),
             "service_pid_file": Path("/unexpected"),
+            "service_identity_file": Path("/unexpected"),
             "network_interface": "eth0",
         }
         for argument, value in values.items():
@@ -591,6 +597,7 @@ class HostedAndroidAdapterTests(unittest.TestCase):
             "--source-repository", "DobbyVPN/DobbyVPN", "--source-sha", _SOURCE_SHA,
             "--platform-version", "35",
             "--candidate-manifest", __file__, "--server-image-digest", "sha256:" + "b" * 64,
+            "--lane-timeout-seconds", "1800",
             "--output", str(Path(self.directory.name) / "result.json"),
             "--adb", "/synthetic/adb", "--identity-url", "https://identity.example.test/ip",
             "--latency-url", "https://latency.example.test/blob",

@@ -139,6 +139,7 @@ jobs:
           chmod 700 "$private_root" "$handoff" "$service" "$diagnostics"
           printf 'HANDOFF_DIR=%s\nSERVICE_DIR=%s\nDIAGNOSTIC_DIR=%s\nRESULT_PATH=%s\nLEASE_RUN_ID=unassigned\n' \
             "$handoff" "$service" "$diagnostics" "$handoff/functional-result.json" >> "$GITHUB_ENV"
+          printf 'POST_LANE_DEADLINE_EPOCH=unvalidated\nPOST_LANE_STEP_TIMEOUT_SECONDS=60\nPOST_LANE_MARKER_RESERVE_SECONDS=180\n' >> "$GITHUB_ENV"
 
       - name: Prove macOS client runner architecture and elevation
         shell: bash
@@ -351,6 +352,7 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          export PYTHONPATH="$GITHUB_WORKSPACE/torturer"
           emit_private_evidence() {
             label="$1"
             file="$2"
@@ -389,7 +391,36 @@ jobs:
           if [ "$launch_timeout" -gt "$launch_remaining" ]; then launch_timeout="$launch_remaining"; fi
           if [ "$launch_timeout" -le 0 ]; then printf 'preflight service launch reached cleanup reserve: remaining=%s\n' "$launch_remaining" >&2; exit 1; fi
           launch_status=0
-          service_pid="$(timeout --foreground --signal=TERM --kill-after=1s "${launch_timeout}s" sudo -n sh -c 'set -eu; product_tmp=$1; product_log=$2; control_socket=$3; peer_uid=$4; binary=$5; service_log=$6; env TMPDIR="$product_tmp" DOBBY_LOG_PATH="$product_log" DOBBYVPN_CONTROL_SOCKET="$control_socket" DOBBYVPN_CONTROL_PEER_UID="$peer_uid" "$binary" > "$service_log" 2>&1 & printf "%s\n" "$!"' dobbyvpn-preflight-service "$product_tmp" "$product_log" "$control_socket" "$peer_uid" "$service_binary" "$service_log")" 2>"$launch_log" || launch_status=$?
+          service_pid="$(timeout --foreground --signal=TERM --kill-after=1s "${launch_timeout}s" \
+            sudo -n python3 - "$service_binary" "$service_log" "$product_tmp" "$product_log" "$control_socket" "$peer_uid" <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          binary, service_log, product_tmp, product_log, control_socket, peer_uid = sys.argv[1:]
+          log_fd = os.open(service_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+          try:
+              environment = os.environ.copy()
+              environment.update({
+                  "TMPDIR": product_tmp,
+                  "DOBBY_LOG_PATH": product_log,
+                  "DOBBYVPN_CONTROL_SOCKET": control_socket,
+                  "DOBBYVPN_CONTROL_PEER_UID": peer_uid,
+              })
+              process = subprocess.Popen(
+                  (binary,),
+                  stdin=subprocess.DEVNULL,
+                  stdout=log_fd,
+                  stderr=log_fd,
+                  env=environment,
+                  start_new_session=True,
+                  close_fds=True,
+              )
+          finally:
+              os.close(log_fd)
+          print(process.pid, flush=True)
+          PY
+          )" 2>"$launch_log" || launch_status=$?
           emit_private_evidence preflight-service-launch "$launch_log"
           if [ "$launch_status" -ne 0 ]; then printf 'preflight_service_launch=failed code=LAUNCH status=%s\n' "$launch_status" >&2; emit_private_evidence preflight-service-log "$service_log"; exit 1; fi
           case "$service_pid" in ""|*[!0-9]*) printf 'invalid preflight service pid=%s\n' "$service_pid" >&2; exit 1;; esac
@@ -401,29 +432,64 @@ jobs:
           if [ "$identity_probe_timeout" -gt "$identity_probe_remaining" ]; then identity_probe_timeout="$identity_probe_remaining"; fi
           if [ "$identity_probe_timeout" -le 0 ]; then printf 'preflight_service_identity=failed code=DEADLINE\n' >&2; exit 1; fi
           timeout --foreground --signal=TERM --kill-after=1s "${identity_probe_timeout}s" \
-            sudo -n ps -p "$service_pid" -o pid=,lstart=,command= > "$identity_probe" 2>&1 || identity_probe_status=$?
+            python3 - "$service_pid" > "$identity_probe" 2>&1 <<'PY' || identity_probe_status=$?
+          import subprocess
+          import sys
+
+          from torturer_checks.hosted.macos import _MACOS_PROCESS_IDENTITY_SCRIPT
+
+          result = subprocess.run(
+              ("sudo", "-n", "python3", "-c", _MACOS_PROCESS_IDENTITY_SCRIPT, sys.argv[1]),
+              capture_output=True,
+              text=True,
+              check=False,
+              timeout=9.0,
+          )
+          print(result.stdout, end="")
+          print(result.stderr, end="", file=sys.stderr)
+          if result.returncode != 0:
+              raise SystemExit(result.returncode)
+          group = subprocess.run(
+              ("sudo", "-n", "ps", "-p", sys.argv[1], "-o", "pid=,pgid="),
+              capture_output=True,
+              text=True,
+              check=False,
+              timeout=9.0,
+          )
+          fields = group.stdout.split()
+          if group.returncode != 0 or len(fields) != 2 or fields[0] != sys.argv[1] or fields[1] != sys.argv[1]:
+              print("macOS service is not the leader of an isolated process group", file=sys.stderr)
+              print(group.stdout, end="")
+              print(group.stderr, end="", file=sys.stderr)
+              raise SystemExit(1)
+          print("service_group=%s|%s" % (fields[0], fields[1]))
+          PY
           emit_private_evidence preflight-service-identity-probe "$identity_probe"
           if [ "$identity_probe_status" -ne 0 ]; then printf 'preflight_service_identity=failed code=PROBE status=%s\n' "$identity_probe_status" >&2; exit 1; fi
           python3 - "$identity_probe" "$service_identity_file" "$service_pid" "$service_binary" <<'PY'
           import json
-          import os
           from pathlib import Path
           import sys
+
+          from torturer_checks.hosted.macos import _parse_macos_process_identity
 
           probe = Path(sys.argv[1])
           destination = Path(sys.argv[2])
           expected_pid = int(sys.argv[3])
-          expected_binary = sys.argv[4]
-          lines = [line for line in probe.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
-          fields = lines[0].split(maxsplit=6) if len(lines) == 1 else []
-          if len(fields) < 7 or not fields[0].isdigit():
-              raise SystemExit("macOS service identity probe is incomplete")
-          pid = int(fields[0])
-          start = " ".join(fields[1:6])
-          command = " ".join(fields[6:])
-          if pid != expected_pid or not (command == expected_binary or command.startswith(expected_binary + " ")):
+          expected_binary = str(Path(sys.argv[4]).resolve())
+          output = probe.read_text(encoding="utf-8", errors="replace")
+          group_lines = [line for line in output.splitlines() if line.startswith("service_group=")]
+          if group_lines != [f"service_group={expected_pid}|{expected_pid}"]:
+              raise SystemExit("macOS service process-group isolation proof is incomplete")
+          output = "\n".join(line for line in output.splitlines() if not line.startswith("service_group=")) + "\n"
+          try:
+              identity, actual_path = _parse_macos_process_identity(output, expected_pid)
+          except ValueError:
+              raise SystemExit("macOS service native identity probe is incomplete")
+          if str(Path(actual_path).resolve()) != expected_binary:
               raise SystemExit("macOS service identity does not match candidate")
-          destination.write_text(json.dumps({"pid": pid, "start": start, "command": command}, sort_keys=True) + "\n", encoding="utf-8")
+          native_start = identity.split("|", 1)[1]
+          destination.write_text(json.dumps({"command": expected_binary, "native_start": native_start, "pid": expected_pid, "start": native_start}, sort_keys=True) + "\n", encoding="utf-8")
           destination.chmod(0o600)
           PY
           printf 'PREFLIGHT_SERVICE_PID=%s\nPREFLIGHT_SERVICE_PID_FILE=%s\nPREFLIGHT_SERVICE_IDENTITY_FILE=%s\nPREFLIGHT_SERVICE_BINARY=%s\nPREFLIGHT_SERVICE_CONTROL_SOCKET=%s\nPREFLIGHT_SERVICE_LOG=%s\nPREFLIGHT_SERVICE_PRODUCT_LOG=%s\n' "$service_pid" "$HANDOFF_DIR/preflight-service.pid" "$service_identity_file" "$service_binary" "$control_socket" "$service_log" "$product_log" >> "$GITHUB_ENV"
@@ -484,6 +550,7 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          export PYTHONPATH="$GITHUB_WORKSPACE/torturer"
           emit_private_evidence() {
             label="$1"
             file="$2"
@@ -507,12 +574,29 @@ jobs:
           identity_status=0
           cleanup_deadline_epoch=$((RUN_DEADLINE_EPOCH - 180))
           if [ -f "$service_identity_file" ]; then
-            service_identity="$(python3 - "$service_identity_file" <<'PY'
+            service_identity="$(python3 - "$service_identity_file" "$service_binary" <<'PY'
           import json
+          import re
           import sys
           from pathlib import Path
           value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          print(f"{value['pid']}|{value['start']}|{value['command']}")
+          expected_command = str(Path(sys.argv[2]).resolve())
+          if set(value) != {"command", "native_start", "pid", "start"}:
+              raise ValueError("native process identity has unexpected fields")
+          pid = value["pid"]
+          native_start = value["native_start"]
+          command = value["command"]
+          if (
+              not isinstance(pid, int) or pid <= 0
+              or not isinstance(command, str) or not Path(command).is_absolute()
+              or str(Path(command).resolve()) != expected_command
+              or not isinstance(native_start, str)
+              or re.fullmatch(r"[1-9][0-9]*\.[0-9]{6}", native_start) is None
+              or int(native_start.split(".", 1)[1]) >= 1_000_000
+              or value["start"] != native_start
+          ):
+              raise ValueError("native process identity is invalid")
+          print(f"{pid}|{native_start}|{command}")
           PY
             )" || identity_status=$?
           fi
@@ -524,76 +608,53 @@ jobs:
             timeout_seconds="$5"
             probe_status=0
             timeout --foreground --signal=TERM --kill-after=1s "${timeout_seconds}s" \
-              sudo -n ps -p "$pid" -o pid=,lstart=,command= > "$output" 2>&1 || probe_status=$?
-            if [ "$probe_status" -ne 0 ]; then return "$probe_status"; fi
-            python3 - "$output" "$identity" "$binary" <<'PY'
-          import json
+              python3 - "$pid" "$identity" "$binary" "$timeout_seconds" > "$output" 2>&1 <<'PY' || probe_status=$?
+          import subprocess
           import sys
           from pathlib import Path
 
-          probe, identity, expected_binary = (Path(sys.argv[1]), sys.argv[2], sys.argv[3])
-          try:
-              expected_pid, expected_start, expected_command = identity.split("|", 2)
-              expected_pid = int(expected_pid)
-          except (ValueError, TypeError):
-              raise SystemExit(4)
-          lines = [line for line in probe.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
-          if not lines:
+          from torturer_checks.hosted.macos import (
+              _MACOS_PROCESS_IDENTITY_SCRIPT,
+              _parse_macos_process_identity,
+          )
+
+          pid = int(sys.argv[1])
+          expected_pid, expected_start, expected_command = sys.argv[2].split("|", 2)
+          expected_binary = str(Path(sys.argv[3]).resolve())
+          result = subprocess.run(
+              ("sudo", "-n", "python3", "-c", _MACOS_PROCESS_IDENTITY_SCRIPT, str(pid)),
+              capture_output=True,
+              text=True,
+              check=False,
+              timeout=max(0.1, float(sys.argv[4])),
+          )
+          print(result.stdout, end="")
+          print(result.stderr, end="", file=sys.stderr)
+          if result.returncode == 2 and result.stdout.strip() == "service_probe_absent":
               raise SystemExit(2)
-          fields = lines[0].split(maxsplit=6)
-          if len(fields) < 7 or not fields[0].isdigit():
+          if result.returncode != 0:
               raise SystemExit(4)
-          actual_pid = int(fields[0])
-          actual_start = " ".join(fields[1:6])
-          actual_command = fields[6]
-          if actual_pid != expected_pid or actual_start != expected_start or actual_command != expected_command:
+          try:
+              actual_identity, actual_path = _parse_macos_process_identity(result.stdout, pid)
+          except ValueError:
+              raise SystemExit(4)
+          if actual_identity != f"{expected_pid}|{expected_start}":
               raise SystemExit(3)
-          if not (actual_command == expected_binary or actual_command.startswith(expected_binary + " ")):
+          if str(Path(actual_path).resolve()) != expected_binary or expected_command != expected_binary:
               raise SystemExit(3)
           raise SystemExit(0)
           PY
+            if [ "$probe_status" -ne 0 ]; then return "$probe_status"; fi
           }
-          if [ -z "$service_identity" ] && [ -f "$service_pid_file" ] && [ -n "$service_binary" ]; then
-            fallback_pid="$(tr -d '\r\n' < "$service_pid_file")"
-            case "$fallback_pid" in
-              ""|*[!0-9]*) fallback_pid="";;
-            esac
-            if [ -n "$fallback_pid" ]; then
-              fallback_log="$DIAGNOSTIC_DIR/preflight-cleanup-identity.raw.log"
-              fallback_status=0
-              fallback_timeout=10
-              fallback_remaining=$((cleanup_deadline_epoch - $(date +%s)))
-              if [ "$fallback_timeout" -gt "$fallback_remaining" ]; then fallback_timeout="$fallback_remaining"; fi
-              if [ "$fallback_timeout" -le 0 ]; then printf 'preflight_service_cleanup=failed code=CLEANUP_DEADLINE\n' >&2; exit 1; fi
-              timeout --foreground --signal=TERM --kill-after=1s "${fallback_timeout}s" \
-                sudo -n ps -p "$fallback_pid" -o pid=,lstart=,command= > "$fallback_log" 2>&1 || fallback_status=$?
-              emit_private_evidence preflight-cleanup-identity "$fallback_log"
-              if [ "$fallback_status" -eq 0 ]; then
-                service_identity="$(python3 - "$fallback_log" "$service_identity_file" "$fallback_pid" "$service_binary" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
-
-          probe = Path(sys.argv[1])
-          destination = Path(sys.argv[2])
-          expected_pid = int(sys.argv[3])
-          expected_binary = sys.argv[4]
-          lines = [line for line in probe.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
-          fields = lines[0].split(maxsplit=6) if len(lines) == 1 else []
-          if len(fields) < 7 or not fields[0].isdigit():
-              raise SystemExit("macOS service identity probe is incomplete")
-          pid = int(fields[0])
-          start = " ".join(fields[1:6])
-          command = fields[6]
-          if pid != expected_pid or not (command == expected_binary or command.startswith(expected_binary + " ")):
-              raise SystemExit("macOS service identity does not match candidate")
-          destination.write_text(json.dumps({"pid": pid, "start": start, "command": command}, sort_keys=True) + "\n", encoding="utf-8")
-          destination.chmod(0o600)
-          print(f"{pid}|{start}|{command}")
-          PY
-                )" || service_identity=""
-              fi
-            fi
+          # A PID file without its native sidecar is not an ownership proof.
+          # Never probe or signal that PID: it may be a stale predecessor or
+          # a same-binary PID reuse after a partial launch.
+          if [ -z "$service_identity" ] && [ -f "$service_pid_file" ]; then
+            fallback_attempted=true
+            fallback_remaining=$((cleanup_deadline_epoch - $(date +%s)))
+            emit_private_evidence preflight-service-identity "$service_identity_file"
+            printf 'preflight_service_cleanup=failed code=NATIVE_IDENTITY_UNAVAILABLE remaining=%s\n' "$fallback_remaining" >&2
+            exit 1
           fi
           if [ -z "$service_identity" ]; then
             printf 'preflight_service_stop_verified=true state=not-started\n'
@@ -793,11 +854,16 @@ jobs:
               "source_sha": os.environ["SOURCE_SHA"],
               "state": "issued",
           }
-          expected_keys = set(expected) | {"services"}
+          expected_keys = set(expected) | {"services", "available_until_epoch"}
           if set(value) != expected_keys:
               raise SystemExit("macOS safe lease record has an unsafe shape")
           for key, wanted in expected.items():
               if value.get(key) != wanted: raise SystemExit(f"lease field {key} is invalid")
+          available_until_epoch = value.get("available_until_epoch")
+          if (isinstance(available_until_epoch, bool)
+                  or not isinstance(available_until_epoch, int)
+                  or available_until_epoch <= 0):
+              raise SystemExit("lease availability deadline is invalid")
           services = value.get("services")
           if not isinstance(services, list) or len(services) != 2:
               raise SystemExit("macOS lease service bundle is invalid")
@@ -855,11 +921,39 @@ jobs:
           print("upload_handoff=validated")
           PY
 
+      - name: Establish validated post-lane provider deadline
+        if: always()
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          lease_file="${LEASE_RESPONSE_DIR:-}/lease.json"
+          if [ -z "${LEASE_RESPONSE_DIR:-}" ] || [ ! -f "$lease_file" ]; then
+            printf '%s\n' 'post-lane provider deadline unavailable: no validated lease exists; server hard cleanup remains authoritative' >&2
+            exit 1
+          fi
+          available_until_epoch="$(python3 - "$lease_file" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          deadline = value.get("available_until_epoch")
+          if isinstance(deadline, bool) or not isinstance(deadline, int) or deadline <= 0:
+              raise SystemExit("lease availability deadline is invalid")
+          print(deadline)
+          PY
+          )"
+          printf 'POST_LANE_DEADLINE_EPOCH=%s\nPOST_LANE_STEP_TIMEOUT_SECONDS=60\nPOST_LANE_MARKER_RESERVE_SECONDS=180\n' \
+            "$((available_until_epoch - 5))" >> "$GITHUB_ENV"
+          printf 'validated_post_lane_provider_deadline=%s marker_reserve_seconds=180\n' "$available_until_epoch"
+
       - name: Start exact macOS functional candidate
         shell: bash
         run: |
           set -euo pipefail
           umask 077
+          export PYTHONPATH="$GITHUB_WORKSPACE/torturer"
           emit_private_evidence() {
             label="$1"
             file="$2"
@@ -898,7 +992,36 @@ jobs:
           if [ "$launch_timeout" -gt "$launch_remaining" ]; then launch_timeout="$launch_remaining"; fi
           if [ "$launch_timeout" -le 0 ]; then printf 'service launch reached cleanup reserve: remaining=%s\n' "$launch_remaining" >&2; exit 1; fi
           launch_status=0
-          service_pid="$(timeout --foreground --signal=TERM --kill-after=1s "${launch_timeout}s" sudo -n sh -c 'set -eu; product_tmp=$1; product_log=$2; control_socket=$3; peer_uid=$4; binary=$5; service_log=$6; env TMPDIR="$product_tmp" DOBBY_LOG_PATH="$product_log" DOBBYVPN_CONTROL_SOCKET="$control_socket" DOBBYVPN_CONTROL_PEER_UID="$peer_uid" "$binary" > "$service_log" 2>&1 & printf "%s\n" "$!"' dobbyvpn-service "$product_tmp" "$product_log" "$control_socket" "$peer_uid" "$service_binary" "$service_log")" 2>"$launch_log" || launch_status=$?
+          service_pid="$(timeout --foreground --signal=TERM --kill-after=1s "${launch_timeout}s" \
+            sudo -n python3 - "$service_binary" "$service_log" "$product_tmp" "$product_log" "$control_socket" "$peer_uid" <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          binary, service_log, product_tmp, product_log, control_socket, peer_uid = sys.argv[1:]
+          log_fd = os.open(service_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+          try:
+              environment = os.environ.copy()
+              environment.update({
+                  "TMPDIR": product_tmp,
+                  "DOBBY_LOG_PATH": product_log,
+                  "DOBBYVPN_CONTROL_SOCKET": control_socket,
+                  "DOBBYVPN_CONTROL_PEER_UID": peer_uid,
+              })
+              process = subprocess.Popen(
+                  (binary,),
+                  stdin=subprocess.DEVNULL,
+                  stdout=log_fd,
+                  stderr=log_fd,
+                  env=environment,
+                  start_new_session=True,
+                  close_fds=True,
+              )
+          finally:
+              os.close(log_fd)
+          print(process.pid, flush=True)
+          PY
+          )" 2>"$launch_log" || launch_status=$?
           emit_private_evidence service-launch "$launch_log"
           if [ "$launch_status" -ne 0 ]; then printf 'service_launch=failed code=LAUNCH status=%s\n' "$launch_status" >&2; emit_private_evidence service-log "$service_log"; exit 1; fi
           case "$service_pid" in ""|*[!0-9]*) printf 'invalid service pid=%s\n' "$service_pid" >&2; exit 1;; esac
@@ -913,7 +1036,38 @@ jobs:
             exit 1
           fi
           timeout --foreground --signal=TERM --kill-after=1s "${identity_probe_timeout}s" \
-            sudo -n ps -p "$service_pid" -o pid=,lstart=,command= > "$identity_probe" 2>&1 || identity_probe_status=$?
+            python3 - "$service_pid" > "$identity_probe" 2>&1 <<'PY' || identity_probe_status=$?
+          import subprocess
+          import sys
+
+          from torturer_checks.hosted.macos import _MACOS_PROCESS_IDENTITY_SCRIPT
+
+          result = subprocess.run(
+              ("sudo", "-n", "python3", "-c", _MACOS_PROCESS_IDENTITY_SCRIPT, sys.argv[1]),
+              capture_output=True,
+              text=True,
+              check=False,
+              timeout=9.0,
+          )
+          print(result.stdout, end="")
+          print(result.stderr, end="", file=sys.stderr)
+          if result.returncode != 0:
+              raise SystemExit(result.returncode)
+          group = subprocess.run(
+              ("sudo", "-n", "ps", "-p", sys.argv[1], "-o", "pid=,pgid="),
+              capture_output=True,
+              text=True,
+              check=False,
+              timeout=9.0,
+          )
+          fields = group.stdout.split()
+          if group.returncode != 0 or len(fields) != 2 or fields[0] != sys.argv[1] or fields[1] != sys.argv[1]:
+              print("macOS service is not the leader of an isolated process group", file=sys.stderr)
+              print(group.stdout, end="")
+              print(group.stderr, end="", file=sys.stderr)
+              raise SystemExit(1)
+          print("service_group=%s|%s" % (fields[0], fields[1]))
+          PY
           emit_private_evidence service-identity-probe "$identity_probe"
           if [ "$identity_probe_status" -ne 0 ]; then printf 'service_identity=failed code=PROBE status=%s\n' "$identity_probe_status" >&2; exit 1; fi
           python3 - "$identity_probe" "$service_identity_file" "$service_pid" "$service_binary" <<'PY'
@@ -921,20 +1075,25 @@ jobs:
           from pathlib import Path
           import sys
 
+          from torturer_checks.hosted.macos import _parse_macos_process_identity
+
           probe = Path(sys.argv[1])
           destination = Path(sys.argv[2])
           expected_pid = int(sys.argv[3])
-          expected_binary = sys.argv[4]
-          lines = [line for line in probe.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
-          fields = lines[0].split(maxsplit=6) if len(lines) == 1 else []
-          if len(fields) < 7 or not fields[0].isdigit():
-              raise SystemExit("macOS service identity probe is incomplete")
-          pid = int(fields[0])
-          start = " ".join(fields[1:6])
-          command = fields[6]
-          if pid != expected_pid or not (command == expected_binary or command.startswith(expected_binary + " ")):
+          expected_binary = str(Path(sys.argv[4]).resolve())
+          output = probe.read_text(encoding="utf-8", errors="replace")
+          group_lines = [line for line in output.splitlines() if line.startswith("service_group=")]
+          if group_lines != [f"service_group={expected_pid}|{expected_pid}"]:
+              raise SystemExit("macOS service process-group isolation proof is incomplete")
+          output = "\n".join(line for line in output.splitlines() if not line.startswith("service_group=")) + "\n"
+          try:
+              identity, actual_path = _parse_macos_process_identity(output, expected_pid)
+          except ValueError:
+              raise SystemExit("macOS service native identity probe is incomplete")
+          if str(Path(actual_path).resolve()) != expected_binary:
               raise SystemExit("macOS service identity does not match candidate")
-          destination.write_text(json.dumps({"pid": pid, "start": start, "command": command}, sort_keys=True) + "\n", encoding="utf-8")
+          native_start = identity.split("|", 1)[1]
+          destination.write_text(json.dumps({"command": expected_binary, "native_start": native_start, "pid": expected_pid, "start": native_start}, sort_keys=True) + "\n", encoding="utf-8")
           destination.chmod(0o600)
           PY
           printf 'SERVICE_PID=%s\nSERVICE_BINARY=%s\nSERVICE_PID_FILE=%s\nSERVICE_IDENTITY_FILE=%s\nSERVICE_CONTROL_SOCKET=%s\nSERVICE_LOG=%s\nSERVICE_PRODUCT_LOG=%s\nDOBBYVPN_CONTROL_SOCKET=%s\n' "$service_pid" "$service_binary" "$HANDOFF_DIR/service.pid" "$service_identity_file" "$control_socket" "$service_log" "$product_log" "$control_socket" >> "$GITHUB_ENV"
@@ -1056,11 +1215,33 @@ jobs:
           export TORTURER_HOSTED_DEADLINE_SUMMARY_PATH="$HANDOFF_DIR/functional-deadline-summary.json"
           printf 'TORTURER_HOSTED_DEADLINE_EVIDENCE_DIR=%s\nTORTURER_HOSTED_DEADLINE_SUMMARY_PATH=%s\n' \
             "$TORTURER_HOSTED_DEADLINE_EVIDENCE_DIR" "$TORTURER_HOSTED_DEADLINE_SUMMARY_PATH" >> "$GITHUB_ENV"
-          remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 120))
+          remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 300))
           # Eight applicable scenarios plus ten resets require 950 seconds;
           # keep a deliberate 60-second scheduling margin inside the 1,200s cap.
-          if [ "$remaining" -lt 1010 ]; then printf 'insufficient macOS canonical budget before cleanup reserve: seconds=%s required=1010\n' "$remaining" >&2; exit 1; fi
           if [ "$remaining" -gt 1200 ]; then remaining=1200; fi
+          available_until_epoch="$(python3 - "$LEASE_RESPONSE_DIR/lease.json" <<'PY'
+          import json, sys
+          from pathlib import Path
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          print(value["available_until_epoch"])
+          PY
+          )"
+          case "$available_until_epoch" in
+            ''|*[!0-9]*) printf 'lease availability deadline is invalid\n' >&2; exit 1 ;;
+          esac
+          server_remaining=$((available_until_epoch - $(date +%s)))
+          client_post_lane_reserve_seconds=300
+          lane_start_margin_seconds=5
+          server_lane_remaining=$((server_remaining - client_post_lane_reserve_seconds - lane_start_margin_seconds))
+          if [ "$server_lane_remaining" -le 0 ]; then
+            printf 'insufficient Render lease lifetime before functional lane: seconds=%s reserve=%s margin=%s\n' \
+              "$server_remaining" "$client_post_lane_reserve_seconds" "$lane_start_margin_seconds" >&2
+            exit 1
+          fi
+          if [ "$remaining" -gt "$server_lane_remaining" ]; then remaining="$server_lane_remaining"; fi
+          if [ "$remaining" -lt 1010 ]; then printf 'insufficient macOS canonical budget before cleanup reserve: seconds=%s required=1010\n' "$remaining" >&2; exit 1; fi
+          printf 'render_lease_lifetime_for_lane_seconds=%s required=%s reserve=%s margin=%s\n' \
+            "$server_remaining" "$remaining" "$client_post_lane_reserve_seconds" "$lane_start_margin_seconds"
           printf 'canonical_lane_timeout_seconds=%s\n' "$remaining"
           upload_url="$(cat "$HANDOFF_DIR/upload-url.txt")"
           test -n "$upload_url"
@@ -1068,23 +1249,28 @@ jobs:
           python3 -m torturer_checks.hosted.deadline --timeout-seconds "$remaining" --kill-grace-seconds 30 \
             --summary-output "$TORTURER_HOSTED_DEADLINE_SUMMARY_PATH" \
             python3 -m torturer_checks.hosted.run --platform macos --cli "$GITHUB_WORKSPACE/candidate/dobby-cli" \
+            --lane-timeout-seconds "$remaining" \
             --profile "$HANDOFF_DIR/profile.toml" --source-repository "$SOURCE_REPOSITORY" --source-sha "$SOURCE_SHA" \
             --platform-version "macos-15" \
             --candidate-manifest "$GITHUB_WORKSPACE/candidate/manifest.json" --server-image-digest "$SERVER_IMAGE_DIGEST" --output "$RESULT_PATH" \
             --raw-log-dir "$HANDOFF_DIR/hosted-command-raw" --upload-url "$upload_url" \
             --service-pid "$SERVICE_PID" --service-binary "$SERVICE_BINARY" \
             --service-socket "$SERVICE_CONTROL_SOCKET" --service-pid-file "$SERVICE_PID_FILE" \
+            --service-identity-file "$SERVICE_IDENTITY_FILE" \
             --expected-unavailable functional.network-transition=HOSTED_MACOS_UPLINK_TOGGLE_UNSUPPORTED \
             --expected-unavailable functional.sleep-wake=HOSTED_RUNNER_SUSPEND_UNSUPPORTED || functional_status=$?
           printf 'FUNCTIONAL_STATUS=%s\n' "$functional_status" >> "$GITHUB_ENV"
           exit "$functional_status"
 
       - name: Stop exact macOS service and verify cleanup
+        id: service_cleanup
         if: always()
+        timeout-minutes: 1
         shell: bash
         run: |
           set -euo pipefail
           umask 077
+          export PYTHONPATH="$GITHUB_WORKSPACE/torturer"
           emit_private_evidence() {
             label="$1"
             file="$2"
@@ -1106,56 +1292,48 @@ jobs:
           service_identity=""
           cleanup_deadline_epoch=$((RUN_DEADLINE_EPOCH - 60))
           if [ -f "$service_identity_file" ]; then
-            service_identity="$(python3 - "$service_identity_file" <<'PY'
+            service_identity="$(python3 - "$service_identity_file" "$service_binary" <<'PY'
           import json
+          import re
           import sys
           from pathlib import Path
           value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          print(f"{value['pid']}|{value['start']}|{value['command']}")
+          expected_command = str(Path(sys.argv[2]).resolve())
+          if set(value) != {"command", "native_start", "pid", "start"}:
+              raise ValueError("native process identity has unexpected fields")
+          pid = value["pid"]
+          command = value["command"]
+          native_start = value["native_start"]
+          if (
+              isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0
+              or not isinstance(command, str) or not Path(command).is_absolute()
+              or str(Path(command).resolve()) != expected_command
+              or not isinstance(native_start, str)
+              or re.fullmatch(r"[1-9][0-9]*\.[0-9]{6}", native_start) is None
+              or int(native_start.split(".", 1)[1]) >= 1_000_000
+              or value["start"] != native_start
+          ):
+              raise ValueError("native process identity is invalid")
+          print(f"{pid}|{native_start}|{command}")
           PY
             )" || service_identity=""
           fi
-          if [ -z "$service_identity" ] && [ -f "$service_pid_file" ] && [ -n "$service_binary" ]; then
-            fallback_pid="$(tr -d '\r\n' < "$service_pid_file")"
-            case "$fallback_pid" in ""|*[!0-9]*) fallback_pid="";; esac
-            if [ -n "$fallback_pid" ]; then
-              fallback_log="$DIAGNOSTIC_DIR/cleanup-identity.raw.log"
-              fallback_status=0
-              fallback_timeout=10
-              fallback_remaining=$((cleanup_deadline_epoch - $(date +%s)))
-              if [ "$fallback_timeout" -gt "$fallback_remaining" ]; then fallback_timeout="$fallback_remaining"; fi
-              if [ "$fallback_timeout" -le 0 ]; then printf 'service_cleanup=failed code=CLEANUP_DEADLINE\n' >&2; exit 1; fi
-              timeout --foreground --signal=TERM --kill-after=1s "${fallback_timeout}s" \
-                sudo -n ps -p "$fallback_pid" -o pid=,lstart=,command= > "$fallback_log" 2>&1 || fallback_status=$?
-              emit_private_evidence cleanup-identity "$fallback_log"
-              if [ "$fallback_status" -eq 0 ]; then
-                service_identity="$(python3 - "$fallback_log" "$service_identity_file" "$fallback_pid" "$service_binary" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
-
-          probe = Path(sys.argv[1])
-          destination = Path(sys.argv[2])
-          expected_pid = int(sys.argv[3])
-          expected_binary = sys.argv[4]
-          lines = [line for line in probe.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
-          fields = lines[0].split(maxsplit=6) if len(lines) == 1 else []
-          if len(fields) < 7 or not fields[0].isdigit():
-              raise SystemExit("macOS service identity probe is incomplete")
-          pid = int(fields[0])
-          start = " ".join(fields[1:6])
-          command = fields[6]
-          if pid != expected_pid or not (command == expected_binary or command.startswith(expected_binary + " ")):
-              raise SystemExit("macOS service identity does not match candidate")
-          destination.write_text(json.dumps({"pid": pid, "start": start, "command": command}, sort_keys=True) + "\n", encoding="utf-8")
-          destination.chmod(0o600)
-          print(f"{pid}|{start}|{command}")
-          PY
-                )" || service_identity=""
-              fi
-            fi
+          # A missing, pending, or malformed sidecar has no safe owner.  The
+          # PID file is intentionally not a fallback: after a partial restart
+          # it may still name the predecessor or an unrelated PID reuse.
+          if [ -z "$service_identity" ] && [ -f "$service_pid_file" ]; then
+            fallback_attempted=true
+            fallback_remaining=$((cleanup_deadline_epoch - $(date +%s)))
+            emit_private_evidence service-identity "$service_identity_file"
+            printf 'service_cleanup=failed code=NATIVE_IDENTITY_UNAVAILABLE remaining=%s\n' "$fallback_remaining" >&2
+            exit 1
           fi
           if [ -z "$service_identity" ]; then
+            if [ "${fallback_attempted:-false}" = true ]; then
+              emit_private_evidence service-identity "$service_identity_file"
+              printf 'service_cleanup=failed code=NATIVE_IDENTITY_UNAVAILABLE\n' >&2
+              exit 1
+            fi
             printf 'SERVICE_STOP_STATE=not-started\n' >> "$GITHUB_ENV"
             exit 0
           fi
@@ -1167,35 +1345,50 @@ jobs:
             binary="$3"
             output="$4"
             timeout_seconds="$5"
+            # Only the precise native proc_pidinfo token is accepted.  The
+            # legacy ps lstart value is deliberately not an identity proof.
+            if ! [[ "$identity" =~ ^[1-9][0-9]{0,9}\|[1-9][0-9]*\.[0-9]{6}\| ]]; then
+              return 4
+            fi
             probe_status=0
             timeout --foreground --signal=TERM --kill-after=1s "${timeout_seconds}s" \
-              sudo -n ps -p "$pid" -o pid=,lstart=,command= > "$output" 2>&1 || probe_status=$?
-            if [ "$probe_status" -ne 0 ]; then return "$probe_status"; fi
-            python3 - "$output" "$identity" "$binary" <<'PY'
+              python3 - "$pid" "$identity" "$binary" "$timeout_seconds" > "$output" 2>&1 <<'PY' || probe_status=$?
+          import subprocess
           import sys
           from pathlib import Path
 
-          probe, identity, expected_binary = (Path(sys.argv[1]), sys.argv[2], sys.argv[3])
-          try:
-              expected_pid, expected_start, expected_command = identity.split("|", 2)
-              expected_pid = int(expected_pid)
-          except (ValueError, TypeError):
-              raise SystemExit(4)
-          lines = [line for line in probe.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
-          if not lines:
+          from torturer_checks.hosted.macos import (
+              _MACOS_PROCESS_IDENTITY_SCRIPT,
+              _parse_macos_process_identity,
+          )
+
+          pid = int(sys.argv[1])
+          expected_identity = sys.argv[2].split("|", 2)
+          expected_binary = str(Path(sys.argv[3]).resolve())
+          result = subprocess.run(
+              ("sudo", "-n", "python3", "-c", _MACOS_PROCESS_IDENTITY_SCRIPT, str(pid)),
+              capture_output=True,
+              text=True,
+              check=False,
+              timeout=max(0.1, float(sys.argv[4])),
+          )
+          print(result.stdout, end="")
+          print(result.stderr, end="", file=sys.stderr)
+          if result.returncode == 2 and result.stdout.strip() == "service_probe_absent":
               raise SystemExit(2)
-          fields = lines[0].split(maxsplit=6)
-          if len(fields) < 7 or not fields[0].isdigit():
+          if result.returncode != 0:
               raise SystemExit(4)
-          actual_pid = int(fields[0])
-          actual_start = " ".join(fields[1:6])
-          actual_command = fields[6]
-          if actual_pid != expected_pid or actual_start != expected_start or actual_command != expected_command:
+          try:
+              actual_identity, actual_path = _parse_macos_process_identity(result.stdout, pid)
+          except ValueError:
+              raise SystemExit(4)
+          if actual_identity != f"{expected_identity[0]}|{expected_identity[1]}":
               raise SystemExit(3)
-          if not (actual_command == expected_binary or actual_command.startswith(expected_binary + " ")):
+          if str(Path(actual_path).resolve()) != expected_binary:
               raise SystemExit(3)
           raise SystemExit(0)
           PY
+            return "$probe_status"
           }
           cleanup_probe_log="$DIAGNOSTIC_DIR/cleanup-probe-initial.raw.log"
           remaining=$((cleanup_deadline_epoch - $(date +%s)))
@@ -1272,14 +1465,126 @@ jobs:
           test "$children_status" -eq 0
           printf 'SERVICE_STOP_STATE=%s\n' "$stop_state" >> "$GITHUB_ENV"
 
-      - name: Retain opaque macOS functional evidence before route recovery
+      - name: Restore macOS default route before evidence upload
+        id: route_cleanup
         if: always()
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          emit_private_evidence() {
+            label="$1"
+            file="$2"
+            if [ -f "$file" ]; then
+              bytes="$(wc -c < "$file" | tr -d '[:space:]')"
+              digest="$(sha256sum "$file" | awk '{print $1}')"
+              evidence_id="$(printf '%s:%s' "$GITHUB_RUN_ID" "$label" | sha256sum | cut -c1-16)"
+              printf 'diagnostic_evidence label=%s id=%s bytes=%s sha256=%s\n' \
+                "$label" "$evidence_id" "$bytes" "$digest"
+            else
+              printf 'diagnostic_evidence label=%s state=missing\n' "$label"
+            fi
+          }
+          service_pid="${SERVICE_PID:-}"
+          # The controller's identity sidecar is authoritative after a
+          # restart; the PID file can still name the predecessor when its
+          # persistence failed after the native identity was committed.
+          if [ -f "${SERVICE_IDENTITY_FILE:-}" ]; then
+            sidecar_pid="$(python3 - "$SERVICE_IDENTITY_FILE" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          print(value["pid"])
+          PY
+            )" || sidecar_pid=""
+            if [[ "$sidecar_pid" =~ ^[1-9][0-9]{0,9}$ ]]; then service_pid="$sidecar_pid"; fi
+          fi
+          if ! [[ "$service_pid" =~ ^[1-9][0-9]{0,9}$ ]] && [ -f "${SERVICE_PID_FILE:-}" ]; then
+            service_pid="$(cat "$SERVICE_PID_FILE")"
+          fi
+          case "$service_pid" in ""|*[!0-9]*) printf 'missing or invalid macOS service pid during route cleanup\n' >&2; exit 1;; esac
+          # macos_route treats the observed "not in table" marker separately
+          # from a malformed or foreign default route and confirms it twice.
+          restore_status=0
+          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.macos_route \
+            --baseline-file "$DIAGNOSTIC_DIR/baseline-default-route.raw.log" \
+            --service-probe-file "$DIAGNOSTIC_DIR/service-death-probe.raw.log" \
+            --current-file "$DIAGNOSTIC_DIR/post-functional-default-route.raw.log" \
+            --confirmation-file "$DIAGNOSTIC_DIR/confirmed-absent-default-route.raw.log" \
+            --restore-file "$DIAGNOSTIC_DIR/restore-default-route.raw.log" \
+            --verified-file "$DIAGNOSTIC_DIR/verified-default-route.raw.log" \
+            --service-pid "$service_pid" --service-identity-file "$SERVICE_IDENTITY_FILE" --timeout-seconds 10 || restore_status=$?
+          emit_private_evidence macos-service-death-probe "$DIAGNOSTIC_DIR/service-death-probe.raw.log"
+          emit_private_evidence macos-post-functional-default-route "$DIAGNOSTIC_DIR/post-functional-default-route.raw.log"
+          emit_private_evidence macos-confirmed-absent-default-route "$DIAGNOSTIC_DIR/confirmed-absent-default-route.raw.log"
+          emit_private_evidence macos-restore-default-route "$DIAGNOSTIC_DIR/restore-default-route.raw.log"
+          emit_private_evidence macos-verified-default-route "$DIAGNOSTIC_DIR/verified-default-route.raw.log"
+          if [ "$restore_status" -ne 0 ]; then
+            printf 'macos_default_route_restore=failed status=%s\n' "$restore_status" >&2
+            exit "$restore_status"
+          fi
+
+      - name: Remove plaintext handoff material and prepare completion marker
+        if: always()
+        timeout-minutes: 1
+        id: post_lane_marker_prepare
+        shell: bash
+        env:
+          FUNCTIONAL_OUTCOME: ${{ steps.functional.outcome }}
+        run: |
+          set -euo pipefail
+          # Plaintext handoff material is removed even when timing metadata is
+          # unavailable; marker publication itself still fails closed.
+          if [ -n "${HANDOFF_DIR:-}" ]; then
+            rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/upload-url.txt" "$HANDOFF_DIR/recipient.key"
+          else
+            printf '%s\n' 'post-lane plaintext removal skipped: handoff directory was never initialized' >&2
+          fi
+          run_deadline="${RUN_DEADLINE_EPOCH:-}"
+          provider_deadline="${POST_LANE_DEADLINE_EPOCH:-}"
+          post_lane_marker_reserve="${POST_LANE_MARKER_RESERVE_SECONDS:-}"
+          if [ -z "${HANDOFF_DIR:-}" ] || ! [[ "$run_deadline" =~ ^[0-9]+$ ]] || ! [[ "$provider_deadline" =~ ^[0-9]+$ ]] || ! [[ "$post_lane_marker_reserve" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' 'post-lane marker preparation skipped: functional lane did not establish valid origin/provider deadlines' >&2
+            exit 1
+          fi
+          if [ "$run_deadline" -le "$provider_deadline" ]; then
+            post_deadline="$run_deadline"
+          else
+            post_deadline="$provider_deadline"
+          fi
+          post_remaining=$((post_deadline - $(date +%s)))
+          if [ "$post_remaining" -lt "$post_lane_marker_reserve" ]; then
+            printf 'post-lane marker preparation cannot fit before origin/provider deadline: remaining=%s required=%s\n' \
+              "$post_remaining" "$post_lane_marker_reserve" >&2
+            exit 1
+          fi
+          umask 077
+          mkdir -p "$HANDOFF_DIR/completion"
+          printf 'schema=1\nrun_id=%s\nplatform=macos\nfunctional_outcome=%s\n' "$LEASE_RUN_ID" "$FUNCTIONAL_OUTCOME" > "$HANDOFF_DIR/completion/completion.marker"
+
+      - name: Upload opaque macOS completion marker
+        if: always() && steps.service_cleanup.outcome == 'success' && steps.route_cleanup.outcome == 'success' && steps.post_lane_marker_prepare.outcome == 'success'
+        timeout-minutes: 1
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: render-complete-${{ env.LEASE_RUN_ID }}-macos
+          path: ${{ env.HANDOFF_DIR }}/completion/completion.marker
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Retain opaque macOS functional evidence after provider-release marker
+        if: always()
+        timeout-minutes: 1
         env:
           FUNCTIONAL_OUTCOME: ${{ steps.functional.outcome }}
         shell: bash
         run: |
           set -euo pipefail
           umask 077
+          # This derived manifest is deliberately after the marker upload so
+          # evidence retention cannot delay provider cleanup.
           PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 - "$HANDOFF_DIR/macos-failure-evidence.json" <<'PY'
           import os
           from pathlib import Path
@@ -1344,51 +1649,9 @@ jobs:
           print("macos_opaque_evidence_manifest=retained")
           PY
 
-      - name: Restore macOS default route before evidence upload
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          umask 077
-          emit_private_evidence() {
-            label="$1"
-            file="$2"
-            if [ -f "$file" ]; then
-              bytes="$(wc -c < "$file" | tr -d '[:space:]')"
-              digest="$(sha256sum "$file" | awk '{print $1}')"
-              evidence_id="$(printf '%s:%s' "$GITHUB_RUN_ID" "$label" | sha256sum | cut -c1-16)"
-              printf 'diagnostic_evidence label=%s id=%s bytes=%s sha256=%s\n' \
-                "$label" "$evidence_id" "$bytes" "$digest"
-            else
-              printf 'diagnostic_evidence label=%s state=missing\n' "$label"
-            fi
-          }
-          service_pid="${SERVICE_PID:-}"
-          if [ -f "${SERVICE_PID_FILE:-}" ]; then service_pid="$(cat "$SERVICE_PID_FILE")"; fi
-          case "$service_pid" in ""|*[!0-9]*) printf 'missing or invalid macOS service pid during route cleanup\n' >&2; exit 1;; esac
-          # macos_route treats the observed "not in table" marker separately
-          # from a malformed or foreign default route and confirms it twice.
-          restore_status=0
-          PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.macos_route \
-            --baseline-file "$DIAGNOSTIC_DIR/baseline-default-route.raw.log" \
-            --service-probe-file "$DIAGNOSTIC_DIR/service-death-probe.raw.log" \
-            --current-file "$DIAGNOSTIC_DIR/post-functional-default-route.raw.log" \
-            --confirmation-file "$DIAGNOSTIC_DIR/confirmed-absent-default-route.raw.log" \
-            --restore-file "$DIAGNOSTIC_DIR/restore-default-route.raw.log" \
-            --verified-file "$DIAGNOSTIC_DIR/verified-default-route.raw.log" \
-            --service-pid "$service_pid" --service-identity-file "$SERVICE_IDENTITY_FILE" --timeout-seconds 10 || restore_status=$?
-          emit_private_evidence macos-service-death-probe "$DIAGNOSTIC_DIR/service-death-probe.raw.log"
-          emit_private_evidence macos-post-functional-default-route "$DIAGNOSTIC_DIR/post-functional-default-route.raw.log"
-          emit_private_evidence macos-confirmed-absent-default-route "$DIAGNOSTIC_DIR/confirmed-absent-default-route.raw.log"
-          emit_private_evidence macos-restore-default-route "$DIAGNOSTIC_DIR/restore-default-route.raw.log"
-          emit_private_evidence macos-verified-default-route "$DIAGNOSTIC_DIR/verified-default-route.raw.log"
-          if [ "$restore_status" -ne 0 ]; then
-            printf 'macos_default_route_restore=failed status=%s\n' "$restore_status" >&2
-            exit "$restore_status"
-          fi
-
       - name: Upload safe macOS failure evidence
         if: always()
+        timeout-minutes: 1
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: macos-failure-evidence-${{ env.LEASE_RUN_ID }}
@@ -1400,39 +1663,13 @@ jobs:
 
       - name: Upload safe macOS functional result
         if: always()
+        timeout-minutes: 1
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: functional-result-${{ env.LEASE_RUN_ID }}-macos
           path: ${{ env.RESULT_PATH }}
           if-no-files-found: warn
           retention-days: 1
-
-      - name: Publish opaque macOS completion marker
-        if: always()
-        shell: bash
-        env:
-          FUNCTIONAL_OUTCOME: ${{ steps.functional.outcome }}
-        run: |
-          set -euo pipefail
-          umask 077
-          mkdir -p "$HANDOFF_DIR/completion"
-          printf 'schema=1\nrun_id=%s\nplatform=macos\nfunctional_outcome=%s\n' "$LEASE_RUN_ID" "$FUNCTIONAL_OUTCOME" > "$HANDOFF_DIR/completion/completion.marker"
-
-      - name: Upload opaque macOS completion marker
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
-        with:
-          name: render-complete-${{ env.LEASE_RUN_ID }}-macos
-          path: ${{ env.HANDOFF_DIR }}/completion/completion.marker
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: Remove plaintext handoff material
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/upload-url.txt" "$HANDOFF_DIR/recipient.key"
 
   controller:
     name: Dispatch isolated macOS Render lease controller

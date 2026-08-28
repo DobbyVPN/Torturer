@@ -26,11 +26,11 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      actions: read
     env:
       SOURCE_REPOSITORY: ${{ inputs.source_repository }}
       SOURCE_SHA: ${{ inputs.commit_sha }}
       TORTURER_SHA: ${{ github.sha }}
-      WORKFLOW_RUN_STARTED_AT: ${{ github.run_started_at }}
 
     steps:
       - name: Validate exact public candidate identity
@@ -42,22 +42,58 @@ jobs:
           test "$SOURCE_SHA" != "0000000000000000000000000000000000000000"
           printf 'source_repository=%s\nsource_sha=%s\n' "$SOURCE_REPOSITORY" "$SOURCE_SHA"
 
-      - name: Establish build run-start deadline
+      - name: Check out exact trusted Torturer revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        timeout-minutes: 5
+        with:
+          repository: DobbyVPN/Torturer
+          ref: ${{ github.sha }}
+          path: torturer
+          persist-credentials: false
+
+      - name: Verify exact trusted Torturer helper checkout
         shell: bash
         run: |
           set -euo pipefail
-          python3 - "$WORKFLOW_RUN_STARTED_AT" <<'PY'
+          test "$(git -C torturer rev-parse HEAD)" = "$TORTURER_SHA"
+          git -C torturer status --porcelain=v1 --untracked-files=all
+          test -z "$(git -C torturer status --porcelain=v1 --untracked-files=all)"
+
+      - name: Establish build run-start deadline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          deadline_dir="$RUNNER_TEMP/android-build-deadline"
+          mkdir -p "$deadline_dir"
+          chmod 700 "$deadline_dir"
+          origin_run="$deadline_dir/origin-run.json"
+          "$GITHUB_WORKSPACE/torturer/.github/scripts/private-gh-api.sh" 30 origin-run "$origin_run" \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          python3 - "$origin_run" <<'PY'
           import datetime
+          import json
           import os
           import sys
           from pathlib import Path
 
-          started = datetime.datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if value.get("id") != int(os.environ["GITHUB_RUN_ID"]):
+              raise SystemExit("workflow run identity mismatch")
+          if not isinstance(value.get("run_started_at"), str):
+              raise SystemExit("workflow run start timestamp is missing")
+          started = datetime.datetime.fromisoformat(value["run_started_at"].replace("Z", "+00:00"))
           deadline = int(started.timestamp()) + 30 * 60
+          if int(datetime.datetime.now(datetime.timezone.utc).timestamp()) >= deadline:
+              raise SystemExit("workflow already exceeded its hard thirty-minute deadline")
           with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as output:
               output.write(f"RUN_DEADLINE_EPOCH={deadline}\nANDROID_CLEANUP_RESERVE_SECONDS=120\n")
-          print(f"run_deadline_epoch={deadline} cleanup_reserve_seconds=120")
+          print(f"workflow_started_epoch={int(started.timestamp())}\nrun_deadline_epoch={deadline} cleanup_reserve_seconds=120")
           PY
+          unset GH_TOKEN
+          test -z "${GH_TOKEN:-}"
           deadline_command="$RUNNER_TEMP/android-build-run-with-deadline.sh"
           cat > "$deadline_command" <<'SH'
           #!/usr/bin/env bash
@@ -135,23 +171,6 @@ jobs:
         run: |
           set -euo pipefail
           "$DEADLINE_COMMAND" --check 300
-
-      - name: Check out exact trusted Torturer revision
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        timeout-minutes: 5
-        with:
-          repository: DobbyVPN/Torturer
-          ref: ${{ github.sha }}
-          path: torturer
-          persist-credentials: false
-
-      - name: Verify exact trusted Torturer helper checkout
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git -C torturer rev-parse HEAD)" = "$TORTURER_SHA"
-          git -C torturer status --porcelain=v1 --untracked-files=all
-          test -z "$(git -C torturer status --porcelain=v1 --untracked-files=all)"
 
       - name: Check Android build JDK setup deadline budget
         shell: bash
@@ -293,10 +312,11 @@ jobs:
     needs: build
     name: Trusted functional Android
     runs-on: ubuntu-24.04
-    # The build job is capped at ten minutes.  Keep this client at twenty so
-    # build plus client execution cannot exceed the workflow's thirty-minute
-    # run-start deadline.
-    timeout-minutes: 20
+    # The build job is capped at ten minutes.  The client may use the full
+    # remaining job window, but every bounded command is governed by the
+    # workflow run-start deadline established below, so build plus client still
+    # cannot exceed thirty minutes in total.
+    timeout-minutes: 30
     permissions:
       contents: read
       actions: read
@@ -335,6 +355,7 @@ jobs:
           done
           printf 'HANDOFF_DIR=%s\nSERVICE_DIR=%s\nRESULT_PATH=%s\nLEASE_RUN_ID=unassigned\n' \
             "$handoff" "$service" "$handoff/functional-result.json" >> "$GITHUB_ENV"
+          printf 'POST_LANE_DEADLINE_EPOCH=unvalidated\nPOST_LANE_STEP_TIMEOUT_SECONDS=60\nPOST_LANE_MARKER_RESERVE_SECONDS=180\n' >> "$GITHUB_ENV"
 
       - name: Validate trusted functional inputs
         shell: bash
@@ -1081,11 +1102,16 @@ jobs:
               "source_sha": os.environ["SOURCE_SHA"],
               "state": "issued",
           }
-          expected_keys = set(expected) | {"services"}
+          expected_keys = set(expected) | {"services", "available_until_epoch"}
           if set(value) != expected_keys:
               raise SystemExit("Android safe lease record has an unsafe shape")
           for key, wanted in expected.items():
               if value.get(key) != wanted: raise SystemExit(f"lease field {key} is invalid")
+          available_until_epoch = value.get("available_until_epoch")
+          if (isinstance(available_until_epoch, bool)
+                  or not isinstance(available_until_epoch, int)
+                  or available_until_epoch <= 0):
+              raise SystemExit("lease availability deadline is invalid")
           services = value.get("services")
           if not isinstance(services, list) or len(services) != 2:
               raise SystemExit("Android lease service bundle is invalid")
@@ -1135,22 +1161,74 @@ jobs:
           print("upload_handoff=validated")
           PY
 
+      - name: Establish validated post-lane provider deadline
+        if: always()
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          lease_file="${LEASE_RESPONSE_DIR:-}/lease.json"
+          if [ -z "${LEASE_RESPONSE_DIR:-}" ] || [ ! -f "$lease_file" ]; then
+            printf '%s\n' 'post-lane provider deadline unavailable: no validated lease exists; server hard cleanup remains authoritative' >&2
+            exit 1
+          fi
+          available_until_epoch="$(python3 - "$lease_file" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          deadline = value.get("available_until_epoch")
+          if isinstance(deadline, bool) or not isinstance(deadline, int) or deadline <= 0:
+              raise SystemExit("lease availability deadline is invalid")
+          print(deadline)
+          PY
+          )"
+          printf 'POST_LANE_DEADLINE_EPOCH=%s\nPOST_LANE_STEP_TIMEOUT_SECONDS=60\nPOST_LANE_MARKER_RESERVE_SECONDS=180\n' \
+            "$((available_until_epoch - 5))" >> "$GITHUB_ENV"
+          printf 'validated_post_lane_provider_deadline=%s marker_reserve_seconds=180\n' "$available_until_epoch"
+
       - name: Run canonical Android functional scenarios
         id: functional
         shell: bash
         working-directory: torturer
         run: |
           set -euo pipefail
-          remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 120))
+          remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 300))
           # Eight applicable scenarios plus ten resets require 920 seconds;
           # keep a deliberate 60-second scheduling margin inside the 1,200s cap.
-          if [ "$remaining" -lt 980 ]; then printf 'insufficient Android canonical budget before cleanup reserve: seconds=%s required=980\n' "$remaining" >&2; exit 1; fi
           if [ "$remaining" -gt 1200 ]; then remaining=1200; fi
+          available_until_epoch="$(python3 - "$LEASE_RESPONSE_DIR/lease.json" <<'PY'
+          import json, sys
+          from pathlib import Path
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          print(value["available_until_epoch"])
+          PY
+          )"
+          case "$available_until_epoch" in
+            ''|*[!0-9]*) printf 'lease availability deadline is invalid\n' >&2; exit 1 ;;
+          esac
+          server_remaining=$((available_until_epoch - $(date +%s)))
+          # The common post-lane reserve covers emulator shutdown plus marker
+          # preparation/upload and a scheduling margin before provider cleanup.
+          client_post_lane_reserve_seconds=300
+          lane_start_margin_seconds=5
+          server_lane_remaining=$((server_remaining - client_post_lane_reserve_seconds - lane_start_margin_seconds))
+          if [ "$server_lane_remaining" -le 0 ]; then
+            printf 'insufficient Render lease lifetime before functional lane: seconds=%s reserve=%s margin=%s\n' \
+              "$server_remaining" "$client_post_lane_reserve_seconds" "$lane_start_margin_seconds" >&2
+            exit 1
+          fi
+          if [ "$remaining" -gt "$server_lane_remaining" ]; then remaining="$server_lane_remaining"; fi
+          if [ "$remaining" -lt 980 ]; then printf 'insufficient Android canonical budget before cleanup reserve: seconds=%s required=980\n' "$remaining" >&2; exit 1; fi
+          printf 'render_lease_lifetime_for_lane_seconds=%s required=%s reserve=%s margin=%s\n' \
+            "$server_remaining" "$remaining" "$client_post_lane_reserve_seconds" "$lane_start_margin_seconds"
           printf 'canonical_lane_timeout_seconds=%s\n' "$remaining"
           upload_url="$(cat "$HANDOFF_DIR/upload-url.txt")"
           test -n "$upload_url"
           python3 -m torturer_checks.hosted.deadline --timeout-seconds "$remaining" --kill-grace-seconds 30 \
             python3 -m torturer_checks.hosted.run --platform android \
+            --lane-timeout-seconds "$remaining" \
             --profile "$HANDOFF_DIR/profile.toml" --source-repository "$SOURCE_REPOSITORY" --source-sha "$SOURCE_SHA" \
             --platform-version "35" \
             --candidate-manifest "$GITHUB_WORKSPACE/candidate/manifest.json" --server-image-digest "$SERVER_IMAGE_DIGEST" --output "$RESULT_PATH" \
@@ -1159,207 +1237,10 @@ jobs:
             --expected-unavailable functional.network-transition=ANDROID_UPLINK_TOGGLE_UNSUPPORTED \
             --expected-unavailable functional.bounded-endurance=ANDROID_ENDURANCE_SEAM_UNSUPPORTED
 
-      - name: Report safe Android command diagnostics
+      - name: Stop Android emulator and verify cleanup
+        id: essential_cleanup
         if: always()
         timeout-minutes: 2
-        shell: bash
-        run: |
-          set -euo pipefail
-          umask 077
-          diagnostic="$HANDOFF_DIR/android-command-diagnostic.txt"
-          transport_summary="$HANDOFF_DIR/android-transport-summary.txt"
-          : > "$diagnostic"
-          # Keep derived parsing bounded while retaining every raw command
-          # stream in the owner-only handoff directory.  Reserve the complete
-          # downstream emulator cleanup tail before starting this child.
-          "$DEADLINE_COMMAND" --reserve 70 10 python3 - "$HANDOFF_DIR/hosted-command-raw" "$diagnostic" "$transport_summary" <<'PY'
-          from __future__ import annotations
-
-          import hashlib
-          import json
-          import re
-          import sys
-          from pathlib import Path
-
-          raw_dir = Path(sys.argv[1])
-          output = Path(sys.argv[2])
-          summary = Path(sys.argv[3])
-          files = sorted(raw_dir.glob("command-*.raw.log")) if raw_dir.is_dir() else []
-
-          def section(payload: bytes, name: str) -> bytes:
-              match = re.search(
-                  rb"(?ms)^" + name.encode("ascii") + rb"-begin\n(.*?)\n" +
-                  name.encode("ascii") + rb"-end\n",
-                  payload,
-              )
-              return match.group(1) if match else b""
-
-          def command_line(payload: bytes) -> str:
-              match = re.search(rb"^argv=(.*)$", payload, re.MULTILINE)
-              return match.group(1).decode("utf-8", errors="replace") if match else ""
-
-          def operation(argv: str) -> str:
-              lower = argv.lower()
-              if "run-as" in lower and "cat > files/" in lower:
-                  if ".profile" in lower:
-                      return "profile-stage"
-                  if ".command.json" in lower:
-                      return "command-stage"
-              if "run-as" in lower and "chmod" in lower:
-                  if ".profile" in lower:
-                      return "profile-chmod"
-                  if ".command.json" in lower:
-                      return "command-chmod"
-              if " am instrument " in f" {lower} ":
-                  return "instrumentation"
-              if " exec-out " in f" {lower} ":
-                  return "observation"
-              if " logcat " in f" {lower} ":
-                  return "logcat"
-              if " dumpsys " in f" {lower} ":
-                  return "dumpsys"
-              if " shell ps " in f" {lower} ":
-                  return "process-list"
-              if " shell pidof " in f" {lower} ":
-                  return "process-probe"
-              if " shell run-as " in f" {lower} " and " rm " in f" {lower} ":
-                  return "private-cleanup"
-              if " shell rm " in f" {lower} ":
-                  return "temporary-cleanup"
-              if " force-stop " in f" {lower} ":
-                  return "force-stop"
-              return "other"
-
-          def stderr_code(stderr: bytes) -> str:
-              lower = stderr.decode("utf-8", errors="replace").lower()
-              markers = (
-                  ("not debuggable", "NOT_DEBUGGABLE"),
-                  ("permission denied", "PERMISSION_DENIED"),
-                  ("access denied", "ACCESS_DENIED"),
-                  ("unknown package", "PACKAGE_UNKNOWN"),
-                  ("package not found", "PACKAGE_MISSING"),
-                  ("does not exist", "PATH_MISSING"),
-                  ("no such file", "PATH_MISSING"),
-                  ("cannot create", "CREATE_FAILED"),
-                  ("can't create", "CREATE_FAILED"),
-                  ("read-only file system", "READ_ONLY_FILESYSTEM"),
-                  ("closed", "CHANNEL_CLOSED"),
-                  ("broken pipe", "BROKEN_PIPE"),
-                  ("protocol fault", "PROTOCOL_FAULT"),
-              )
-              for marker, code in markers:
-                  if marker in lower:
-                      return code
-              return "NONEMPTY" if lower.strip() else "EMPTY"
-
-          def safe_stderr_display(stderr: bytes) -> str:
-              """Expose a bounded, secret-safe reason without replacing raw evidence."""
-              value = stderr.decode("utf-8", errors="replace").replace("\x00", " ")
-              value = re.sub(r"(?i)(?:[A-Za-z]:[\\/]|/)[^\r\n]*", "<path>", value)
-              value = re.sub(
-                  r"(?i)\b(?:token|key|secret|password|authorization)\b\s*[:=]\s*\S+",
-                  "<redacted>",
-                  value,
-              )
-              value = re.sub(r"(?i)\b[0-9a-f]{32,}\b", "<hex>", value)
-              value = " ".join(value.split())
-              return value[:240] if value else "<empty>"
-
-          def classify(argv: str, output: str, returncode: str, op: str) -> str:
-              lower = output.lower()
-              command_lower = argv.lower()
-              if "run-as" in command_lower and "not debuggable" in lower:
-                  return "RUN_AS_NOT_DEBUGGABLE"
-              if "run-as" in command_lower and any(
-                  marker in lower for marker in ("permission denied", "access denied", "denied")
-              ):
-                  return "RUN_AS_PERMISSION_DENIED"
-              if "run-as" in command_lower and any(
-                  marker in lower
-                  for marker in ("package not found", "unknown package", "does not exist")
-              ):
-                  return "RUN_AS_PACKAGE_MISSING"
-              if "run-as" in command_lower and "not found" in lower:
-                  return "RUN_AS_COMMAND_UNAVAILABLE"
-              if op in {"profile-stage", "command-stage"} and any(
-                  marker in lower for marker in ("broken pipe", "stdin", "standard input")
-              ):
-                  return "ADB_STDIN_FAILED"
-              if any(
-                  marker in lower
-                  for marker in ("device offline", "no devices", "device not found", "device unauthorized")
-              ):
-                  return "ADB_DEVICE_UNAVAILABLE"
-              if returncode == "0":
-                  return "OK"
-              if returncode != "unknown":
-                  return "COMMAND_FAILED"
-              return "RAW_FORMAT_INVALID"
-
-          output.write_text("schema=1\n", encoding="ascii")
-          records = []
-          with output.open("a", encoding="ascii") as stream:
-              for sequence, path in enumerate(files, start=1):
-                  payload = path.read_bytes()
-                  match = re.search(rb"^returncode=([^\n]*)$", payload, re.MULTILINE)
-                  returncode = match.group(1).decode("ascii", errors="replace") if match else "unknown"
-                  argv = command_line(payload)
-                  stdout = section(payload, "stdout")
-                  stderr = section(payload, "stderr")
-                  output = stdout + b"\n" + stderr
-                  op = operation(argv)
-                  code = classify(argv, output.decode("utf-8", errors="replace"), returncode, op)
-                  stderr_digest = hashlib.sha256(stderr).hexdigest()
-                  records.append((sequence, op, code, returncode, len(stdout)))
-                  stream.write(
-                      f"android_command_diagnostic sequence={sequence} operation={op} "
-                      f"code={code} returncode={returncode} stdout_bytes={len(stdout)} "
-                      f"stderr_bytes={len(stderr)} stderr_code={stderr_code(stderr)} "
-                      f"stderr_sha256={stderr_digest} "
-                      f"stderr_display={json.dumps(safe_stderr_display(stderr), ensure_ascii=True)} "
-                      f"raw_bytes={len(payload)}\n"
-                  )
-          logcat_records = [record for record in records if record[1] == "logcat"]
-          offline_records = [record for record in records if record[2] == "ADB_DEVICE_UNAVAILABLE"]
-          failed_logcat_records = [record for record in logcat_records if record[3] != "0"]
-          if offline_records:
-              transport_state = "ADB_DEVICE_OFFLINE"
-          elif failed_logcat_records:
-              transport_state = "ADB_LOGCAT_COMMAND_FAILED"
-          else:
-              transport_state = "ADB_TRANSPORT_NOT_FAILED"
-          summary.write_text(
-              "schema=1\n"
-              f"transport_state={transport_state}\n"
-              f"command_count={len(records)}\n"
-              f"logcat_command_count={len(logcat_records)}\n"
-              f"logcat_nonzero_count={len(failed_logcat_records)}\n"
-              f"logcat_stdout_bytes={sum(record[4] for record in logcat_records)}\n"
-              f"adb_device_unavailable_count={len(offline_records)}\n"
-              f"first_logcat_failure_sequence={failed_logcat_records[0][0] if failed_logcat_records else 'none'}\n"
-              f"first_device_unavailable_sequence={offline_records[0][0] if offline_records else 'none'}\n",
-              encoding="ascii",
-          )
-          PY
-          chmod 600 "$diagnostic"
-          chmod 600 "$transport_summary"
-          cat "$diagnostic"
-          cat "$transport_summary"
-
-      - name: Upload safe Android command diagnostics
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
-        timeout-minutes: 1
-        with:
-          name: android-command-diagnostic-${{ env.LEASE_RUN_ID }}
-          path: |
-            ${{ env.HANDOFF_DIR }}/android-command-diagnostic.txt
-            ${{ env.HANDOFF_DIR }}/android-transport-summary.txt
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: Stop Android emulator and verify cleanup
-        if: always()
         shell: bash
         run: |
           set -euo pipefail
@@ -1378,7 +1259,7 @@ jobs:
             fi
           }
           adb="${ADB_PATH:-${ANDROID_SDK_ROOT:-}/platform-tools/adb}"
-          # Keep the complete cleanup phase inside the client’s 120-second
+          # Keep the complete cleanup phase inside the client’s 300-second
           # finalization reserve.  Seven adb operations are each capped at
           # 4s plus a 1s kill grace; host process-group proof is capped at
           # 15s TERM observation + 5s TERM grace + 5s KILL grace, and the
@@ -1744,13 +1625,237 @@ jobs:
           cat "$emulator_summary"
           if [ "$emulator_cleanup_failure" = true ]; then exit 1; fi
 
-      - name: Remove plaintext handoff material
+      - name: Remove plaintext handoff material and prepare completion marker
+        if: always()
+        timeout-minutes: 1
+        id: post_lane_marker_prepare
+        shell: bash
+        env:
+          FUNCTIONAL_OUTCOME: ${{ steps.functional.outcome }}
+        run: |
+          set -euo pipefail
+          # Plaintext handoff material is removed even when timing metadata is
+          # unavailable; marker publication itself still fails closed.
+          if [ -n "${HANDOFF_DIR:-}" ]; then
+            rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/upload-url.txt" "$HANDOFF_DIR/recipient.key"
+          else
+            printf '%s\n' 'post-lane plaintext removal skipped: handoff directory was never initialized' >&2
+          fi
+          run_deadline="${RUN_DEADLINE_EPOCH:-}"
+          provider_deadline="${POST_LANE_DEADLINE_EPOCH:-}"
+          post_lane_marker_reserve="${POST_LANE_MARKER_RESERVE_SECONDS:-}"
+          if [ -z "${HANDOFF_DIR:-}" ] || ! [[ "$run_deadline" =~ ^[0-9]+$ ]] || ! [[ "$provider_deadline" =~ ^[0-9]+$ ]] || ! [[ "$post_lane_marker_reserve" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' 'post-lane marker preparation skipped: functional lane did not establish valid origin/provider deadlines' >&2
+            exit 1
+          fi
+          if [ "$run_deadline" -le "$provider_deadline" ]; then
+            post_deadline="$run_deadline"
+          else
+            post_deadline="$provider_deadline"
+          fi
+          post_remaining=$((post_deadline - $(date +%s)))
+          if [ "$post_remaining" -lt "$post_lane_marker_reserve" ]; then
+            printf 'post-lane marker preparation cannot fit before origin/provider deadline: remaining=%s required=%s\n' \
+              "$post_remaining" "$post_lane_marker_reserve" >&2
+            exit 1
+          fi
+          mkdir -p "$HANDOFF_DIR/completion"
+          printf 'schema=1\nrun_id=%s\nplatform=android\nfunctional_outcome=%s\n' "$LEASE_RUN_ID" "$FUNCTIONAL_OUTCOME" > "$HANDOFF_DIR/completion/completion.marker"
+
+      - name: Upload opaque Android completion marker
+        if: always() && steps.essential_cleanup.outcome == 'success' && steps.post_lane_marker_prepare.outcome == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        timeout-minutes: 1
+        with:
+          name: render-complete-${{ env.LEASE_RUN_ID }}-android
+          path: ${{ env.HANDOFF_DIR }}/completion/completion.marker
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Report safe Android command diagnostics
         if: always()
         timeout-minutes: 1
         shell: bash
         run: |
           set -euo pipefail
-          rm -f "$HANDOFF_DIR/profile.toml" "$HANDOFF_DIR/upload-url.txt" "$HANDOFF_DIR/recipient.key"
+          umask 077
+          diagnostic="$HANDOFF_DIR/android-command-diagnostic.txt"
+          transport_summary="$HANDOFF_DIR/android-transport-summary.txt"
+          : > "$diagnostic"
+          # Keep derived parsing bounded while retaining every raw command
+          # stream in the owner-only handoff directory.  This derived evidence
+          # intentionally runs after the provider-release marker and therefore
+          # cannot delay provider cleanup.
+          "$DEADLINE_COMMAND" --reserve 70 10 python3 - "$HANDOFF_DIR/hosted-command-raw" "$diagnostic" "$transport_summary" <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import re
+          import sys
+          from pathlib import Path
+
+          raw_dir = Path(sys.argv[1])
+          output = Path(sys.argv[2])
+          summary = Path(sys.argv[3])
+          files = sorted(raw_dir.glob("command-*.raw.log")) if raw_dir.is_dir() else []
+
+          def section(payload: bytes, name: str) -> bytes:
+              match = re.search(
+                  rb"(?ms)^" + name.encode("ascii") + rb"-begin\n(.*?)\n" +
+                  name.encode("ascii") + rb"-end\n",
+                  payload,
+              )
+              return match.group(1) if match else b""
+
+          def command_line(payload: bytes) -> str:
+              match = re.search(rb"^argv=(.*)$", payload, re.MULTILINE)
+              return match.group(1).decode("utf-8", errors="replace") if match else ""
+
+          def operation(argv: str) -> str:
+              lower = argv.lower()
+              if "run-as" in lower and "cat > files/" in lower:
+                  if ".profile" in lower:
+                      return "profile-stage"
+                  if ".command.json" in lower:
+                      return "command-stage"
+              if "run-as" in lower and "chmod" in lower:
+                  if ".profile" in lower:
+                      return "profile-chmod"
+                  if ".command.json" in lower:
+                      return "command-chmod"
+              if " am instrument " in f" {lower} ":
+                  return "instrumentation"
+              if " exec-out " in f" {lower} ":
+                  return "observation"
+              if " logcat " in f" {lower} ":
+                  return "logcat"
+              if " dumpsys " in f" {lower} ":
+                  return "dumpsys"
+              if " shell ps " in f" {lower} ":
+                  return "process-list"
+              if " shell pidof " in f" {lower} ":
+                  return "process-probe"
+              if " shell run-as " in f" {lower} " and " rm " in f" {lower} ":
+                  return "private-cleanup"
+              if " shell rm " in f" {lower} ":
+                  return "temporary-cleanup"
+              if " force-stop " in f" {lower} ":
+                  return "force-stop"
+              return "other"
+
+          def stderr_code(stderr: bytes) -> str:
+              lower = stderr.decode("utf-8", errors="replace").lower()
+              markers = (
+                  ("not debuggable", "NOT_DEBUGGABLE"),
+                  ("permission denied", "PERMISSION_DENIED"),
+                  ("access denied", "ACCESS_DENIED"),
+                  ("unknown package", "PACKAGE_UNKNOWN"),
+                  ("package not found", "PACKAGE_MISSING"),
+                  ("does not exist", "PATH_MISSING"),
+                  ("no such file", "PATH_MISSING"),
+                  ("cannot create", "CREATE_FAILED"),
+                  ("can't create", "CREATE_FAILED"),
+                  ("read-only file system", "READ_ONLY_FILESYSTEM"),
+                  ("closed", "CHANNEL_CLOSED"),
+                  ("broken pipe", "BROKEN_PIPE"),
+                  ("protocol fault", "PROTOCOL_FAULT"),
+              )
+              for marker, code in markers:
+                  if marker in lower:
+                      return code
+              return "NONEMPTY" if lower.strip() else "EMPTY"
+
+          def classify(argv: str, output: str, returncode: str, op: str) -> str:
+              lower = output.lower()
+              command_lower = argv.lower()
+              if "run-as" in command_lower and "not debuggable" in lower:
+                  return "RUN_AS_NOT_DEBUGGABLE"
+              if "run-as" in command_lower and any(
+                  marker in lower for marker in ("permission denied", "access denied", "denied")
+              ):
+                  return "RUN_AS_PERMISSION_DENIED"
+              if "run-as" in command_lower and any(
+                  marker in lower
+                  for marker in ("package not found", "unknown package", "does not exist")
+              ):
+                  return "RUN_AS_PACKAGE_MISSING"
+              if "run-as" in command_lower and "not found" in lower:
+                  return "RUN_AS_COMMAND_UNAVAILABLE"
+              if op in {"profile-stage", "command-stage"} and any(
+                  marker in lower for marker in ("broken pipe", "stdin", "standard input")
+              ):
+                  return "ADB_STDIN_FAILED"
+              if any(
+                  marker in lower
+                  for marker in ("device offline", "no devices", "device not found", "device unauthorized")
+              ):
+                  return "ADB_DEVICE_UNAVAILABLE"
+              if returncode == "0":
+                  return "OK"
+              if returncode != "unknown":
+                  return "COMMAND_FAILED"
+              return "RAW_FORMAT_INVALID"
+
+          output.write_text("schema=1\n", encoding="ascii")
+          records = []
+          with output.open("a", encoding="ascii") as stream:
+              for sequence, path in enumerate(files, start=1):
+                  payload = path.read_bytes()
+                  match = re.search(rb"^returncode=([^\n]*)$", payload, re.MULTILINE)
+                  returncode = match.group(1).decode("ascii", errors="replace") if match else "unknown"
+                  argv = command_line(payload)
+                  stdout = section(payload, "stdout")
+                  stderr = section(payload, "stderr")
+                  output = stdout + b"\n" + stderr
+                  op = operation(argv)
+                  code = classify(argv, output.decode("utf-8", errors="replace"), returncode, op)
+                  stderr_digest = hashlib.sha256(stderr).hexdigest()
+                  records.append((sequence, op, code, returncode, len(stdout)))
+                  stream.write(
+                      f"android_command_diagnostic sequence={sequence} operation={op} "
+                      f"code={code} returncode={returncode} stdout_bytes={len(stdout)} "
+                      f"stderr_bytes={len(stderr)} stderr_code={stderr_code(stderr)} "
+                      f"stderr_sha256={stderr_digest} "
+                      f"raw_bytes={len(payload)}\n"
+                  )
+          logcat_records = [record for record in records if record[1] == "logcat"]
+          offline_records = [record for record in records if record[2] == "ADB_DEVICE_UNAVAILABLE"]
+          failed_logcat_records = [record for record in logcat_records if record[3] != "0"]
+          if offline_records:
+              transport_state = "ADB_DEVICE_OFFLINE"
+          elif failed_logcat_records:
+              transport_state = "ADB_LOGCAT_COMMAND_FAILED"
+          else:
+              transport_state = "ADB_TRANSPORT_NOT_FAILED"
+          summary.write_text(
+              "schema=1\n"
+              f"transport_state={transport_state}\n"
+              f"command_count={len(records)}\n"
+              f"logcat_command_count={len(logcat_records)}\n"
+              f"logcat_nonzero_count={len(failed_logcat_records)}\n"
+              f"logcat_stdout_bytes={sum(record[4] for record in logcat_records)}\n"
+              f"adb_device_unavailable_count={len(offline_records)}\n"
+              f"first_logcat_failure_sequence={failed_logcat_records[0][0] if failed_logcat_records else 'none'}\n"
+              f"first_device_unavailable_sequence={offline_records[0][0] if offline_records else 'none'}\n",
+              encoding="ascii",
+          )
+          PY
+          chmod 600 "$diagnostic"
+          chmod 600 "$transport_summary"
+          cat "$diagnostic"
+          cat "$transport_summary"
+
+      - name: Upload safe Android command diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        timeout-minutes: 1
+        with:
+          name: android-command-diagnostic-${{ env.LEASE_RUN_ID }}
+          path: |
+            ${{ env.HANDOFF_DIR }}/android-command-diagnostic.txt
+            ${{ env.HANDOFF_DIR }}/android-transport-summary.txt
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Upload safe Android emulator and transport summary
         if: always()
@@ -1772,26 +1877,6 @@ jobs:
           name: functional-result-${{ env.LEASE_RUN_ID }}-android
           path: ${{ env.RESULT_PATH }}
           if-no-files-found: warn
-          retention-days: 1
-
-      - name: Publish opaque Android completion marker
-        if: always()
-        shell: bash
-        env:
-          FUNCTIONAL_OUTCOME: ${{ steps.functional.outcome }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$HANDOFF_DIR/completion"
-          printf 'schema=1\nrun_id=%s\nplatform=android\nfunctional_outcome=%s\n' "$LEASE_RUN_ID" "$FUNCTIONAL_OUTCOME" > "$HANDOFF_DIR/completion/completion.marker"
-
-      - name: Upload opaque Android completion marker
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
-        timeout-minutes: 1
-        with:
-          name: render-complete-${{ env.LEASE_RUN_ID }}-android
-          path: ${{ env.HANDOFF_DIR }}/completion/completion.marker
-          if-no-files-found: error
           retention-days: 1
 
   controller:

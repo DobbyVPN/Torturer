@@ -36,6 +36,7 @@ class FunctionalWindowsWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("unset GH_TOKEN", self.text)
         self.assertIn("hosted.deadline", self.text)
         self.assertIn("--kill-grace-seconds 30", self.text)
+        self.assertIn('--lane-timeout-seconds "$remaining"', self.text)
         self.assertIn("for attempt in $(seq 1 360); do", self.text)
         self.assertIn("if int(datetime.datetime.now(datetime.timezone.utc).timestamp()) >= deadline:", self.text)
         self.assertIn("timeout-minutes: 30", self.text)
@@ -110,6 +111,7 @@ class FunctionalWindowsWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("hosted.deadline", functional)
         self.assertIn("--platform windows", functional)
         self.assertIn("--service-socket", functional)
+        self.assertIn('--service-identity-file "$SERVICE_IDENTITY_FILE"', functional)
         self.assertIn("--candidate-manifest \"$GITHUB_WORKSPACE/candidate/manifest.json\"", functional)
         self.assertNotRegex(functional, r"--artifact(?:\s|=)")
         self.assertNotIn("--download-url", functional)
@@ -249,6 +251,29 @@ class FunctionalWindowsWorkflowPolicyTest(unittest.TestCase):
         self.assertIn('discovery_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 60 - 1))', client)
         self.assertIn('timeout --foreground --signal=TERM --kill-after=1s "${kill_timeout}s"', client)
 
+    def test_cleanup_keeps_authoritative_identity_when_pid_file_is_stale(self) -> None:
+        client = self.text[self.text.index("  client:"):self.text.index("\n\n  controller:")]
+        for begin, end in (
+            (
+                "- name: Stop Windows preflight candidate before Render handoff",
+                "- name: Upload public certificate and opaque request",
+            ),
+            (
+                "- name: Stop exact Windows service and verify cleanup",
+                "- name: Remove plaintext handoff material and prepare completion marker",
+            ),
+        ):
+            cleanup = client[client.index(begin):client.index(end)]
+            self.assertIn("native identity sidecar", cleanup)
+            self.assertNotIn("recorded_pid", cleanup)
+            self.assertIn(
+                'if ! [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\\|[1-9][0-9]+$ ]] && [ -n "$service_binary" ]; then',
+                cleanup,
+            )
+            self.assertIn("service_state=path-mismatch", cleanup)
+            self.assertIn("actual=[System.IO.Path]::GetFullPath", cleanup)
+            self.assertIn("CreationDate.ToUniversalTime().Ticks", cleanup)
+
     def test_render_handoff_is_opaque_and_bound_to_windows_origin(self) -> None:
         self.assertIn("render-request-${lease_run_id}-${PLATFORM}", self.text)
         self.assertIn("render-lease-${LEASE_RUN_ID}-${PLATFORM}", self.text)
@@ -263,13 +288,19 @@ class FunctionalWindowsWorkflowPolicyTest(unittest.TestCase):
     def test_cleanup_and_completion_are_unconditional(self) -> None:
         stop = self.text.index("- name: Stop exact Windows service")
         result = self.text.index("- name: Upload safe Windows functional result")
-        marker = self.text.index("- name: Publish opaque Windows completion marker")
-        remove = self.text.index("- name: Remove plaintext handoff material")
+        marker = self.text.index("id: post_lane_marker_prepare")
+        remove = self.text.index("- name: Remove plaintext handoff material and prepare completion marker")
+        self.assertLess(remove, marker)
+        marker_upload = self.text.index("- name: Upload opaque Windows completion marker")
+        self.assertLess(marker, marker_upload)
+        self.assertLess(stop, remove)
+        self.assertLess(marker_upload, result)
+        self.assertLess(stop, result)
+        self.assertIn("if: always()", self.text[remove:marker_upload])
         self.assertIn("if: always()", self.text[stop:result])
-        self.assertIn("if: always()", self.text[result:marker])
-        self.assertIn("if: always()", self.text[marker:remove])
+        self.assertIn("if: always()", self.text[result:])
         self.assertIn("taskkill.exe /PID", self.text[stop:result])
-        uploads = self.text[result:marker]
+        uploads = self.text[result:remove]
         self.assertNotIn("profile.cms", uploads)
         self.assertNotIn("upload.cms", uploads)
         self.assertNotIn("upload-url.txt", uploads)

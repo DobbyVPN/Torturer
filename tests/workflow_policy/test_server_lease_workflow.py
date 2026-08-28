@@ -27,8 +27,8 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         self.assertRegex(self.text, r"(?m)^    timeout-minutes: 30$")
         self.assertNotRegex(self.text, r"(?m)^\s+timeout-minutes:\s*(?:3[1-9]|[4-9][0-9]|[1-9][0-9]{2,})$")
         self.assertIn("LEASE_DEADLINE_EPOCH", self.text)
-        self.assertIn("reserve = 680", self.text)
-        self.assertIn("cleanup_command_seconds = 600", self.text)
+        self.assertIn("reserve = 240", self.text)
+        self.assertIn("cleanup_command_seconds = 150", self.text)
         self.assertIn("cleanup_kill_grace_seconds = 1", self.text)
         self.assertIn("plaintext_cleanup_seconds = 4", self.text)
         self.assertIn("plaintext_kill_grace_seconds = 1", self.text)
@@ -219,8 +219,9 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         boundary = self.text.index("- name: Validate trusted lease boundary", establish)
         deadline_setup = self.text[establish:boundary]
         self.assertIn("deadline = int(started.timestamp()) + 30 * 60", deadline_setup)
-        self.assertIn("reserve = 680", deadline_setup)
-        self.assertIn("render_api_timeout_seconds = 20", deadline_setup)
+        self.assertIn("reserve = 240", deadline_setup)
+        self.assertIn("available_until = deadline - reserve", deadline_setup)
+        self.assertIn("render_api_timeout_seconds = 5", deadline_setup)
         self.assertIn("render_api_retry_attempts = 2", deadline_setup)
         self.assertIn("render_api_backoff_seconds = 0.5 + 1.0", deadline_setup)
         self.assertIn("cleanup_provider_api_calls = 8", deadline_setup)
@@ -228,6 +229,12 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("LEASE_CLEANUP_PROVIDER_WORST_CASE_SECONDS", deadline_setup)
         self.assertIn("if sum(finalization_components) > reserve", deadline_setup)
         self.assertIn("LEASE_DEADLINE_EPOCH={deadline}", deadline_setup)
+        self.assertIn("LEASE_AVAILABLE_UNTIL_EPOCH={available_until}", deadline_setup)
+        self.assertIn('--available-until-epoch "$LEASE_AVAILABLE_UNTIL_EPOCH"', self.text)
+        self.assertIn("--api-timeout-seconds 5", self.text)
+        self.assertIn("--api-retry-attempts 2", self.text)
+        self.assertIn("--api-retry-backoff-seconds 0.5", self.text)
+        self.assertIn('"available_until_epoch": int(os.environ["LEASE_AVAILABLE_UNTIL_EPOCH"])', self.text)
 
         encrypt = self.text.index("- name: Encrypt and publish the profile and upload handoffs")
         upload = self.text.index("- name: Upload encrypted profile and safe lease record", encrypt)
@@ -257,11 +264,12 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         self.assertIn("torturer_provider.lease_cli cleanup", cleanup_step)
         self.assertIn("Mark the issued lease as actively testing", self.text)
         self.assertIn("torturer_provider.lease_cli begin-testing", self.text)
-        self.assertIn('if [ -f "$LEASE_DIR/journal.json" ]', cleanup_step)
-        self.assertIn('--journal "$LEASE_DIR/journal.json"', cleanup_step)
-        self.assertIn('--request "$LEASE_DIR/request/unpacked/request.json"', cleanup_step)
+        self.assertIn('lease_dir="${LEASE_DIR:-}"', cleanup_step)
+        self.assertIn('if [ -f "$lease_dir/journal.json" ]', cleanup_step)
+        self.assertIn('--journal "$lease_dir/journal.json"', cleanup_step)
+        self.assertIn('--request "$lease_dir/request/unpacked/request.json"', cleanup_step)
         self.assertIn('--owner-id "$RENDER_OWNER_ID"', cleanup_step)
-        self.assertIn('cleanup_args+=(--lease "$LEASE_DIR/lease.json")', cleanup_step)
+        self.assertIn('cleanup_args+=(--lease "$lease_dir/lease.json")', cleanup_step)
         self.assertIn("if api.exists(service_id)", (ROOT / "torturer_provider" / "lease_cli.py").read_text(encoding="utf-8"))
         self.assertIn("for attempt in $(seq 1 180)", self.text)
         self.assertIn("completion marker wait reached the cleanup reserve", self.text)
@@ -270,6 +278,14 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
         self.assertIn('cleanup_command_limit="$LEASE_CLEANUP_COMMAND_SECONDS"', self.text)
         self.assertIn('"$LEASE_PLAINTEXT_CLEANUP_SECONDS"', self.text)
         self.assertIn('timeout --foreground --signal=TERM --kill-after="${LEASE_PLAINTEXT_KILL_GRACE_SECONDS}s" "${command_timeout}s"', self.text)
+        plaintext = self.text.index("- name: Remove plaintext lease material")
+        journal_after_plaintext = self.text.index("- name: Upload safe lease journal", plaintext)
+        plaintext_step = self.text[plaintext:journal_after_plaintext]
+        self.assertIn('deadline="${LEASE_DEADLINE_EPOCH:-}"', plaintext_step)
+        self.assertIn('fallback_timeout_seconds=4', plaintext_step)
+        self.assertIn('plaintext cleanup deadline unavailable; using bounded fallback', plaintext_step)
+        self.assertIn('kill-after=1s', plaintext_step)
+        self.assertIn('fallback_status=$?', plaintext_step)
         self.assertIn("completion marker deadline expired", self.text)
 
     def test_finalization_sub_budgets_fit_inside_the_reserve(self) -> None:
@@ -287,7 +303,7 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
             for name in names
         }
         self.assertEqual(values, {
-            "cleanup_command_seconds": 600,
+            "cleanup_command_seconds": 150,
             "cleanup_kill_grace_seconds": 1,
             "plaintext_cleanup_seconds": 4,
             "plaintext_kill_grace_seconds": 1,
@@ -295,8 +311,10 @@ class ServerLeaseWorkflowPolicyTest(unittest.TestCase):
             "finalization_overhead_seconds": 10,
         })
         self.assertLessEqual(sum(values.values()), reserve)
-        self.assertEqual(sum(values.values()), 676)
-        self.assertEqual(reserve, 680)
+        self.assertEqual(sum(values.values()), 226)
+        self.assertEqual(reserve, 240)
+        self.assertGreater(30 * 60 - reserve, 1200)
+        self.assertIn("completion marker wait reached the cleanup reserve", self.text)
         self.assertRegex(
             self.text,
             r"(?ms)- name: Upload safe lease journal.*?timeout-minutes: 1",

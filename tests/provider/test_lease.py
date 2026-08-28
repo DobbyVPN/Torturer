@@ -83,6 +83,7 @@ class FakeLeaseAPI:
 class FakeBundleAPI:
     def __init__(self, *, retain_sink: bool = False) -> None:
         self.retain_sink = retain_sink
+        self.fail_listing = False
         self.created: list[RenderServiceSpec] = []
         self.active: set[str] = set()
         self.delete_calls: list[str] = []
@@ -112,6 +113,8 @@ class FakeBundleAPI:
         return service_id in self.active
 
     def list_services(self, owner_id: str) -> tuple[RenderServiceRecord, ...]:
+        if self.fail_listing:
+            raise RenderAPIError("TRANSPORT_ERROR")
         now = datetime.fromtimestamp(time.time() - 3600, timezone.utc).isoformat().replace("+00:00", "Z")
         return tuple(
             RenderServiceRecord(
@@ -123,6 +126,36 @@ class FakeBundleAPI:
             )
             for service_id in sorted(self.active)
         )
+
+
+def make_bundle(api: FakeBundleAPI, directory: str | Path) -> RenderLeaseBundle:
+    journal = RenderLeaseJournal(Path(directory) / "journal.json", schema=2)
+    sink_digest = "sha256:" + "b" * 64
+    outline_descriptor = RenderLeaseDescriptor(
+        RUN_ID, "linux", f"dobby-torturer-{RUN_ID}-linux", IMAGE_DIGEST
+    )
+    sink_descriptor = RenderLeaseDescriptor(
+        RUN_ID, "linux", f"dobby-torturer-{RUN_ID}-upload-sink", sink_digest, "upload-sink"
+    )
+    outline = RenderLease(
+        api,
+        RenderServiceSpec(
+            "tea-test123", outline_descriptor.service_name, "tea-test123",
+            "ghcr.io/dobbyvpn/outline@" + IMAGE_DIGEST, IMAGE_DIGEST,
+        ),
+        outline_descriptor,
+        journal,
+    )
+    sink = RenderLease(
+        api,
+        RenderServiceSpec(
+            "tea-test123", sink_descriptor.service_name, "tea-test123",
+            "ghcr.io/dobbyvpn/sink@" + sink_digest, sink_digest,
+        ),
+        sink_descriptor,
+        journal,
+    )
+    return RenderLeaseBundle(outline, sink)
 
 
 def make_lease(api: FakeLeaseAPI, temporary: tempfile.TemporaryDirectory) -> RenderLease:
@@ -242,6 +275,41 @@ class RenderLeaseTests(unittest.TestCase):
                 self.assertEqual(api.delete_calls, ["srv-orphan123"])
                 self.assertIs(lease.state, LeaseState.ABSENT)
                 self.assertEqual(lease.journal.records()[-1].cleanup_result, "verified-namespace")
+            finally:
+                holder.cleanup()
+
+    def test_lost_create_response_fails_closed_on_an_ambiguous_namespace(self) -> None:
+        api = FakeLeaseAPI(fail_create=True)
+        old = datetime.fromtimestamp(time.time() - 5, timezone.utc).isoformat().replace("+00:00", "Z")
+        prefix = f"dobby-torturer-{RUN_ID}-"
+        api.records = (
+            RenderServiceRecord(
+                "srv-orphan123",
+                prefix + "linux",
+                "tea-test123",
+                "web_service",
+                old,
+            ),
+            RenderServiceRecord(
+                "srv-stale123",
+                prefix + "android",
+                "tea-test123",
+                "web_service",
+                old,
+            ),
+        )
+        with tempfile.TemporaryDirectory(prefix="render-lease-ambiguous-lost-response-test.") as directory:
+            holder = tempfile.TemporaryDirectory(dir=directory)
+            try:
+                lease = make_lease(api, holder)
+                with self.assertRaises(LeaseCleanupError):
+                    lease.acquire(timeout_seconds=5, poll_seconds=1)
+                self.assertIs(lease.state, LeaseState.DELETING)
+                self.assertEqual(api.delete_calls, [])
+                self.assertEqual(
+                    lease.journal.records()[-1].cleanup_result,
+                    "unverified-no-service-id",
+                )
             finally:
                 holder.cleanup()
 
@@ -422,6 +490,30 @@ class RenderLeaseTests(unittest.TestCase):
             )
             document = json.dumps([record.to_json_object(include_role=True) for record in records])
             self.assertNotIn("onrender.com", document)
+
+    def test_linux_bundle_fails_closed_on_an_extra_same_namespace_service(self) -> None:
+        api = FakeBundleAPI()
+        with tempfile.TemporaryDirectory(prefix="render-lease-bundle-extra-service-test.") as directory:
+            bundle = make_bundle(api, directory)
+            bundle.acquire(timeout_seconds=5, poll_seconds=1)
+            api.active.add("srv-extra123")
+            with self.assertRaises(LeaseCleanupError):
+                bundle.cleanup()
+            self.assertEqual(api.delete_calls, ["srv-sink123", "srv-outline123"])
+            self.assertEqual(api.active, {"srv-extra123"})
+
+    def test_linux_bundle_fails_closed_when_namespace_probe_fails(self) -> None:
+        api = FakeBundleAPI()
+        with tempfile.TemporaryDirectory(prefix="render-lease-bundle-probe-failure-test.") as directory:
+            bundle = make_bundle(api, directory)
+            bundle.acquire(timeout_seconds=5, poll_seconds=1)
+            api.fail_listing = True
+            with self.assertRaises(LeaseCleanupError):
+                bundle.cleanup()
+            self.assertEqual(api.delete_calls, ["srv-sink123", "srv-outline123"])
+            self.assertEqual(api.active, set())
+            api.fail_listing = False
+            bundle.cleanup()
 
     def test_schema2_bundle_accepts_all_hosted_platforms(self) -> None:
         for platform in ("linux", "windows", "macos", "android"):
