@@ -38,7 +38,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Callable, Sequence
+from typing import BinaryIO, Callable, Sequence
 
 from torturer_checks.public_output import emit_evidence
 
@@ -1065,6 +1065,26 @@ def _emit_and_retain_service_log(path: Path, evidence_directory: Path | None) ->
     emit_evidence("linux-service", status="retained", payloads={"service": payload})
 
 
+def _open_owner_only_service_log(path: Path) -> BinaryIO:
+    """Create the service log exclusively and enforce its owner-only mode.
+
+    The returned object is a binary ``FileIO`` stream, so permission changes
+    must target the path (or its integer file descriptor), not the stream
+    object itself.  Keeping this operation in one helper makes the security
+    boundary testable without launching the full desktop build.
+    """
+
+    service_log = path.open("xb", buffering=0)
+    try:
+        # Bind the mode change to the exclusively opened descriptor. A path
+        # chmod would introduce a replacement window between open and chmod.
+        os.fchmod(service_log.fileno(), 0o600)
+    except BaseException:
+        service_log.close()
+        raise
+    return service_log
+
+
 def run_slice(
     candidate: Path,
     *,
@@ -1131,8 +1151,7 @@ def run_slice(
         fixture.chmod(0o600)
         environment = service_environment(service.parent, socket_path)
         service_log_path = runtime / "service.combined.log"
-        with service_log_path.open("xb", buffering=0) as service_log:
-            service_log.chmod(0o600)
+        with _open_owner_only_service_log(service_log_path) as service_log:
             process = subprocess.Popen(
                 [str(service)],
                 cwd=root,
