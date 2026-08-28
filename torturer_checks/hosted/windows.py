@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 from pathlib import Path
 import re
@@ -506,14 +507,43 @@ class WindowsServiceProcessController(HostedServiceProcessController):
 
     @staticmethod
     def _powershell(script: str, *arguments: str) -> tuple[str, ...]:
+        """Invoke a fixed script with an exact, injection-safe argument array.
+
+        ``powershell.exe -Command <script> <arg>`` is not an argument-array
+        interface on the Windows PowerShell versions used by hosted runners:
+        trailing tokens can be parsed as additional command text instead of
+        becoming the script block's ``$args``.  Keep the command line to one
+        fixed wrapper and carry the script and each caller-supplied value as
+        base64 data.  Base64's alphabet contains no PowerShell syntax, so
+        paths, quotes, pipes, newlines, and other argument content cannot
+        alter the wrapper or the fixed script.
+        """
+        if not isinstance(script, str) or any(
+            not isinstance(argument, str) for argument in arguments
+        ):
+            raise TypeError("PowerShell script and arguments must be strings")
+        script_payload = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        argument_expressions = ", ".join(
+            "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("
+            f"'{base64.b64encode(argument.encode('utf-8')).decode('ascii')}'"
+            "))"
+            for argument in arguments
+        )
+        wrapper = (
+            "$__dobbyvpnScript = [Text.Encoding]::UTF8.GetString("
+            f"[Convert]::FromBase64String('{script_payload}')); "
+            "$__dobbyvpnArguments = @("
+            f"{argument_expressions}); "
+            "& ([ScriptBlock]::Create($__dobbyvpnScript)) "
+            "@__dobbyvpnArguments"
+        )
         return (
             "powershell.exe",
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            script,
-            *arguments,
+            wrapper,
         )
 
     def _record_service_diagnostics(self, *diagnostics: str) -> None:

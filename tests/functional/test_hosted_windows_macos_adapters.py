@@ -1,7 +1,10 @@
 from __future__ import annotations
+
+import base64
 import json
 import hashlib
 import os
+import re
 import time
 
 from pathlib import Path
@@ -36,6 +39,24 @@ from torturer_checks.hosted.windows import (
 from torturer_contract.functional.capabilities import Capability
 from torturer_contract.functional.engine import FunctionalEngine, ScenarioExecutionError
 from torturer_checks.windows_job import WindowsJobCleanup
+
+
+def _decode_safe_powershell(command: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
+    """Decode the fixed PowerShell wrapper and its exact string arguments."""
+
+    command_index = command.index("-Command")
+    if command_index != 4 or len(command) != command_index + 2:
+        raise AssertionError(command)
+    payloads = re.findall(
+        r"FromBase64String\('([A-Za-z0-9+/=]*)'\)", command[command_index + 1]
+    )
+    if not payloads:
+        raise AssertionError(command)
+    decoded = tuple(
+        base64.b64decode(payload, validate=True).decode("utf-8")
+        for payload in payloads
+    )
+    return decoded[0], decoded[1:]
 
 
 class _FakeWindowsReplacementProcess:
@@ -192,8 +213,10 @@ class HostedDesktopProcessRunner:
                 )
             return CommandResult(argv, 0, (str(self.binary.resolve()) + "\n").encode(), b"")
         if argv[0] == "powershell.exe":
-            script = argv[argv.index("-Command") + 1]
+            script, arguments = _decode_safe_powershell(argv)
             if script == hosted_windows._WINDOWS_EXTERNAL_DESCENDANT_SNAPSHOT_SCRIPT:
+                if arguments != (str(self.service_pid),):
+                    raise AssertionError(arguments)
                 output = (
                     b"late_tree_pid=789\nlate_tree_identity=789|200\n"
                     if self.tree_late_descendant
@@ -201,6 +224,8 @@ class HostedDesktopProcessRunner:
                 )
                 return CommandResult(argv, 0, output, b"")
             if "tree_pid=" in script:
+                if arguments != (str(self.service_pid),):
+                    raise AssertionError(arguments)
                 if self.tree_partial:
                     return CommandResult(argv, 0, b"tree_pid=123\nmalformed-tree-row\n", b"")
                 return CommandResult(
@@ -213,6 +238,9 @@ class HostedDesktopProcessRunner:
                     b"",
                 )
             if "survivor_pid=" in script:
+                expected_tree = (f"{self.service_pid}|100",)
+                if arguments != expected_tree:
+                    raise AssertionError(arguments)
                 if self.tree_identity_mismatch:
                     return CommandResult(
                         argv,
@@ -231,15 +259,25 @@ class HostedDesktopProcessRunner:
             if "Start-Process" in script:
                 self.service_alive = True
                 self.service_pid = 456
-                Path(argv[7]).write_bytes(b"windows service stdout\n")
-                Path(argv[8]).write_bytes(b"windows service stderr\n")
-                Path(argv[7]).chmod(0o600)
-                Path(argv[8]).chmod(0o600)
+                if len(arguments) != 2:
+                    raise AssertionError(arguments)
+                Path(arguments[0]).write_bytes(b"windows service stdout\n")
+                Path(arguments[1]).write_bytes(b"windows service stderr\n")
+                Path(arguments[0]).chmod(0o600)
+                Path(arguments[1]).chmod(0o600)
                 return CommandResult(argv, 0, b"456\n", b"")
             if script == hosted_windows._WINDOWS_EXTERNAL_PROCESS_STOP_SCRIPT:
+                if arguments != (
+                    str(self.service_pid),
+                    "100",
+                    str(self.binary.resolve()),
+                ):
+                    raise AssertionError(arguments)
                 self.service_alive = False
                 return CommandResult(argv, 0, b"external_service_stop=123\n", b"")
             if script == _WINDOWS_PROCESS_IDENTITY_SCRIPT:
+                if arguments != (str(self.service_pid),):
+                    raise AssertionError(arguments)
                 if not self.service_alive:
                     return CommandResult(argv, 1, b"", b"")
                 ticks = 200 if self.identity_reused else 100
@@ -255,6 +293,8 @@ class HostedDesktopProcessRunner:
                     (str(self.binary.resolve()) + "\n").encode(), b"",
                 )
             if "Get-Process" in script:
+                if arguments != (str(self.service_pid),):
+                    raise AssertionError(arguments)
                 if self.probe_error:
                     return CommandResult(argv, 1, b"service_probe_error\n", b"")
                 return CommandResult(
@@ -268,6 +308,8 @@ class HostedDesktopProcessRunner:
                     b"",
                 )
             if "Test-NetConnection" in script:
+                if arguments != ("127.0.0.1", "50051"):
+                    raise AssertionError(arguments)
                 return CommandResult(argv, 0 if self.service_alive else 1, b"True\n", b"")
 
         if argv[0] == str(self.binary):
@@ -431,7 +473,11 @@ class HostedDesktopAdapterTests(unittest.TestCase):
             self.assertEqual((Path(self.directory.name) / f"{platform}.pid").read_text(), "456\n")
 
             if platform == "windows":
-                self.assertTrue(any(call[0] == "powershell.exe" and "Test-NetConnection" in call[5] for call in runner.calls))
+                self.assertTrue(any(
+                    call[0] == "powershell.exe"
+                    and "Test-NetConnection" in _decode_safe_powershell(call)[0]
+                    for call in runner.calls
+                ))
             else:
                 privileged = [call[2:] for call in runner.calls if call[:2] == ("sudo", "-n")]
                 self.assertTrue(any(call[:2] == ("kill", "-KILL") for call in privileged))

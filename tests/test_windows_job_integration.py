@@ -313,7 +313,10 @@ class WindowsJobIntegrationTests(unittest.TestCase):
     def test_desktop_service_teardown_uses_job_and_retains_service_log(self) -> None:
         with tempfile.TemporaryDirectory(prefix="windows-job-desktop-service-") as temporary:
             root = Path(temporary)
-            evidence = root / "evidence"
+            # Use the production evidence-directory preparation so the
+            # teardown and retained service log have the same owner-only
+            # boundary as a real desktop qualification.
+            evidence = desktop_slice._prepare_evidence_directory(root / "evidence")
             service_log_path = root / "service.combined.log"
             with service_log_path.open("wb", buffering=0) as service_log:
                 process = popen_with_windows_job(

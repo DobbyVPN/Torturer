@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -11,6 +13,24 @@ import torturer_checks.hosted.windows as hosted_windows
 from torturer_checks.hosted.cli import CommandResult, HostedAdapterError, _evidence_metadata
 from torturer_checks.windows_job import WindowsJobCleanup
 from torturer_contract.functional.engine import ScenarioExecutionError
+
+
+def _decode_safe_powershell(command: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
+    """Decode the test seam's fixed wrapper and its exact string arguments."""
+
+    command_index = command.index("-Command")
+    if command_index != 4 or len(command) != command_index + 2:
+        raise AssertionError(command)
+    payloads = re.findall(
+        r"FromBase64String\('([A-Za-z0-9+/=]*)'\)", command[command_index + 1]
+    )
+    if not payloads:
+        raise AssertionError(command)
+    decoded = tuple(
+        base64.b64decode(payload, validate=True).decode("utf-8")
+        for payload in payloads
+    )
+    return decoded[0], decoded[1:]
 
 
 class _FakeProcess:
@@ -53,11 +73,11 @@ class _ServiceRunner:
         self.calls.append(argv)
         if argv[0] != "powershell.exe":
             raise AssertionError(argv)
-        script = argv[argv.index("-Command") + 1]
+        script, arguments = _decode_safe_powershell(argv)
         if script == hosted_windows._WINDOWS_PROCESS_IDENTITY_SCRIPT:
             if not self.service_alive:
                 return CommandResult(argv, 1, b"", b"")
-            pid = int(argv[-1])
+            pid = int(arguments[0])
             return CommandResult(
                 argv,
                 0,
@@ -65,11 +85,12 @@ class _ServiceRunner:
                 b"",
             )
         if script == hosted_windows._WINDOWS_PROCESS_ALIVE_SCRIPT:
+            pid = arguments[0]
             return CommandResult(
                 argv,
                 0 if self.service_alive else 2,
                 (
-                    f"service_probe_pid={argv[-1]}\n"
+                    f"service_probe_pid={pid}\n"
                     if self.service_alive
                     else "service_probe_absent\n"
                 ).encode(),
@@ -167,6 +188,38 @@ class HostedWindowsServiceJobTests(unittest.TestCase):
         self.assertNotIn("run_detached", source)
         self.assertNotIn("taskkill", source.lower())
 
+    def test_powershell_wrapper_binds_exact_literal_arguments(self) -> None:
+        arguments = (
+            "123|456",
+            r'C:\Program Files\Dobby "quoted"\service.exe',
+            "$(Get-Process); exit 99",
+            "' ; Get-Process | Stop-Process; '",
+            "line one\nline two",
+        )
+        scripts = (
+            hosted_windows._WINDOWS_PROCESS_ALIVE_SCRIPT,
+            hosted_windows._WINDOWS_PROCESS_IDENTITY_SCRIPT,
+            hosted_windows._WINDOWS_EXTERNAL_PROCESS_STOP_SCRIPT,
+            hosted_windows._WINDOWS_EXTERNAL_DESCENDANT_SNAPSHOT_SCRIPT,
+            hosted_windows._WINDOWS_PROCESS_PATH_SCRIPT,
+            hosted_windows._WINDOWS_PROCESS_TREE_SNAPSHOT_SCRIPT,
+            hosted_windows._WINDOWS_PROCESS_TREE_VERIFY_SCRIPT,
+            hosted_windows._WINDOWS_PORT_READY_SCRIPT,
+        )
+        for script in scripts:
+            with self.subTest(script=script):
+                command = hosted_windows.WindowsServiceProcessController._powershell(
+                    script, *arguments
+                )
+                decoded_script, decoded_arguments = _decode_safe_powershell(command)
+                self.assertEqual(decoded_script, script)
+                self.assertEqual(decoded_arguments, arguments)
+                self.assertEqual(len(command), 6)
+                wrapper = command[5]
+                for argument in arguments:
+                    self.assertNotIn(argument, wrapper)
+                self.assertIn("FromBase64String", wrapper)
+
     def test_recorded_start_identity_mismatch_fails_before_any_stop(self) -> None:
         self.runner.calls.clear()
         with self.assertRaisesRegex(HostedAdapterError, "SERVICE_PID_NOT_CANDIDATE"):
@@ -179,7 +232,7 @@ class HostedWindowsServiceJobTests(unittest.TestCase):
                 control_address="127.0.0.1:50051",
                 expected_initial_identity="123|999",
             )
-        scripts = [call[call.index("-Command") + 1] for call in self.runner.calls]
+        scripts = [_decode_safe_powershell(call)[0] for call in self.runner.calls]
         self.assertEqual(scripts, [hosted_windows._WINDOWS_PROCESS_IDENTITY_SCRIPT])
         self.assertNotIn(hosted_windows._WINDOWS_EXTERNAL_PROCESS_STOP_SCRIPT, scripts)
 
@@ -313,7 +366,8 @@ class HostedWindowsServiceJobTests(unittest.TestCase):
         self.assertTrue(
             any(
                 call[0] == "powershell.exe"
-                and call[5] == hosted_windows._WINDOWS_EXTERNAL_DESCENDANT_SNAPSHOT_SCRIPT
+                and _decode_safe_powershell(call)[0]
+                == hosted_windows._WINDOWS_EXTERNAL_DESCENDANT_SNAPSHOT_SCRIPT
                 for call in self.runner.calls
             )
         )
