@@ -31,9 +31,16 @@ class WindowsJobIntegrationTests(unittest.TestCase):
     """Exercise the same native boundary used by hosted ordinary commands."""
 
     def _process_identity(self, pid: int) -> str:
+        # ``powershell.exe -Command <script> <arg>`` does not bind the final
+        # token to ``$args`` consistently across Windows PowerShell versions:
+        # it can execute it as a second command instead.  Embed this
+        # test-created integer in the script so the probe cannot accidentally
+        # query PID 0 and append the argument as an extra output line.
+        process_id = int(pid)
         script = (
             '$ErrorActionPreference="Stop"; '
-            '$p=Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f ([int]$args[0])); '
+            f'$processId={process_id}; '
+            '$p=Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $processId); '
             'if ($null -eq $p -or $null -eq $p.CreationDate) { exit 2 }; '
             'Write-Output ([string]$p.ProcessId + "|" + '
             '[string]$p.CreationDate.ToUniversalTime().Ticks)'
@@ -46,7 +53,6 @@ class WindowsJobIntegrationTests(unittest.TestCase):
                 "-NonInteractive",
                 "-Command",
                 script,
-                str(pid),
             ),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -134,7 +140,7 @@ class WindowsJobIntegrationTests(unittest.TestCase):
             assert job is not None
             self.assertTrue(job.assigned)
             stdout, stderr = process.communicate(timeout=10.0)
-            self.assertEqual(stdout, b"resumed\n")
+            self.assertEqual(stdout, b"resumed" + os.linesep.encode("ascii"))
             self.assertEqual(stderr, b"")
             self.assertTrue(
                 wait_for_empty(process, deadline=time.monotonic() + 10.0).process_tree_proven
@@ -160,18 +166,19 @@ class WindowsJobIntegrationTests(unittest.TestCase):
                 "time.sleep(30)"
             )
             code = (
-                "import pathlib, subprocess, sys, time; "
+                "import pathlib, subprocess, sys, time\n"
                 f"subprocess.Popen([sys.executable, '-c', {child_code!r}], "
-                "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
-                f"deadline = time.monotonic() + 10; "
-                f"ready = pathlib.Path({str(child_ready)!r}), pathlib.Path({str(grandchild_ready)!r}); "
-                "while time.monotonic() < deadline and not all(path.is_file() for path in ready): time.sleep(0.01); "
-                "print('root-exited', flush=True)"
+                "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                f"deadline = time.monotonic() + 10\n"
+                f"ready = pathlib.Path({str(child_ready)!r}), pathlib.Path({str(grandchild_ready)!r})\n"
+                "while time.monotonic() < deadline and not all(path.is_file() for path in ready):\n"
+                "    time.sleep(0.01)\n"
+                "print('root-exited', flush=True)\n"
             )
             process = self._launch(code, stage="integration-descendants")
             try:
                 stdout, stderr = process.communicate(timeout=15.0)
-                self.assertEqual(stdout, b"root-exited\n")
+                self.assertEqual(stdout, b"root-exited" + os.linesep.encode("ascii"))
                 self.assertEqual(stderr, b"")
                 self.assertIsNotNone(process.returncode)
                 self.assertTrue(child_ready.is_file())
@@ -325,9 +332,10 @@ class WindowsJobIntegrationTests(unittest.TestCase):
                 try:
                     self.assertIsNotNone(job_for(process))
                     marker_deadline = time.monotonic() + 10.0
+                    expected_marker = b"synthetic-service" + os.linesep.encode("ascii")
                     while time.monotonic() < marker_deadline:
                         service_log.flush()
-                        if service_log_path.read_bytes() == b"synthetic-service\n":
+                        if service_log_path.read_bytes() == expected_marker:
                             break
                         time.sleep(0.01)
                     else:
@@ -339,11 +347,18 @@ class WindowsJobIntegrationTests(unittest.TestCase):
                         evidence_directory=evidence,
                     )
                 finally:
-                    service_log.flush()
+                    # If readiness or stop_service fails, the normal cleanup
+                    # call is never reached.  Close the native Job here before
+                    # TemporaryDirectory removal, while the service log is
+                    # still open, so descendants cannot retain its handle.
+                    try:
+                        self._close_process(process)
+                    finally:
+                        service_log.flush()
             desktop_slice._emit_and_retain_service_log(service_log_path, evidence)
             self.assertEqual(
                 (evidence / "service.combined.raw.log").read_bytes(),
-                b"synthetic-service\n",
+                b"synthetic-service" + os.linesep.encode("ascii"),
             )
             self.assertIsNone(job_for(process))
 

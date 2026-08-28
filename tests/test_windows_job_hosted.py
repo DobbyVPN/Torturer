@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import tempfile
 import time
@@ -8,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 import torturer_checks.hosted.cli as hosted_cli
-from torturer_checks.hosted.cli import HostedAdapterError, SubprocessRunner
+from torturer_checks.hosted.cli import HostedAdapterError, SubprocessRunner, _evidence_metadata
 from torturer_checks.windows_job import (
     WindowsJobCleanup,
     WindowsJobCloseDiagnostics,
@@ -87,6 +88,28 @@ class HostedWindowsJobRunnerTests(unittest.TestCase):
             "close_windows_job": mock.Mock(return_value=close),
             "_finish_process_tree": mock.Mock(return_value=finish),
         }
+
+    def test_windows_evidence_metadata_uses_write_capable_descriptor_for_flush(self) -> None:
+        path = Path(self.directory.name) / "complete.raw.log"
+        payload = b"complete evidence\x00\xff\n"
+        path.write_bytes(payload)
+        with (
+            mock.patch.object(hosted_cli.os, "name", "nt"),
+            mock.patch.object(hosted_cli.os, "open", wraps=hosted_cli.os.open) as open_file,
+        ):
+            size, digest = _evidence_metadata(path)
+
+        self.assertEqual((size, digest), (len(payload), hashlib.sha256(payload).hexdigest()))
+        flags = open_file.call_args.args[1]
+        self.assertEqual(flags & getattr(hosted_cli.os, "O_ACCMODE", 3), hosted_cli.os.O_RDWR)
+
+    def test_evidence_metadata_keeps_flush_failures_fatal(self) -> None:
+        path = Path(self.directory.name) / "flush-failure.raw.log"
+        path.write_bytes(b"evidence")
+        path.chmod(0o600)
+        with mock.patch.object(hosted_cli.os, "fsync", side_effect=OSError(5, "synthetic flush failure")):
+            with self.assertRaisesRegex(HostedAdapterError, "EVIDENCE_FSYNC_FAILED"):
+                _evidence_metadata(path)
 
     def test_normal_completion_survivor_fails_after_complete_diagnostics(self) -> None:
         raw = Path(self.directory.name) / "survivor-raw"

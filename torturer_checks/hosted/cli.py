@@ -990,9 +990,19 @@ class SubprocessRunner:
 
 
 def _evidence_metadata(path: Path) -> tuple[int, str]:
-    """Hash one retained raw file after validating its private inode."""
+    """Hash one retained raw file after validating its private inode.
 
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    Windows ``os.fsync`` maps to ``_commit``/``FlushFileBuffers`` and rejects
+    a descriptor opened read-only (``OSError(9, ...)``).  The retained file is
+    already complete and is never modified here, but Windows still requires a
+    write-capable handle to prove the flush.  Use that access mode only on
+    Windows; POSIX keeps the least-privileged read-only descriptor.  Any
+    actual flush failure remains fatal so metadata cannot certify undurable
+    evidence.
+    """
+
+    access_flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+    flags = access_flags | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
     try:
         info = os.fstat(descriptor)
