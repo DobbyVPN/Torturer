@@ -282,6 +282,38 @@ class WindowsJobTests(unittest.TestCase):
         self.assertIn("api=ClosePipe winerror=0 detail=stdout:OSError", str(caught.exception))
         self.assertIsNotNone(original)
 
+    def test_setup_communicate_oserror_retains_partial_output(self) -> None:
+        class PipeFailureProcess(_FakeProcess):
+            def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+                error = OSError(232, "pipe closed")
+                error.output = b"partial-stdout\x00"  # type: ignore[attr-defined]
+                error.stderr = b"partial-stderr\xff"  # type: ignore[attr-defined]
+                raise error
+
+        process = PipeFailureProcess()
+        retained: list[tuple[bytes, bytes]] = []
+        with patch.object(windows_job.os, "name", "nt"), patch.object(
+            windows_job,
+            "attach_and_resume",
+            side_effect=windows_job.WindowsJobError(
+                "desktop-command", ("api=AssignProcessToJobObject winerror=5",)
+            ),
+        ):
+            with self.assertRaises(windows_job.WindowsJobError) as caught:
+                windows_job.popen_with_windows_job(
+                    MagicMock(return_value=process),
+                    ["safe-command"],
+                    stage="desktop-command",
+                    on_setup_failure_output=lambda stdout, stderr: retained.append(
+                        (stdout, stderr)
+                    ),
+                )
+        self.assertEqual(caught.exception.stdout, b"partial-stdout\x00")
+        self.assertEqual(caught.exception.stderr, b"partial-stderr\xff")
+        self.assertEqual(retained, [(b"partial-stdout\x00", b"partial-stderr\xff")])
+        self.assertIn("api=ProcessCommunicate winerror=232 detail=OSError", str(caught.exception))
+        self.assertIn("EVIDENCE_INCOMPLETE=1 reason=setup-communicate-error", str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

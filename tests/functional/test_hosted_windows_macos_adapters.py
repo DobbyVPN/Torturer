@@ -601,6 +601,19 @@ class HostedDesktopAdapterTests(unittest.TestCase):
         self.assertIn("os.kill(pid, 0)", _MACOS_PROCESS_IDENTITY_SCRIPT)
         self.assertIn("os.setsid()", _MACOS_SERVICE_LAUNCH_SCRIPT)
 
+    def test_macos_embedded_probes_emit_safe_exception_diagnostics(self) -> None:
+        from torturer_checks.hosted.macos import (
+            _MACOS_PROCESS_ALIVE_SCRIPT,
+            _MACOS_PROCESS_IDENTITY_SCRIPT,
+        )
+
+        for script in (_MACOS_PROCESS_ALIVE_SCRIPT, _MACOS_PROCESS_IDENTITY_SCRIPT):
+            with self.subTest(script=script[:24]):
+                self.assertIn("service_probe_exception", script)
+                self.assertIn("exception_type = type(error).__name__", script)
+                self.assertIn("detail=", script)
+                self.assertNotIn("traceback", script.lower())
+
     def test_windows_tree_identity_rejects_malformed_and_accepts_creation_time(self) -> None:
         self.assertEqual(
             _parse_windows_tree_identities(
