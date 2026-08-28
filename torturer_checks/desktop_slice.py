@@ -1584,6 +1584,12 @@ def service_environment(target_platform: str, runtime: RuntimePaths, port: int |
         raise SliceFailure("Windows runtime has no loopback TCP port")
     environment["PROGRAMDATA"] = str(runtime.root / "ProgramData")
     environment["PORT"] = str(port)
+    # The native Windows CLI does not infer the service's test port from the
+    # Gradle/app PORT variable; it dials DOBBYVPN_CONTROL_ADDRESS (defaulting
+    # to the installed 50051 endpoint).  Bind the CLI to this run's private
+    # loopback listener so the lifecycle check exercises the service it just
+    # started rather than an unrelated/default endpoint.
+    environment["DOBBYVPN_CONTROL_ADDRESS"] = f"127.0.0.1:{port}"
     # The public Windows service must not fall back to an account lookup that
     # can differ across hosted launch contexts.  Derive it from the copied
     # runner environment only after removing any inherited override.

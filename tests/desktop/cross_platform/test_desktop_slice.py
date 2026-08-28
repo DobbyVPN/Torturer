@@ -547,6 +547,7 @@ class DesktopSliceHelperTest(unittest.TestCase):
             environment = service_environment("windows", runtime, 50151)
             self.assertEqual(environment["PROGRAMDATA"], "/tmp/runtime/ProgramData")
             self.assertEqual(environment["PORT"], "50151")
+            self.assertEqual(environment["DOBBYVPN_CONTROL_ADDRESS"], "127.0.0.1:50151")
             self.assertNotIn("DOBBYVPN_CONTROL_TOKEN_PATH", environment)
             self.assertEqual(
                 environment["DOBBYVPN_CONTROL_TOKEN_USER"],
