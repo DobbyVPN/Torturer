@@ -9,13 +9,16 @@ import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest.mock import patch
 
 TORTURER_ROOT = Path(__file__).resolve().parents[3]
 if str(TORTURER_ROOT) not in sys.path:
     sys.path.insert(0, str(TORTURER_ROOT))
 
+import torturer_checks.linux_slice as linux_slice
 from torturer_checks.linux_slice import (
     BUILD_SCRIPT_RELATIVE_PATH,
+    CLI_RELATIVE_PATH,
     CLEANUP_RESERVE_SECONDS,
     MAX_FUNCTIONAL_SECONDS,
     MAX_RUN_SECONDS,
@@ -75,10 +78,9 @@ class LinuxSliceHelperTest(unittest.TestCase):
         self.assertEqual(
             cli_command(root, "status", "--json"),
             [
-                "/candidate/kmp_module/gradlew",
-                "--no-daemon",
-                ":app:run",
-                "--args=status --json",
+                "/candidate/kmp_module/services/dobby-cli",
+                "status",
+                "--json",
             ],
         )
 
@@ -516,6 +518,32 @@ class LinuxSliceHelperTest(unittest.TestCase):
 
     def test_service_relative_path_is_expected_linux_output(self) -> None:
         self.assertEqual(str(SERVICE_RELATIVE_PATH), "kmp_module/services/ubuntu_grpcvpnserver")
+        self.assertEqual(str(CLI_RELATIVE_PATH), "kmp_module/services/dobby-cli")
+
+    def test_main_publishes_safe_failure_reason_without_retained_command_streams(self) -> None:
+        captured_stderr = io.StringIO()
+        failure = SliceFailure(
+            "CLI status failed\n"
+            "stdout=private-output stderr=private-error token=private-token "
+            "https://profile.example.test/config"
+        )
+        with patch.object(linux_slice, "run_slice", side_effect=failure):
+            with redirect_stderr(captured_stderr):
+                result = linux_slice.main(
+                    [
+                        "--candidate",
+                        "/candidate",
+                        "--commit-sha",
+                        "0123456789abcdef0123456789abcdef01234567",
+                    ]
+                )
+        self.assertEqual(result, 1)
+        output = captured_stderr.getvalue()
+        self.assertIn("reason=CLI status failed", output)
+        self.assertNotIn("private-output", output)
+        self.assertNotIn("private-error", output)
+        self.assertNotIn("private-token", output)
+        self.assertNotIn("profile.example.test", output)
 
 
 class _FakeProcess:

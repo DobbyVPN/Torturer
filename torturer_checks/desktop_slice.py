@@ -1,7 +1,7 @@
 """Secretless public Windows and macOS desktop lifecycle verification.
 
 This source-build slice calls only DobbyVPN's public ``desktop_build.py`` and
-the product JVM CLI target.  It deliberately uses an invalid local TOML file;
+the built native operator CLI.  It deliberately uses an invalid local TOML file;
 no profile, endpoint, credential, routable URL, ``connect`` command, or
 privileged tunnel start is involved.
 
@@ -63,6 +63,10 @@ WINDOWS_GRADLE_RELATIVE_PATH = Path("kmp_module/gradlew.bat")
 SERVICE_RELATIVE_PATHS = {
     "macos": Path("kmp_module/services/macos_grpcvpnserver"),
     "windows": Path("kmp_module/services/windows_grpcvpnserver.exe"),
+}
+CLI_RELATIVE_PATHS = {
+    "macos": Path("kmp_module/services/dobby-cli"),
+    "windows": Path("kmp_module/services/dobby-cli.exe"),
 }
 MACOS_ARCHITECTURES = frozenset(("arm64", "amd64"))
 MALFORMED_CONFIG_NAME = "malformed-public-fixture.toml"
@@ -310,7 +314,7 @@ def service_build_command(root: Path, target_platform: str, architecture: str, *
 
 
 def app_build_command(root: Path, target_platform: str, *, skip_dependencies: bool) -> list[str]:
-    """Build the JVM app after the service build without rebuilding that service."""
+    """Build the desktop app and native CLI without rebuilding the service."""
 
     command = [
         sys.executable,
@@ -326,15 +330,9 @@ def app_build_command(root: Path, target_platform: str, *, skip_dependencies: bo
 
 
 def cli_command(root: Path, target_platform: str, *arguments: str) -> list[str]:
-    """Run the product JVM CLI through the candidate's Gradle application target."""
+    """Run the candidate's built native operator CLI directly."""
 
-    gradle = WINDOWS_GRADLE_RELATIVE_PATH if target_platform == "windows" else GRADLE_RELATIVE_PATH
-    return [
-        str(root / gradle),
-        "--no-daemon",
-        ":app:run",
-        "--args=" + " ".join(arguments),
-    ]
+    return [str(root / CLI_RELATIVE_PATHS[target_platform]), *arguments]
 
 
 def service_command(service: Path, target_platform: str, port: int | None) -> list[str]:
@@ -1393,10 +1391,9 @@ def assert_cli_contract(
 ) -> None:
     """Exercise only non-connecting product CLI operations against the service."""
 
-    gradle_dir = root / "kmp_module"
     help_result = run_command(
         cli_command(root, target_platform, "--help"),
-        cwd=gradle_dir,
+        cwd=root,
         env=environment,
         timeout_seconds=budget.operation_timeout(),
         evidence_directory=evidence_directory,
@@ -1408,7 +1405,7 @@ def assert_cli_contract(
 
     status_result = run_command(
         cli_command(root, target_platform, "status", "--json"),
-        cwd=gradle_dir,
+        cwd=root,
         env=environment,
         timeout_seconds=budget.operation_timeout(),
         evidence_directory=evidence_directory,
@@ -1420,7 +1417,7 @@ def assert_cli_contract(
 
     malformed_result = run_command(
         cli_command(root, target_platform, "check-config", str(fixture)),
-        cwd=gradle_dir,
+        cwd=root,
         env=environment,
         timeout_seconds=budget.operation_timeout(),
         evidence_directory=evidence_directory,
@@ -1430,7 +1427,7 @@ def assert_cli_contract(
 
     disconnect_result = run_command(
         cli_command(root, target_platform, "disconnect"),
-        cwd=gradle_dir,
+        cwd=root,
         env=environment,
         timeout_seconds=budget.operation_timeout(),
         evidence_directory=evidence_directory,
@@ -1481,12 +1478,15 @@ def run_slice(
                 evidence_directory=evidence_root,
                 evidence_label="app-build",
             ),
-            f"public {target_platform} JVM application build",
+            f"public {target_platform} desktop application and native CLI build",
         )
 
         service = root / SERVICE_RELATIVE_PATHS[target_platform]
         if not service.is_file() or (target_platform == "macos" and not os.access(service, os.X_OK)):
             raise SliceFailure(f"public build did not produce an executable {target_platform} service: {service}")
+        cli = root / CLI_RELATIVE_PATHS[target_platform]
+        if not cli.is_file() or (target_platform == "macos" and not os.access(cli, os.X_OK)):
+            raise SliceFailure(f"public build did not produce an executable {target_platform} operator CLI: {cli}")
 
         with tempfile.TemporaryDirectory(prefix=f"torturer-{target_platform}-") as temporary:
             runtime_root = Path(temporary)
@@ -1585,7 +1585,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 1
     print(
-        "Torturer desktop slice passed: source builds, safe CLI lifecycle, "
+        "Torturer desktop slice passed: source builds, native CLI lifecycle, "
         "and private service cleanup verified."
     )
     return 0

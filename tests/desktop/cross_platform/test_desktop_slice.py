@@ -23,6 +23,7 @@ if str(TORTURER_ROOT) not in sys.path:
 import torturer_checks.desktop_slice as desktop_slice
 from torturer_checks.desktop_slice import (
     BUILD_SCRIPT_RELATIVE_PATH,
+    CLI_RELATIVE_PATHS,
     CLEANUP_RESERVE_SECONDS,
     GRADLE_RELATIVE_PATH,
     MAX_RUN_SECONDS,
@@ -84,14 +85,15 @@ class DesktopSliceHelperTest(unittest.TestCase):
         self.assertEqual(
             cli_command(root, "macos", "status", "--json"),
             [
-                "/candidate/kmp_module/gradlew",
-                "--no-daemon",
-                ":app:run",
-                "--args=status --json",
+                "/candidate/kmp_module/services/dobby-cli",
+                "status",
+                "--json",
             ],
         )
         self.assertEqual(
-            cli_command(root, "windows", "disconnect")[0], "/candidate/kmp_module/gradlew.bat")
+            cli_command(root, "windows", "disconnect"),
+            ["/candidate/kmp_module/services/dobby-cli.exe", "disconnect"],
+        )
 
     def test_service_commands_are_argument_vectors(self) -> None:
         self.assertEqual(service_command(Path("/service"), "macos", None), ["/service"])
@@ -576,6 +578,8 @@ class DesktopSliceHelperTest(unittest.TestCase):
     def test_service_paths_match_public_build_outputs(self) -> None:
         self.assertEqual(str(SERVICE_RELATIVE_PATHS["macos"]), "kmp_module/services/macos_grpcvpnserver")
         self.assertEqual(str(SERVICE_RELATIVE_PATHS["windows"]), "kmp_module/services/windows_grpcvpnserver.exe")
+        self.assertEqual(str(CLI_RELATIVE_PATHS["macos"]), "kmp_module/services/dobby-cli")
+        self.assertEqual(str(CLI_RELATIVE_PATHS["windows"]), "kmp_module/services/dobby-cli.exe")
 
 
 class _FakeProcess:

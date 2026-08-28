@@ -1,7 +1,7 @@
 """Secretless public Linux desktop verification for one DobbyVPN checkout.
 
 This is deliberately a black-box slice.  It only calls the candidate's public
-desktop build entry point and its JVM command-line application.  The fixture is
+desktop build entry point and its native operator CLI.  The fixture is
 an invalid local file: it contains no profile, endpoint, credential, or URL,
 so the check must reject it before any tunnel can be started.
 
@@ -44,6 +44,7 @@ from torturer_checks.public_output import emit_evidence
 
 
 SERVICE_RELATIVE_PATH = Path("kmp_module/services/ubuntu_grpcvpnserver")
+CLI_RELATIVE_PATH = Path("kmp_module/services/dobby-cli")
 BUILD_SCRIPT_RELATIVE_PATH = Path(".github/scripts/desktop_build.py")
 GRADLE_RELATIVE_PATH = Path("kmp_module/gradlew")
 MALFORMED_CONFIG_NAME = "malformed-public-fixture.toml"
@@ -55,10 +56,40 @@ MAX_FUNCTIONAL_SECONDS = MAX_RUN_SECONDS - CLEANUP_RESERVE_SECONDS
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
 COMMAND_TERMINATION_GRACE_SECONDS = 15
 FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
+_FAILURE_URL = re.compile(r"(?i)\b(?:https?|wss?)://[^\s]+")
+_FAILURE_AUTH_SCHEME = re.compile(r"(?i)\b(?:bearer|basic)\s+[^\s,;]+")
+_FAILURE_SECRET = re.compile(
+    r'''(?ix)
+    (?P<label>
+        ["']?
+        \b(?:
+            token|access[_-]?token|refresh[_-]?token|id[_-]?token|
+            password|passwd|secret|client[_-]?secret|credential|
+            api[_-]?key|private[_-]?key|authorization|cookie
+        )\b
+        ["']?
+        \s*[:=]\s*
+    )
+    (?:(?:bearer|basic)\s+)?
+    (?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)
+    '''
+)
 
 
 class SliceFailure(RuntimeError):
     """One required public-contract assertion did not hold."""
+
+
+def safe_failure_reason(error: BaseException) -> str:
+    """Return one useful, secretless line for the hosted status boundary."""
+
+    message = str(error).splitlines()[0].strip() if str(error) else ""
+    if not message:
+        return "unspecified failure"
+    message = _FAILURE_URL.sub("<redacted-url>", message)
+    message = _FAILURE_SECRET.sub(r"\g<label><redacted>", message)
+    message = _FAILURE_AUTH_SCHEME.sub("<redacted-auth>", message)
+    return message
 
 
 @dataclass(frozen=True)
@@ -172,7 +203,7 @@ def build_command(root: Path, *, skip_dependencies: bool) -> list[str]:
 
 
 def app_build_command(root: Path, *, skip_dependencies: bool) -> list[str]:
-    """Build the JVM application without rebuilding the service just built."""
+    """Build the desktop application and native CLI without rebuilding the service."""
 
     command = [
         sys.executable,
@@ -188,14 +219,9 @@ def app_build_command(root: Path, *, skip_dependencies: bool) -> list[str]:
 
 
 def cli_command(root: Path, *arguments: str) -> list[str]:
-    """Run the candidate's public JVM CLI using its Gradle application target."""
+    """Run the candidate's built native operator CLI directly."""
 
-    return [
-        str(root / GRADLE_RELATIVE_PATH),
-        "--no-daemon",
-        ":app:run",
-        "--args=" + " ".join(arguments),
-    ]
+    return [str(root / CLI_RELATIVE_PATH), *arguments]
 
 
 def emit_command_diagnostics(result: CommandResult) -> None:
@@ -968,10 +994,9 @@ def assert_cli_contract(
     """Exercise safe CLI surfaces against the ready service, never a tunnel."""
 
     budget = budget or RunBudget()
-    gradle_dir = root / "kmp_module"
     help_result = run_command(
         cli_command(root, "--help"),
-        cwd=gradle_dir,
+        cwd=root,
         env=environment,
         timeout_seconds=budget.operation_timeout(DEFAULT_COMMAND_TIMEOUT_SECONDS),
         evidence_directory=evidence_directory,
@@ -983,7 +1008,7 @@ def assert_cli_contract(
 
     status_result = run_command(
         cli_command(root, "status", "--json"),
-        cwd=gradle_dir,
+        cwd=root,
         env=environment,
         timeout_seconds=budget.operation_timeout(DEFAULT_COMMAND_TIMEOUT_SECONDS),
         evidence_directory=evidence_directory,
@@ -995,7 +1020,7 @@ def assert_cli_contract(
 
     malformed_result = run_command(
         cli_command(root, "check-config", str(fixture)),
-        cwd=gradle_dir,
+        cwd=root,
         env=environment,
         timeout_seconds=budget.operation_timeout(DEFAULT_COMMAND_TIMEOUT_SECONDS),
         evidence_directory=evidence_directory,
@@ -1005,7 +1030,7 @@ def assert_cli_contract(
 
     disconnect_result = run_command(
         cli_command(root, "disconnect"),
-        cwd=gradle_dir,
+        cwd=root,
         env=environment,
         timeout_seconds=budget.operation_timeout(DEFAULT_COMMAND_TIMEOUT_SECONDS),
         evidence_directory=evidence_directory,
@@ -1135,12 +1160,15 @@ def run_slice(
             evidence_directory=evidence_root,
             evidence_label="application-build",
         ),
-        "public desktop application build",
+        "public desktop application and native CLI build",
     )
 
     service = root / SERVICE_RELATIVE_PATH
     if not service.is_file() or not os.access(service, os.X_OK):
         raise SliceFailure(f"public build did not produce an executable Linux service: {service}")
+    cli = root / CLI_RELATIVE_PATH
+    if not cli.is_file() or not os.access(cli, os.X_OK):
+        raise SliceFailure(f"public build did not produce an executable Linux operator CLI: {cli}")
 
     with tempfile.TemporaryDirectory(prefix="torturer-linux-") as temporary:
         runtime = Path(temporary)
@@ -1226,7 +1254,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout_seconds=args.timeout,
         )
     except SliceFailure as error:
-        print(f"linux_slice status=failed code={type(error).__name__}", file=sys.stderr)
+        print(
+            f"linux_slice status=failed code={type(error).__name__} "
+            f"reason={safe_failure_reason(error)}",
+            file=sys.stderr,
+        )
         return 1
     print("Torturer Linux slice passed: build, Unix service readiness, safe CLI rejection, and cleanup verified.")
     return 0
