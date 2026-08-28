@@ -35,6 +35,7 @@ from torturer_checks.desktop_slice import (
     ProcessTreeResult,
     SliceFailure,
     app_build_command,
+    assert_cli_contract,
     build_runtime_paths,
     candidate_path,
     cli_command,
@@ -71,17 +72,30 @@ class DesktopSliceHelperTest(unittest.TestCase):
                 "--skip-deps",
             ],
         )
-        self.assertEqual(
-            app_build_command(root, "windows", skip_dependencies=False),
-            [
-                sys.executable,
-                "/candidate/.github/scripts/desktop_build.py",
-                "app",
-                "--platform",
-                "windows",
-                "--skip-libs",
-            ],
-        )
+        for target_platform, architecture in (
+            ("macos", "arm64"),
+            ("macos", "amd64"),
+            ("windows", "amd64"),
+        ):
+            with self.subTest(target_platform=target_platform, architecture=architecture):
+                self.assertEqual(
+                    app_build_command(
+                        root,
+                        target_platform,
+                        architecture,
+                        skip_dependencies=False,
+                    ),
+                    [
+                        sys.executable,
+                        "/candidate/.github/scripts/desktop_build.py",
+                        "app",
+                        "--platform",
+                        target_platform,
+                        "--arch",
+                        architecture,
+                        "--skip-libs",
+                    ],
+                )
         self.assertEqual(
             cli_command(root, "macos", "status", "--json"),
             [
@@ -119,6 +133,57 @@ class DesktopSliceHelperTest(unittest.TestCase):
         self.assertIn("[\n", MALFORMED_CONFIG)
         self.assertNotIn("://", MALFORMED_CONFIG)
         self.assertNotIn("[[", MALFORMED_CONFIG)
+
+    def test_cli_status_json_accepts_compact_and_spaced_output(self) -> None:
+        for status_output in (
+            '{"code":0,"state":"Disconnected"}',
+            '{\n  "code": 0,\n  "state": "Disconnected"\n}',
+        ):
+            with patch.object(
+                desktop_slice,
+                "run_command",
+                side_effect=[
+                    CommandResult((), 0, "check-config disconnect", ""),
+                    CommandResult((), 0, status_output, ""),
+                    CommandResult((), 1, "", ""),
+                    CommandResult((), 0, "", ""),
+                ],
+            ):
+                assert_cli_contract(
+                    Path("/candidate"),
+                    "macos",
+                    {},
+                    Path("/fixture"),
+                    budget=RunBudget(max_seconds=30, cleanup_reserve_seconds=1),
+                    evidence_directory=None,
+                )
+
+    def test_cli_status_json_rejects_malformed_extra_and_wrong_state(self) -> None:
+        for status_output in (
+            "not-json",
+            '{"code":0,"state":"Disconnected","extra":true}',
+            '{"code":2,"state":"Connected"}',
+        ):
+            with self.subTest(status_output=status_output):
+                with patch.object(
+                    desktop_slice,
+                    "run_command",
+                    side_effect=[
+                        CommandResult((), 0, "check-config disconnect", ""),
+                        CommandResult((), 0, status_output, ""),
+                    ],
+                ):
+                    with self.assertRaisesRegex(
+                        SliceFailure, r"(?:CLI status JSON was invalid|initial disconnected)"
+                    ):
+                        assert_cli_contract(
+                            Path("/candidate"),
+                            "macos",
+                            {},
+                            Path("/fixture"),
+                            budget=RunBudget(max_seconds=30, cleanup_reserve_seconds=1),
+                            evidence_directory=None,
+                        )
 
     def test_runtime_environment_is_private_and_does_not_accept_token_overrides(self) -> None:
         old_path = os.environ.get("DOBBYVPN_CONTROL_TOKEN_PATH")

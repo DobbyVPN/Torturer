@@ -29,6 +29,7 @@ from torturer_checks.linux_slice import (
     RunBudget,
     SliceFailure,
     _link_state,
+    assert_cli_contract,
     app_build_command,
     build_command,
     candidate_path,
@@ -88,6 +89,55 @@ class LinuxSliceHelperTest(unittest.TestCase):
         self.assertIn("[\n", MALFORMED_CONFIG)
         self.assertNotIn("://", MALFORMED_CONFIG)
         self.assertNotIn("[[", MALFORMED_CONFIG)
+
+    def test_cli_status_json_accepts_compact_and_spaced_output(self) -> None:
+        for status_output in (
+            '{"code":0,"state":"Disconnected"}',
+            '{\n  "code": 0,\n  "state": "Disconnected"\n}',
+        ):
+            with patch.object(
+                linux_slice,
+                "run_command",
+                side_effect=[
+                    CommandResult((), 0, "check-config verify-session", ""),
+                    CommandResult((), 0, status_output, ""),
+                    CommandResult((), 1, "", ""),
+                    CommandResult((), 0, "", ""),
+                ],
+            ):
+                assert_cli_contract(
+                    Path("/candidate"),
+                    {},
+                    Path("/fixture"),
+                    budget=RunBudget(max_seconds=30, cleanup_reserve_seconds=1),
+                    evidence_directory=None,
+                )
+
+    def test_cli_status_json_rejects_malformed_extra_and_wrong_state(self) -> None:
+        for status_output in (
+            "not-json",
+            '{"code":0,"state":"Disconnected","extra":true}',
+            '{"code":2,"state":"Connected"}',
+        ):
+            with self.subTest(status_output=status_output):
+                with patch.object(
+                    linux_slice,
+                    "run_command",
+                    side_effect=[
+                        CommandResult((), 0, "check-config verify-session", ""),
+                        CommandResult((), 0, status_output, ""),
+                    ],
+                ):
+                    with self.assertRaisesRegex(
+                        SliceFailure, r"(?:CLI status JSON was invalid|initial disconnected)"
+                    ):
+                        assert_cli_contract(
+                            Path("/candidate"),
+                            {},
+                            Path("/fixture"),
+                            budget=RunBudget(max_seconds=30, cleanup_reserve_seconds=1),
+                            evidence_directory=None,
+                        )
 
     def test_run_command_streams_stdout_and_stderr(self) -> None:
         with tempfile.TemporaryDirectory(prefix="linux-command-evidence-") as temporary:
