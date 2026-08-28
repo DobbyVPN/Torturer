@@ -20,7 +20,7 @@ import sys
 import time
 from typing import Protocol, Sequence
 
-from torturer_checks.public_output import emit_evidence
+from torturer_checks.public_output import emit_evidence, safe_diagnostic_excerpt
 
 from torturer_checks.ios_simulator import (
     IOSSimulatorContractError,
@@ -769,8 +769,11 @@ def _require_success(
     timeout = budget.operation_timeout(DEFAULT_COMMAND_TIMEOUT_SECONDS) if budget else DEFAULT_COMMAND_TIMEOUT_SECONDS
     result = runner.run(command, timeout_seconds=timeout)
     if result.returncode:
+        excerpt = safe_diagnostic_excerpt(result.stdout)
+        diagnostic = f"\n{excerpt}" if excerpt else ""
         raise IOSSimulatorAppContractError(
-            f"{stage} failed with exit code {result.returncode}; complete diagnostics retained privately"
+            f"{stage} failed with exit code {result.returncode};"
+            f" complete diagnostics retained privately{diagnostic}"
         )
     return result
 
