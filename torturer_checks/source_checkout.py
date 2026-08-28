@@ -22,6 +22,15 @@ import time
 from typing import Sequence
 
 from torturer_checks.public_output import emit_evidence
+from torturer_checks.windows_job import (
+    WindowsJobCloseDiagnostics,
+    WindowsJobError,
+    close_for as close_windows_job,
+    job_for as windows_job_for,
+    popen_with_windows_job,
+    terminate_and_prove_empty as terminate_windows_job,
+    wait_for_empty as wait_for_windows_job,
+)
 
 
 FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -574,15 +583,22 @@ def _wait_for_tree(
     *,
     deadline: float | None = None,
 ) -> bool:
-    if os.name == "nt" and not getattr(process, "_torturer_tree_census_observed", False):
-        # CREATE_NEW_PROCESS_GROUP does not prove descendant disappearance on
-        # Windows. Do not certify a leader-only result when no bounded census
-        # was observed; callers fail closed and retain the evidence metadata.
-        return False
     if deadline is None:
         if timeout is None:
             raise SourceCheckoutError("process-tree deadline is required")
         deadline = time.monotonic() + max(0.0, timeout)
+    # A Job Object is the authoritative Windows containment/proof boundary.
+    # The PID census remains supplemental diagnostic context only: it may be
+    # incomplete during a short-lived child race without invalidating the
+    # native ActiveProcesses=0 observation.
+    if os.name == "nt":
+        if windows_job_for(process) is not None:
+            return wait_for_windows_job(process, deadline=deadline).process_tree_proven
+        # A Windows process without a Job Object is an invalid production
+        # launch. A PID census is supplemental evidence only and cannot
+        # replace the mandatory native containment boundary.
+        tracked.update(_proc_descendants(process.pid, process=process, deadline=deadline))
+        return False
     while True:
         tracked.update(
             _proc_descendants(process.pid, process=process, deadline=deadline)
@@ -611,6 +627,22 @@ def _tree_survivors(
     *,
     deadline: float | None = None,
 ) -> tuple[int, ...]:
+    if os.name == "nt" and windows_job_for(process) is not None:
+        cleanup = wait_for_windows_job(
+            process,
+            deadline=deadline if deadline is not None else time.monotonic(),
+        )
+        if cleanup.active_processes == 0:
+            return ()
+        survivors = set(getattr(process, "_torturer_tracked", set()))
+        survivors.update(_proc_descendants(process.pid, process=process, deadline=deadline))
+        if process.poll() is None or cleanup.active_processes:
+            survivors.add(process.pid)
+        return tuple(sorted(survivors))
+    if os.name == "nt":
+        # Without a Job Object only the Popen-owned leader can be killed
+        # safely. Descendant PID values are never treated as kill targets.
+        return (process.pid,) if process.poll() is None else ()
     tracked.update(_proc_descendants(process.pid, process=process, deadline=deadline))
     survivors = {
         pid for pid in tracked if _pid_alive(pid, deadline=deadline)
@@ -642,15 +674,31 @@ def _terminate_tree(
     leader_running = process.poll() is None
     if force_immediately:
         if os.name == "nt":
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-            except OSError as error:
-                termination_errors.append(
-                    f"preflight forced leader kill error={type(error).__name__}; "
-                    "EVIDENCE_INCOMPLETE=1 reason=process-kill-error"
+            job_attached = windows_job_for(process) is not None
+            if job_attached:
+                cleanup = terminate_windows_job(
+                    process,
+                    deadline=cleanup_deadline,
+                    stage="preflight-forced",
                 )
+                if cleanup.process_tree_proven:
+                    return TreeCleanup(True, (), "; ".join(cleanup.diagnostics) or None)
+                termination_errors.extend(cleanup.diagnostics)
+            else:
+                termination_errors.append(
+                    "stage=preflight-forced windows-job missing; "
+                    "EVIDENCE_INCOMPLETE=1 reason=job-containment-missing"
+                )
+            if not job_attached:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                except OSError as error:
+                    termination_errors.append(
+                        f"preflight forced leader kill error={type(error).__name__}; "
+                        "EVIDENCE_INCOMPLETE=1 reason=process-kill-error"
+                    )
         else:
             if leader_running:
                 try:
@@ -688,23 +736,22 @@ def _terminate_tree(
             ),
         )
     if os.name == "nt":
-        # Ask taskkill for recursive tree cleanup while the leader still gives
-        # Windows a stable root PID. Its complete diagnostics stay visible.
-        try:
-            remaining = _remaining_until(cleanup_deadline)
-            if remaining > 0:
-                subprocess.run(
-                    ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
-                    check=False,
-                    timeout=remaining,
-                )
-            else:
-                process.kill()
-        except (OSError, subprocess.TimeoutExpired):
+        if windows_job_for(process) is not None:
+            cleanup = terminate_windows_job(
+                process,
+                deadline=cleanup_deadline,
+                stage="preflight",
+            )
+            if cleanup.process_tree_proven:
+                return TreeCleanup(True, (), "; ".join(cleanup.diagnostics) or None)
+            termination_errors.extend(cleanup.diagnostics)
+        else:
+            termination_errors.append(
+                "stage=preflight windows-job missing; "
+                "EVIDENCE_INCOMPLETE=1 reason=job-containment-missing"
+            )
             try:
                 process.kill()
-            except ProcessLookupError:
-                pass
             except OSError as error:
                 termination_errors.append(
                     f"preflight forced leader kill error={type(error).__name__}; "
@@ -740,15 +787,16 @@ def _terminate_tree(
             "; ".join(termination_errors) if termination_errors else None,
         )
     if os.name == "nt":
-        try:
-            process.kill()
-        except ProcessLookupError:
-            pass
-        except OSError as error:
-            termination_errors.append(
-                f"preflight forced leader kill error={type(error).__name__}; "
-                "EVIDENCE_INCOMPLETE=1 reason=process-kill-error"
-            )
+        if windows_job_for(process) is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            except OSError as error:
+                termination_errors.append(
+                    f"preflight forced leader kill error={type(error).__name__}; "
+                    "EVIDENCE_INCOMPLETE=1 reason=process-kill-error"
+                )
     else:
         if process.poll() is None:
             try:
@@ -833,6 +881,7 @@ def _finalize_process(
     """
 
     diagnostics: list[str] = []
+    fatal = False
     try:
         # Always make a bounded wait attempt, including when the absolute
         # deadline has already elapsed.  The old ``poll() is None`` branch
@@ -852,21 +901,25 @@ def _finalize_process(
                     f"{description} leader reap timed out; "
                     "EVIDENCE_INCOMPLETE=1 reason=process-reap-timeout"
                 )
+                fatal = True
             except (OSError, ValueError) as error:
                 diagnostics.append(
                     f"{description} leader reap error={type(error).__name__}; "
                     "EVIDENCE_INCOMPLETE=1 reason=process-reap-error"
                 )
+                fatal = True
         except (OSError, ValueError) as error:
             diagnostics.append(
                 f"{description} leader reap error={type(error).__name__}; "
                 "EVIDENCE_INCOMPLETE=1 reason=process-reap-error"
             )
+            fatal = True
     except (OSError, ValueError) as error:
         diagnostics.append(
             f"{description} leader finalization error={type(error).__name__}; "
             "EVIDENCE_INCOMPLETE=1 reason=process-reap-error"
         )
+        fatal = True
 
     for stream_name in ("stdout", "stderr"):
         stream = getattr(process, stream_name, None)
@@ -879,7 +932,15 @@ def _finalize_process(
                 f"{description} {stream_name} pipe close error={type(error).__name__}; "
                 "EVIDENCE_INCOMPLETE=1 reason=output-close-error"
             )
-    return tuple(diagnostics)
+            fatal = True
+    close_diagnostics = close_windows_job(
+        process,
+        stage=description,
+        deadline=deadline,
+    )
+    diagnostics.extend(close_diagnostics)
+    fatal = fatal or bool(close_diagnostics)
+    return WindowsJobCloseDiagnostics(diagnostics, failed=fatal)
 
 
 def _communicate_with_tree(
@@ -939,14 +1000,36 @@ def run_bounded_preflight(
     cleanup_reserve = _preflight_cleanup_reserve(timeout_seconds)
     evidence_root = _evidence_directory(evidence_directory)
     try:
-        process = subprocess.Popen(
+        process = popen_with_windows_job(
+            subprocess.Popen,
             list(command),
             stdin=None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=os.name != "nt",
             creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
+            stage="source-preflight",
+            deadline=deadline,
         )
+    except WindowsJobError as error:
+        setup_result = PreflightResult(
+            tuple(command),
+            -1,
+            error.stdout,
+            error.stderr,
+            evidence_directory=evidence_root,
+            evidence_complete=False,
+            process_tree_proven=False,
+            cleanup_errors=(str(error),),
+            elapsed_seconds=time.monotonic() - started_at,
+        )
+        try:
+            _emit_result(setup_result, evidence_root, evidence_stem)
+        except SourceCheckoutError as retention_error:
+            raise SourceCheckoutError(
+                f"{error}; setup-output-retention-failed: {retention_error}"
+            ) from error
+        raise SourceCheckoutError(str(error)) from error
     except OSError as error:
         raise SourceCheckoutError("could not launch preflight command") from error
     timed_out = False

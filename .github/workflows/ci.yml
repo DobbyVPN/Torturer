@@ -22,3 +22,17 @@ jobs:
 
       - name: Compile Python sources
         run: python3 -m compileall torturer_checks torturer_contract tests
+
+  windows-job-containment:
+    name: Windows Job Object containment integration
+    runs-on: windows-2022
+    timeout-minutes: 5
+    steps:
+      - name: Check out Torturer
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
+
+      - name: Run native containment integration tests
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "."
+          python -m unittest -v tests.test_windows_job_integration

@@ -31,6 +31,14 @@ import uuid
 from torturer_contract.functional.capabilities import Capability
 from torturer_contract.functional.engine import CapabilityUnavailable, ScenarioExecutionError
 from torturer_contract.functional.scenarios import ScenarioStep
+from torturer_checks.windows_job import (
+    WindowsJobError,
+    close_for as close_windows_job,
+    job_for as windows_job_for,
+    popen_with_windows_job,
+    terminate_and_prove_empty as terminate_windows_job,
+    wait_for_empty as wait_for_windows_job,
+)
 
 
 _MIN_ENDURANCE_SAMPLE_SECONDS = 5.0
@@ -114,6 +122,11 @@ def _ensure_owner_only_directory(path: Path) -> None:
 
     if not path.is_absolute():
         raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
+    # Windows mode bits are not an ACL boundary.  The Windows workflows
+    # provision and verify the private directory ACL before invoking Python;
+    # this helper still performs the symlink/type/ownership checks that are
+    # meaningful here, while POSIX retains strict mode-bit enforcement.
+    posix_permissions = os.name != "nt"
     missing: list[Path] = []
     cursor = path
     while True:
@@ -145,7 +158,7 @@ def _ensure_owner_only_directory(path: Path) -> None:
             raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
         if current_uid is not None and info.st_uid != current_uid:
             raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
-        if stat.S_IMODE(info.st_mode) & 0o077:
+        if posix_permissions and stat.S_IMODE(info.st_mode) & 0o077:
             raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
         os.chmod(directory, 0o700)
 
@@ -158,7 +171,7 @@ def _ensure_owner_only_directory(path: Path) -> None:
         path.is_symlink()
         or not stat.S_ISDIR(info.st_mode)
         or current_uid is not None and info.st_uid != current_uid
-        or stat.S_IMODE(info.st_mode) & 0o077
+        or posix_permissions and stat.S_IMODE(info.st_mode) & 0o077
     ):
         raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
     if path.parent.is_symlink() or not stat.S_ISDIR(parent_info.st_mode):
@@ -167,7 +180,7 @@ def _ensure_owner_only_directory(path: Path) -> None:
     parent_is_sticky = bool(parent_mode & stat.S_ISVTX)
     if current_uid is not None and parent_info.st_uid != current_uid and not parent_is_sticky:
         raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
-    if parent_mode & 0o077 and not parent_is_sticky:
+    if posix_permissions and parent_mode & 0o077 and not parent_is_sticky:
         raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
     os.chmod(path, 0o700)
 
@@ -246,16 +259,62 @@ class SubprocessRunner:
             )
             raise
         process: subprocess.Popen[bytes] | None = None
+        job_closed = False
+        job_close_failed = False
+
+        def close_job(stage: str) -> bytes:
+            """Close the retained Windows Job through its shared retry helper."""
+
+            nonlocal job_closed, job_close_failed
+            if job_closed or process is None or os.name != "nt":
+                return b""
+            # The shared helper performs both same-deadline attempts, retains
+            # every attempt diagnostic, and leaves the attachment live when
+            # both attempts fail.  This caller only decides whether that
+            # shared result is fatal for the hosted command.
+            if windows_job_for(process) is None:
+                job_close_failed = True
+                return (
+                    b"WINDOWS_JOB_CLOSE_DIAGNOSTIC="
+                    + b"stage="
+                    + stage.encode("utf-8", errors="replace")
+                    + b" api=CloseHandle winerror=6 detail=job-missing-before-close\n"
+                )
+            close_diagnostics = close_windows_job(
+                process,
+                stage=stage,
+                deadline=deadline,
+            )
+            diagnostics = list(close_diagnostics)
+            if windows_job_for(process) is None:
+                job_closed = True
+            else:
+                job_close_failed = True
+                diagnostics.append(
+                    f"stage={stage} api=CloseHandle winerror=6 detail=job-still-attached"
+                )
+            return b"".join(
+                (
+                    b"WINDOWS_JOB_CLOSE_DIAGNOSTIC="
+                    + str(item).encode("utf-8", errors="replace")
+                    + b"\n"
+                )
+                for item in diagnostics
+            )
+
         try:
             popen_kwargs: dict[str, object] = _process_group_kwargs()
             if status_writer is not None:
                 popen_kwargs["pass_fds"] = (status_writer,)
             try:
-                process = subprocess.Popen(
+                process = popen_with_windows_job(
+                    subprocess.Popen,
                     list(launch_argv),
                     stdin=subprocess.PIPE if input_bytes is not None else None,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
+                    stage="hosted-cli-command",
+                    deadline=deadline,
                     **popen_kwargs,
                 )
             finally:
@@ -304,6 +363,7 @@ class SubprocessRunner:
             status_reader = None
             tree_diagnostics += subreaper_diagnostics
             tree_diagnostics += snapshot_provider.diagnostics
+            tree_diagnostics += close_job("hosted-cli-command")
             result = CommandResult(argv, process.returncode, stdout, stderr)
             self._retain(result, time.monotonic() - started, tree_diagnostics)
             if time.monotonic() > deadline:
@@ -311,9 +371,33 @@ class SubprocessRunner:
                 raise HostedAdapterError("COMMAND_DEADLINE_EXCEEDED")
             if tree_status != "gone":
                 raise HostedAdapterError("PROCESS_TREE_UNPROVEN")
+            if job_close_failed:
+                raise HostedAdapterError("PROCESS_TREE_UNPROVEN")
             if launch_argv != argv and subreaper_failure is not None:
                 raise HostedAdapterError(subreaper_failure)
             return result
+        except WindowsJobError as error:
+            # A native containment setup failure is already bounded and the
+            # launcher has reaped/closed its process.  Preserve every byte
+            # collected from the setup-failure pipes in the same owner-only
+            # command evidence record as ordinary execution, while exposing
+            # only the stage-scoped numeric diagnostics to callers.
+            setup_diagnostics = (
+                b"WINDOWS_JOB_SETUP_ERROR="
+                + str(error).encode("utf-8", errors="replace")
+                + b"\nEVIDENCE_INCOMPLETE=1 reason=windows-job-setup\n"
+            )
+            self._retain(
+                CommandResult(
+                    argv,
+                    -1,
+                    error.stdout,
+                    error.stderr,
+                ),
+                time.monotonic() - started,
+                setup_diagnostics,
+            )
+            raise HostedAdapterError("PROCESS_CONTAINMENT_UNAVAILABLE") from error
         except subprocess.TimeoutExpired as error:
             partial_stdout = _output_bytes(error.stdout)
             partial_stderr = _output_bytes(error.stderr)
@@ -517,6 +601,7 @@ class SubprocessRunner:
             )
             status_reader = None
             kill_diagnostics += subreaper_diagnostics
+            kill_diagnostics += close_job("hosted-cli-command-timeout")
             stdout = _merge_output(partial_stdout, recovered_stdout)
             stderr = _merge_output(partial_stderr, recovered_stderr)
             result = CommandResult(argv, 124, stdout, stderr, timed_out=True)
@@ -584,6 +669,7 @@ class SubprocessRunner:
                 )
                 status_reader = None
                 diagnostics.extend(subreaper_diagnostics)
+                diagnostics.extend(close_job("hosted-cli-command-output-error"))
                 self._retain(
                     CommandResult(
                         argv,
@@ -598,8 +684,6 @@ class SubprocessRunner:
         finally:
             _close_descriptor(status_reader)
             _close_descriptor(status_writer)
-        self._retain(result, time.monotonic() - started, b"PROCESS_TREE_STATUS=gone\n")
-        return result
 
     def run_with_input(
         self,
@@ -895,22 +979,37 @@ class SubprocessRunner:
                 )
             except FileExistsError:
                 continue
-            os.fchmod(descriptor, 0o600)
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            else:
+                # Native Windows relies on the ACL-hardened parent prepared
+                # by the workflow; chmod is only a best-effort mode hint.
+                os.chmod(path, 0o600)
             return path, descriptor
         raise HostedAdapterError("EVIDENCE_UNAVAILABLE")
 
 
 def _evidence_metadata(path: Path) -> tuple[int, str]:
-    """Hash one retained raw file after validating its private inode."""
+    """Hash one retained raw file after validating its private inode.
 
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    Windows ``os.fsync`` maps to ``_commit``/``FlushFileBuffers`` and rejects
+    a descriptor opened read-only (``OSError(9, ...)``).  The retained file is
+    already complete and is never modified here, but Windows still requires a
+    write-capable handle to prove the flush.  Use that access mode only on
+    Windows; POSIX keeps the least-privileged read-only descriptor.  Any
+    actual flush failure remains fatal so metadata cannot certify undurable
+    evidence.
+    """
+
+    access_flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+    flags = access_flags | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
     try:
         info = os.fstat(descriptor)
         current_uid = _current_uid()
         if (
             not stat.S_ISREG(info.st_mode)
-            or stat.S_IMODE(info.st_mode) & 0o077
+            or os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o077
             or current_uid is not None and info.st_uid != current_uid
         ):
             raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
@@ -1829,6 +1928,28 @@ def _merge_process_identities(
     return tuple(merged.values())
 
 
+def _windows_job_diagnostics(cleanup: object, phase: str) -> bytes:
+    """Render native Job Object observations as safe private diagnostics."""
+
+    active = getattr(cleanup, "active_processes", None)
+    diagnostics = bytearray(
+        b"WINDOWS_JOB_"
+        + phase.upper().encode("ascii")
+        + b"_ACTIVE_PROCESSES="
+        + (str(active).encode("ascii") if active is not None else b"unknown")
+        + b"\n"
+    )
+    for item in getattr(cleanup, "diagnostics", ()):
+        diagnostics.extend(
+            b"WINDOWS_JOB_"
+            + phase.upper().encode("ascii")
+            + b"_DIAGNOSTIC="
+            + str(item).encode("utf-8", errors="replace")
+            + b"\n"
+        )
+    return bytes(diagnostics)
+
+
 def _finish_process_tree(
     process: subprocess.Popen[bytes],
     observed: tuple[_ProcessIdentity, ...],
@@ -1860,10 +1981,31 @@ def _finish_process_tree(
         + b",".join(str(identity.pid).encode("ascii") for identity in identities)
         + b"\n"
     )
-    initial_status = (
-        _tree_status(process.pid, identities, snapshot_provider, deadline=deadline)
-        if monitor_complete else "unknown"
-    )
+    job = windows_job_for(process)
+    if job is not None:
+        initial_cleanup = wait_for_windows_job(process, deadline=deadline)
+        diagnostics.extend(_windows_job_diagnostics(initial_cleanup, "initial"))
+        initial_status = (
+            "gone"
+            if initial_cleanup.process_tree_proven
+            else "alive"
+            if initial_cleanup.active_processes not in (None, 0)
+            else "unknown"
+        )
+    else:
+        if os.name == "nt":
+            # Ordinary Windows commands are valid only when launched through
+            # the native Job Object wrapper. A complete PID census cannot
+            # substitute for that boundary or prove descendants were safe.
+            diagnostics.extend(
+                b"WINDOWS_JOB_CONTAINMENT_MISSING=1 detail=normal-completion\n"
+            )
+            initial_status = "unknown"
+        else:
+            initial_status = (
+                _tree_status(process.pid, identities, snapshot_provider, deadline=deadline)
+                if monitor_complete else "unknown"
+            )
     status = initial_status
     if status != "gone":
         diagnostics.extend(
@@ -1877,16 +2019,27 @@ def _finish_process_tree(
         )
         if snapshot_provider is not None:
             snapshot_provider.invalidate(deadline=deadline)
-        status = _tree_status(
-            process.pid,
-            identities,
-            snapshot_provider,
-            deadline=deadline,
-            allow_direct_fallback=True,
-            census_complete=getattr(
-                process, "_torturer_tree_census_observed", False
-            ),
-        )
+        if job is not None:
+            final_cleanup = wait_for_windows_job(process, deadline=deadline)
+            diagnostics.extend(_windows_job_diagnostics(final_cleanup, "final"))
+            status = (
+                "gone"
+                if final_cleanup.process_tree_proven
+                else "alive"
+                if final_cleanup.active_processes not in (None, 0)
+                else "unknown"
+            )
+        else:
+            status = _tree_status(
+                process.pid,
+                identities,
+                snapshot_provider,
+                deadline=deadline,
+                allow_direct_fallback=True,
+                census_complete=getattr(
+                    process, "_torturer_tree_census_observed", False
+                ),
+            )
     if status == "gone":
         diagnostics.extend(b"PROCESS_TREE_STATUS=gone\n")
     else:
@@ -2387,91 +2540,54 @@ def _kill_process_tree(
         + b"\n"
     )
     if os.name == "nt":
-        taskkill_timed_out = False
-        try:
-            returncode, stdout, stderr, taskkill_timed_out = _bounded_capture(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+        if windows_job_for(process) is not None:
+            cleanup = terminate_windows_job(
+                process,
                 deadline=deadline,
+                stage="hosted-cli-process-tree",
             )
-            diagnostics.extend(b"taskkill-stdout=" + stdout + b"\n")
-            diagnostics.extend(b"taskkill-stderr=" + stderr + b"\n")
-            if taskkill_timed_out:
-                diagnostics.extend(b"TASKKILL_TIMEOUT=1\n")
-                diagnostics.extend(b"EVIDENCE_INCOMPLETE=1 reason=taskkill-timeout\n")
-            if returncode != 0:
-                diagnostics.extend(
-                    b"TASKKILL_RETURN_CODE="
-                    + str(returncode).encode("ascii")
-                    + b"\n"
-                )
-                diagnostics.extend(_kill_process(process))
+            diagnostics.extend(_windows_job_diagnostics(cleanup, "terminate"))
+            final_cleanup = cleanup
+            if not cleanup.process_tree_proven:
+                final_cleanup = wait_for_windows_job(process, deadline=deadline)
+                diagnostics.extend(_windows_job_diagnostics(final_cleanup, "post-terminate"))
+            if final_cleanup.process_tree_proven:
+                diagnostics.extend(b"PROCESS_TREE_STATUS=gone\n")
+            else:
+                diagnostics.extend(b"PROCESS_TREE_KILL_FAILURE=1\n")
+                diagnostics.extend(b"PROCESS_TREE_SURVIVORS=1\n")
+                diagnostics.extend(b"EVIDENCE_INCOMPLETE=1 reason=process-tree\n")
+            return bytes(diagnostics)
+        # A Windows process without the Job Object created by
+        # ``popen_with_windows_job`` is outside the ordinary containment
+        # contract.  ``taskkill /T`` is PID-based and racy: it can miss a
+        # detached descendant or hit a recycled PID, so neither its return
+        # code nor a later census can prove that the command's complete tree
+        # disappeared.  Kill only the known leader as a bounded best effort,
+        # then fail closed with an explicit unproven marker.  The intentional
+        # detached service-controller path still owns its launcher lifecycle;
+        # it must not be mistaken for an ordinary contained command.
+        diagnostics.extend(
+            b"WINDOWS_JOB_CONTAINMENT_MISSING=1 detail=leader-only-cleanup\n"
+        )
+        diagnostics.extend(_kill_process(process))
+        try:
+            remaining = max(0.0, deadline - time.monotonic())
+            process.wait(timeout=remaining)
+            diagnostics.extend(b"PROCESS_LEADER_STATUS=gone\n")
+        except subprocess.TimeoutExpired:
+            diagnostics.extend(
+                b"PROCESS_LEADER_STATUS=unknown winerror=1460\n"
+            )
         except OSError as error:
             diagnostics.extend(
-                b"taskkill-error="
+                b"PROCESS_LEADER_WAIT_ERROR="
                 + repr(error).encode("utf-8", errors="replace")
-                + b"\nEVIDENCE_INCOMPLETE=1 reason=taskkill-error\n"
+                + b"\nEVIDENCE_INCOMPLETE=1 reason=process-leader-wait\n"
             )
-            diagnostics.extend(_kill_process(process))
-        status = _wait_tree_gone(
-            process.pid,
-            identities,
-            deadline,
-            snapshot_provider,
-            allow_direct_fallback=True,
-            census_complete=census_complete,
-            process=process,
-        )
-        if status != "gone":
-            # A detached child is no longer reachable through the leader's
-            # /T traversal.  Kill each identity captured while the leader was
-            # alive, with the same hard cleanup deadline, and verify again.
-            for identity in identities:
-                if time.monotonic() >= deadline:
-                    break
-                if _identity_live(identity, snapshot_provider, deadline=deadline) is not True:
-                    continue
-                try:
-                    code, stdout, stderr, timed_out = _bounded_capture(
-                        ["taskkill", "/PID", str(identity.pid), "/T", "/F"],
-                        deadline=deadline,
-                    )
-                    diagnostics.extend(
-                        b"taskkill-descendant-stdout=" + stdout + b"\n"
-                    )
-                    diagnostics.extend(
-                        b"taskkill-descendant-stderr=" + stderr + b"\n"
-                    )
-                    if timed_out:
-                        diagnostics.extend(b"TASKKILL_DESCENDANT_TIMEOUT=1\n")
-                        diagnostics.extend(
-                            b"EVIDENCE_INCOMPLETE=1 reason=taskkill-timeout\n"
-                        )
-                    if code not in (0, None):
-                        diagnostics.extend(
-                            b"TASKKILL_DESCENDANT_RETURN_CODE="
-                            + str(code).encode("ascii")
-                            + b"\n"
-                        )
-                except OSError as error:
-                    diagnostics.extend(
-                        b"taskkill-descendant-error="
-                        + repr(error).encode("utf-8", errors="replace")
-                        + b"\nEVIDENCE_INCOMPLETE=1 reason=taskkill-descendant-error\n"
-                    )
-            status = _wait_tree_gone(
-                process.pid,
-                identities,
-                deadline,
-                snapshot_provider,
-                allow_direct_fallback=True,
-                census_complete=census_complete,
-                process=process,
-            )
-        if status != "gone":
-            diagnostics.extend(b"PROCESS_TREE_KILL_FAILURE=1\n")
-            diagnostics.extend(b"PROCESS_TREE_SURVIVORS=1\n")
-        else:
-            diagnostics.extend(b"PROCESS_TREE_STATUS=gone\n")
+        diagnostics.extend(b"PROCESS_TREE_UNPROVEN=1\n")
+        diagnostics.extend(b"PROCESS_TREE_STATUS=unknown\n")
+        diagnostics.extend(b"EVIDENCE_INCOMPLETE=1 reason=windows-job-missing\n")
         return bytes(diagnostics)
     if force_immediately:
         diagnostics.extend(
@@ -2582,15 +2698,17 @@ def _kill_process_tree(
 def _allocate_owner_only_path(directory: Path, stem: str, suffix: str) -> Path:
     """Reserve a private path with O_EXCL; never reuse an old evidence file."""
 
+    posix_permissions = os.name != "nt"
     try:
         info = directory.lstat()
     except OSError as error:
         raise HostedAdapterError("EVIDENCE_PATH_UNSAFE") from error
     if (
-        directory.is_symlink()
+        not directory.is_absolute()
+        or directory.is_symlink()
         or not stat.S_ISDIR(info.st_mode)
         or _current_uid() is not None and info.st_uid != _current_uid()
-        or stat.S_IMODE(info.st_mode) & 0o077
+        or posix_permissions and stat.S_IMODE(info.st_mode) & 0o077
     ):
         raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
     for candidate in (
@@ -2605,8 +2723,19 @@ def _allocate_owner_only_path(directory: Path, stem: str, suffix: str) -> Path:
             )
         except FileExistsError:
             continue
-        os.fchmod(descriptor, 0o600)
-        os.close(descriptor)
+        try:
+            if posix_permissions:
+                fchmod = getattr(os, "fchmod", None)
+                if fchmod is not None:
+                    fchmod(descriptor, 0o600)
+                else:
+                    os.chmod(candidate, 0o600)
+            # Windows workflows establish and verify the ACL boundary on the
+            # parent directory.  POSIX chmod operations are neither a Windows
+            # security boundary nor a useful best-effort diagnostic, so do
+            # not invoke or silently suppress them here.
+        finally:
+            os.close(descriptor)
         return candidate
     raise HostedAdapterError("EVIDENCE_UNAVAILABLE")
 

@@ -140,7 +140,7 @@ jobs:
           # Git Bash mode bits are not an ACL boundary on Windows.  Remove
           # inherited access and grant the current runner SID only; resolve
           # the SID directly so no account-name lookup can block the step.
-          powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; foreach ($path in $args) { $item=Get-Item -LiteralPath $path -Force -ErrorAction Stop; if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw "private path is a reparse point" }; $acl=Get-Acl -LiteralPath $path; $acl.SetAccessRuleProtection($true,$false); $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,"FullControl","ContainerInherit,ObjectInherit","None","Allow"); $acl.SetAccessRule($rule); Set-Acl -LiteralPath $path -AclObject $acl; $verified=Get-Acl -LiteralPath $path; if (-not ($verified.Access | Where-Object { $_.IdentityReference.Value -eq $sid -and $_.AccessControlType -eq "Allow" -and (($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -eq [System.Security.AccessControl.FileSystemRights]::FullControl) })) { throw "private ACL verification failed" }; Write-Output ("private_acl_path=" + $path + " sid=" + $sid) }' \
+          powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $verifiedCount=0; foreach ($path in $args) { $item=Get-Item -LiteralPath $path -Force -ErrorAction Stop; if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw "private path is a reparse point" }; $acl=Get-Acl -LiteralPath $path; $acl.SetAccessRuleProtection($true,$false); $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,"FullControl","ContainerInherit,ObjectInherit","None","Allow"); $acl.SetAccessRule($rule); Set-Acl -LiteralPath $path -AclObject $acl; $verified=Get-Acl -LiteralPath $path; if (-not ($verified.Access | Where-Object { $_.IdentityReference.Value -eq $sid -and $_.AccessControlType -eq "Allow" -and (($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -eq [System.Security.AccessControl.FileSystemRights]::FullControl) })) { throw "private ACL verification failed" }; $verifiedCount++ }; Write-Output ("private_acl_verified_count=" + $verifiedCount)' \
             "$(cygpath -w "$private_root" | tr -d '\r')" \
             "$(cygpath -w "$handoff" | tr -d '\r')" \
             "$(cygpath -w "$service" | tr -d '\r')"
@@ -308,26 +308,11 @@ jobs:
             label="$1"
             file="$2"
             if [ -f "$file" ]; then
-              display="$(python - "$file" <<'PY'
-          import re
-          import sys
-          from pathlib import Path
-
-          value = Path(sys.argv[1]).read_bytes().decode("utf-8", "replace")
-          value = value.replace("\x00", " ")
-          # This is an additive, public-safe diagnostic view.  The original
-          # stderr remains private on the runner and is represented by the
-          # evidence byte count and digest above.
-          value = re.sub(r"(?i)(?:[A-Za-z]:\\|\\\\)[^\r\n]*", "<path>", value)
-          value = re.sub(r"(?i)\bS-\d-\d+(?:-\d+)+\b", "<sid>", value)
-          value = re.sub(r"(?i)\b(?:[A-Za-z0-9_.-]+\\)?(?:runner|administrator)[A-Za-z0-9_.-]*\b", "<user>", value)
-          value = re.sub(r"\b\d{2,}\b", "<number>", value)
-          lines = [" ".join(line.split()) for line in value.splitlines()]
-          lines = [line for line in lines if line]
-          print(" | ".join(lines)[:1000])
-          PY
-              )"
-              printf 'diagnostic_display label=%s text=%s\n' "$label" "$display"
+              # Candidate-controlled text cannot be made public-safe with a
+              # best-effort regex.  Keep every byte in the runner-private
+              # source file; the adjacent evidence and classification records
+              # expose only its size, digest, and a fixed reason code.
+              printf 'diagnostic_display label=%s state=retained-runner-private\n' "$label"
             else
               printf 'diagnostic_display label=%s state=missing\n' "$label"
             fi
@@ -726,111 +711,70 @@ jobs:
               printf 'diagnostic_classification label=%s code=MISSING\n' "$label"
             fi
           }
-          # No candidate process may remain while the Render handoff uses the GitHub credential.
-          # Never trust a bare PID: verify the PID plus creation identity and
-          # executable path immediately before sending any termination signal.
+          # The trusted controller owns exact identity and tree finalization.
+          # This workflow only supplies its launch contract; it never walks or
+          # recursively signals a PID-derived process tree in YAML.
           service_identity_file="${PREFLIGHT_SERVICE_IDENTITY_FILE:-$HANDOFF_DIR/preflight-service.identity}"
-          service_pid_file="${PREFLIGHT_SERVICE_PID_FILE:-$HANDOFF_DIR/preflight-service.pid}"
           service_binary="${PREFLIGHT_SERVICE_BINARY:-}"
-          launch_started_epoch="${PREFLIGHT_SERVICE_LAUNCH_STARTED_EPOCH:-}"
-          cleanup_deadline_epoch=$((RUN_DEADLINE_EPOCH - 60))
+          controller_raw="$SERVICE_DIR/preflight-controller-raw"
+          controller_log="$SERVICE_DIR/preflight-controller-finalizer.raw.log"
+          fallback_log="$SERVICE_DIR/preflight-controller-fallback.raw.log"
+          mkdir -p "$controller_raw"
+          chmod 700 "$controller_raw"
           service_identity=""
           if [ -f "$service_identity_file" ]; then service_identity="$(tr -d '\r\n' < "$service_identity_file")"; fi
-          # The native identity sidecar is authoritative.  A controller may
-          # have committed a replacement identity immediately before a PID-file
-          # write failed; never discard that identity or rediscover a broader
-          # same-binary candidate merely because the PID file is stale.
-          if ! [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\|[1-9][0-9]+$ ]] && [ -n "$service_binary" ]; then
-            if ! [[ "$launch_started_epoch" =~ ^[0-9]+$ ]]; then
-              printf 'preflight cleanup cannot perform exact candidate discovery without launch identity\n' >&2
-              exit 1
-            fi
-            discovery_log="$SERVICE_DIR/preflight-cleanup-discovery.raw.log"
-            : > "$discovery_log"
-            chmod 600 "$discovery_log"
-            service_binary_windows="$(cygpath -w "$service_binary" | tr -d '\r')"
-            discovery_status=0
-            discovery_remaining=$((cleanup_deadline_epoch - $(date +%s) - 1))
-            if [ "$discovery_remaining" -le 0 ]; then
-              printf 'preflight cleanup discovery reached cleanup deadline: remaining=%s\n' "$discovery_remaining" >> "$discovery_log"
-              discovery_status=124
-            else
-              discovery_timeout=10
-              if [ "$discovery_timeout" -gt "$discovery_remaining" ]; then discovery_timeout="$discovery_remaining"; fi
-              timeout --foreground --signal=TERM --kill-after=1s "${discovery_timeout}s" \
-                powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; $expected=[System.IO.Path]::GetFullPath($args[0]); $identityPath=$args[1]; $launchEpoch=[DateTimeOffset]::FromUnixTimeSeconds([int64]$args[2]).UtcDateTime.AddSeconds(-2); $matches=@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { if ([string]::IsNullOrWhiteSpace($_.ExecutablePath) -or $null -eq $_.CreationDate) { return $false }; $actual=[System.IO.Path]::GetFullPath([string]$_.ExecutablePath); $actual -ieq $expected -and $_.CreationDate.ToUniversalTime() -ge $launchEpoch }); if ($matches.Count -eq 0) { Write-Output "cleanup_discovery=none"; exit 2 }; if ($matches.Count -ne 1) { Write-Output ("cleanup_discovery=ambiguous count=" + $matches.Count); exit 3 }; $p=$matches[0]; $ticks=$p.CreationDate.ToUniversalTime().Ticks; [System.IO.File]::WriteAllText($identityPath, ([string]$p.ProcessId + "|" + [string]$ticks), [System.Text.Encoding]::ASCII); Write-Output ("cleanup_discovery=selected " + $p.ProcessId + "|" + $ticks)' \
-              "$service_binary_windows" "$(cygpath -w "$service_identity_file" | tr -d '\r')" "$launch_started_epoch" > "$discovery_log" 2>&1 || discovery_status=$?
-            fi
-            emit_private_evidence preflight-cleanup-discovery "$discovery_log"
-            if [ "$discovery_status" -eq 0 ] && [ -f "$service_identity_file" ]; then service_identity="$(tr -d '\r\n' < "$service_identity_file")"; fi
-          fi
-          if ! [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\|[1-9][0-9]+$ ]]; then
-            if [ "${discovery_status:-1}" -eq 2 ]; then
-              printf 'preflight_service_stop_verified=true state=not-started\n'
-              exit 0
-            fi
-            if [ -z "$service_binary" ]; then
-              printf 'preflight_service_stop_verified=true state=not-started\n'
-              exit 0
-            fi
+          if ! [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\|[1-9][0-9]+$ ]] || [ -z "$service_binary" ]; then
             emit_private_evidence preflight-service-identity "$service_identity_file"
             printf 'preflight_service_cleanup=failed code=IDENTITY_UNAVAILABLE\n' >&2
             exit 1
           fi
           service_pid="${service_identity%%|*}"
           service_binary_windows="$(cygpath -w "$service_binary" | tr -d '\r')"
-          verify_script=' $ErrorActionPreference="Stop"; $parts=$args[0] -split "\\|",2; $expected=[System.IO.Path]::GetFullPath($args[1]); $p=Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f ([int]$parts[0])) -ErrorAction Stop; if ($null -eq $p) { Write-Output "service_state=gone"; exit 2 }; $actual=[System.IO.Path]::GetFullPath([string]$p.ExecutablePath); $ticks=$p.CreationDate.ToUniversalTime().Ticks; if ($actual -ine $expected) { Write-Output ("service_state=path-mismatch actual=" + $actual); exit 3 }; if ([string]$parts[1] -ne [string]$ticks) { Write-Output ("service_state=identity-mismatch actual=" + $p.ProcessId + "|" + $ticks); exit 4 }; Write-Output ("service_state=running identity=" + $parts[0] + "|" + $ticks); exit 0'
-          running=false
-          cleanup_probe_log="$SERVICE_DIR/preflight-cleanup-probe-initial.raw.log"
-          cleanup_probe_status=0
-          remaining=$((cleanup_deadline_epoch - $(date +%s)))
-          probe_timeout=10
-          if [ "$probe_timeout" -gt "$remaining" ]; then probe_timeout="$remaining"; fi
-          if [ "$probe_timeout" -le 0 ]; then printf 'preflight_service_cleanup=failed code=CLEANUP_DEADLINE\n' >&2; exit 1; fi
-          timeout --foreground --signal=TERM --kill-after=1s "${probe_timeout}s" \
-            powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$verify_script" "$service_identity" "$service_binary_windows" > "$cleanup_probe_log" 2>&1 || cleanup_probe_status=$?
-          emit_private_evidence preflight-cleanup-probe "$cleanup_probe_log"
-          case "$cleanup_probe_status" in
-            0) running=true;;
-            2) running=false;;
-            *) printf 'preflight_service_cleanup=failed code=IDENTITY_PROBE status=%s\n' "$cleanup_probe_status" >&2; exit 1;;
-          esac
-          stopped=false
-          if [ "$running" = true ]; then
-            taskkill_log="$SERVICE_DIR/preflight-taskkill.raw.log"
-            taskkill_status=0
-            remaining=$((cleanup_deadline_epoch - $(date +%s)))
-            kill_timeout=30
-            if [ "$kill_timeout" -gt "$remaining" ]; then kill_timeout="$remaining"; fi
-            if [ "$kill_timeout" -le 0 ]; then printf 'preflight_service_cleanup=failed code=CLEANUP_DEADLINE\n' >&2; exit 1; fi
-            timeout --foreground --signal=TERM --kill-after=1s "${kill_timeout}s" \
-              taskkill.exe /PID "$service_pid" /T /F > "$taskkill_log" 2>&1 || taskkill_status=$?
-            emit_private_evidence preflight-taskkill "$taskkill_log"
-            if [ "$taskkill_status" -ne 0 ]; then
-              printf 'preflight_service_cleanup=taskkill status=%s; continuing identity verification\n' "$taskkill_status" >&2
-            fi
-            for attempt in $(seq 1 30); do
-              printf 'preflight_service_stop_attempt=%s\n' "$attempt"
-              remaining=$((cleanup_deadline_epoch - $(date +%s)))
-              if [ "$remaining" -le 0 ]; then break; fi
-              cleanup_probe_log="$SERVICE_DIR/preflight-cleanup-probe-${attempt}.raw.log"
-              cleanup_probe_status=0
-              probe_timeout=10
-              if [ "$probe_timeout" -gt "$remaining" ]; then probe_timeout="$remaining"; fi
-              timeout --foreground --signal=TERM --kill-after=1s "${probe_timeout}s" \
-                powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$verify_script" "$service_identity" "$service_binary_windows" > "$cleanup_probe_log" 2>&1 || cleanup_probe_status=$?
-              emit_private_evidence preflight-cleanup-probe "$cleanup_probe_log"
-              if [ "$cleanup_probe_status" -eq 2 ]; then stopped=true; break; fi
-              if [ "$cleanup_probe_status" -ne 0 ]; then printf 'preflight_service_cleanup=failed code=IDENTITY_PROBE status=%s\n' "$cleanup_probe_status" >&2; exit 1; fi
-              sleep 1
-            done
-          else
-            stopped=true
+          service_identity_file_windows="$(cygpath -w "$service_identity_file" | tr -d '\r')"
+          cleanup_deadline_epoch=$((RUN_DEADLINE_EPOCH - 60))
+          cleanup_remaining=$((cleanup_deadline_epoch - $(date +%s)))
+          controller_timeout=40
+          if [ "$controller_timeout" -gt "$cleanup_remaining" ]; then controller_timeout="$cleanup_remaining"; fi
+          if [ "$controller_timeout" -le 0 ]; then
+            printf 'preflight service cleanup has no bounded budget before workflow deadline\n' >&2
+            exit 1
           fi
-          test "$stopped" = true
-          printf 'preflight_service_stop_verified=true pid=%s\n' "$service_pid"
-          rm -f "$SERVICE_DIR/ProgramData/DobbyVPN/control.token"
-          printf 'preflight_control_state_removed=true\n'
+          controller_status=0
+          timeout --foreground --signal=TERM --kill-after=1s "${controller_timeout}s" \
+            env PYTHONPATH="$GITHUB_WORKSPACE/torturer" python -m torturer_checks.hosted.finalize_windows_service \
+              --service-identity-file "$service_identity_file" \
+              --service-binary "$service_binary" \
+              --raw-log-dir "$controller_raw" \
+              --timeout-seconds "$controller_timeout" > "$controller_log" 2>&1 || controller_status=$?
+          emit_private_evidence preflight-controller-finalizer "$controller_log"
+          while IFS= read -r -d '' evidence_path; do
+            emit_private_evidence preflight-controller-command "$evidence_path"
+          done < <(find "$controller_raw" -type f -print0)
+          if [ "$controller_status" -eq 0 ]; then
+            printf 'preflight_service_stop_verified=true method=torturer-controller tree=proven pid=%s\n' "$service_pid"
+            rm -f "$SERVICE_DIR/ProgramData/DobbyVPN/control.token"
+            printf 'preflight_control_state_removed=true\n'
+            exit 0
+          fi
+
+          # Fallback is deliberately leader-only.  It proves the sidecar
+          # identity adjacent to Stop-Process, records every observation, and
+          # exits nonzero because YAML cannot prove descendants without the
+          # controller's native tree finalizer.
+          fallback_status=0
+          fallback_timeout=5
+          fallback_remaining=$((cleanup_deadline_epoch - $(date +%s)))
+          if [ "$fallback_timeout" -gt "$fallback_remaining" ]; then fallback_timeout="$fallback_remaining"; fi
+          if [ "$fallback_timeout" -le 0 ]; then
+            printf 'preflight fallback has no bounded budget before workflow deadline\n' >&2
+            exit 1
+          fi
+          timeout --foreground --signal=TERM --kill-after=1s "${fallback_timeout}s" \
+            powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; $identity=([System.IO.File]::ReadAllText($args[0])).Trim(); if ($identity -notmatch "^[1-9][0-9]{0,9}\|[1-9][0-9]+$") { Write-Output "fallback_state=identity-invalid"; exit 2 }; $separator=$identity.IndexOf([char]124); $processId=[int]$identity.Substring(0,$separator); $expectedTicks=$identity.Substring($separator+1); $expected=[System.IO.Path]::GetFullPath($args[1]); $p=Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $processId) -ErrorAction Stop; if ($null -eq $p) { Write-Output "fallback_state=leader-absent tree-unproven"; exit 3 }; $actual=[System.IO.Path]::GetFullPath([string]$p.ExecutablePath); $ticks=$p.CreationDate.ToUniversalTime().Ticks; if ($actual -ine $expected) { Write-Output ("fallback_state=path-mismatch actual=" + $actual); exit 4 }; if ($expectedTicks -ne [string]$ticks) { Write-Output ("fallback_state=identity-mismatch actual=" + $p.ProcessId + "|" + $ticks); exit 5 }; Write-Output ("fallback_state=identity-checked pid=" + $processId + "|" + $ticks); Stop-Process -Id $processId -Force -ErrorAction Stop; $after=Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $processId) -ErrorAction Stop; if ($null -ne $after) { Write-Output "fallback_state=leader-survived tree-unproven"; exit 6 }; Write-Output "fallback_state=leader-gone tree-unproven"; exit 7' \
+            "$service_identity_file_windows" "$service_binary_windows" > "$fallback_log" 2>&1 || fallback_status=$?
+          emit_private_evidence preflight-controller-fallback "$fallback_log"
+          printf 'preflight_service_cleanup=failed code=CONTROLLER_FINALIZER status=%s fallback_status=%s\n' "$controller_status" "$fallback_status" >&2
+          exit 1
 
       - name: Upload public certificate and opaque request
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
@@ -1097,22 +1041,10 @@ jobs:
             label="$1"
             file="$2"
             if [ -f "$file" ]; then
-              display="$(python - "$file" <<'PY'
-          import re
-          import sys
-          from pathlib import Path
-
-          value = Path(sys.argv[1]).read_bytes().decode("utf-8", "replace")
-          value = value.replace("\x00", " ")
-          value = re.sub(r"(?i)(?:[A-Za-z]:\\|\\\\)[^\r\n]*", "<path>", value)
-          value = re.sub(r"(?i)\bS-\d-\d+(?:-\d+)+\b", "<sid>", value)
-          value = re.sub(r"(?i)\b(?:[A-Za-z0-9_.-]+\\)?(?:runner|administrator)[A-Za-z0-9_.-]*\b", "<user>", value)
-          value = re.sub(r"\b\d{2,}\b", "<number>", value)
-          lines = [" ".join(line.split()) for line in value.splitlines()]
-          print(" | ".join(line for line in lines if line)[:1000])
-          PY
-              )"
-              printf 'diagnostic_display label=%s text=%s\n' "$label" "$display"
+              # Candidate-controlled text remains complete in its private
+              # runner file.  Only fixed metadata from the adjacent evidence
+              # and classification records is suitable for public logs.
+              printf 'diagnostic_display label=%s state=retained-runner-private\n' "$label"
             else
               printf 'diagnostic_display label=%s state=missing\n' "$label"
             fi
@@ -1356,6 +1288,8 @@ jobs:
         if: always()
         timeout-minutes: 1
         shell: bash
+        env:
+          FUNCTIONAL_OUTCOME: ${{ steps.functional.outcome }}
         run: |
           set -euo pipefail
           umask 077
@@ -1372,101 +1306,83 @@ jobs:
               printf 'diagnostic_evidence label=%s state=missing\n' "$label"
             fi
           }
-          # Never trust a bare PID: verify the PID plus creation identity and
-          # executable path immediately before sending any termination signal.
+          # The trusted controller owns exact identity and tree finalization.
+          # It also owns every replacement through a native Job Object; this
+          # always-run step only supplies the initial launch contract.
           service_identity_file="${SERVICE_IDENTITY_FILE:-$HANDOFF_DIR/service.identity}"
-          service_pid_file="${SERVICE_PID_FILE:-$HANDOFF_DIR/service.pid}"
           service_binary="${SERVICE_BINARY:-}"
-          launch_started_epoch="${SERVICE_LAUNCH_STARTED_EPOCH:-}"
+          controller_raw="$SERVICE_DIR/controller-finalizer-raw"
+          controller_log="$SERVICE_DIR/controller-finalizer.raw.log"
+          fallback_log="$SERVICE_DIR/controller-finalizer-fallback.raw.log"
+          mkdir -p "$controller_raw"
+          chmod 700 "$controller_raw"
           service_identity=""
-          discovery_status=2
           if [ -f "$service_identity_file" ]; then service_identity="$(tr -d '\r\n' < "$service_identity_file")"; fi
-          # The native identity sidecar remains authoritative when the PID file
-          # still names the predecessor after a replacement write failure.
-          if ! [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\|[1-9][0-9]+$ ]] && [ -n "$service_binary" ]; then
-            if ! [[ "$launch_started_epoch" =~ ^[0-9]+$ ]]; then
-              printf 'cleanup cannot perform exact candidate discovery without launch identity\n' >&2
-              exit 1
-            fi
-            discovery_log="$SERVICE_DIR/cleanup-discovery.raw.log"
-            : > "$discovery_log"
-            chmod 600 "$discovery_log"
-            service_binary_windows="$(cygpath -w "$service_binary" | tr -d '\r')"
-            discovery_status=0
-            discovery_remaining=$((RUN_DEADLINE_EPOCH - $(date +%s) - 60 - 1))
-            if [ "$discovery_remaining" -le 0 ]; then
-              printf 'cleanup discovery reached cleanup deadline: remaining=%s\n' "$discovery_remaining" >> "$discovery_log"
-              discovery_status=124
-            else
-              discovery_timeout=10
-              if [ "$discovery_timeout" -gt "$discovery_remaining" ]; then discovery_timeout="$discovery_remaining"; fi
-              timeout --foreground --signal=TERM --kill-after=1s "${discovery_timeout}s" \
-                powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; $expected=[System.IO.Path]::GetFullPath($args[0]); $identityPath=$args[1]; $launchEpoch=[DateTimeOffset]::FromUnixTimeSeconds([int64]$args[2]).UtcDateTime.AddSeconds(-2); $matches=@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { if ([string]::IsNullOrWhiteSpace($_.ExecutablePath) -or $null -eq $_.CreationDate) { return $false }; $actual=[System.IO.Path]::GetFullPath([string]$_.ExecutablePath); $actual -ieq $expected -and $_.CreationDate.ToUniversalTime() -ge $launchEpoch }); if ($matches.Count -eq 0) { Write-Output "cleanup_discovery=none"; exit 2 }; if ($matches.Count -ne 1) { Write-Output ("cleanup_discovery=ambiguous count=" + $matches.Count); exit 3 }; $p=$matches[0]; $ticks=$p.CreationDate.ToUniversalTime().Ticks; [System.IO.File]::WriteAllText($identityPath, ([string]$p.ProcessId + "|" + [string]$ticks), [System.Text.Encoding]::ASCII); Write-Output ("cleanup_discovery=selected " + $p.ProcessId + "|" + $ticks)' \
-              "$service_binary_windows" "$(cygpath -w "$service_identity_file" | tr -d '\r')" "$launch_started_epoch" > "$discovery_log" 2>&1 || discovery_status=$?
-            fi
-            emit_private_evidence cleanup-discovery "$discovery_log"
-            if [ "$discovery_status" -eq 0 ] && [ -f "$service_identity_file" ]; then service_identity="$(tr -d '\r\n' < "$service_identity_file")"; fi
-          fi
-          if ! [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\|[1-9][0-9]+$ ]]; then
-            if [ "${discovery_status:-2}" -eq 2 ]; then
-              printf 'candidate service was not running at cleanup\n'
-              exit 0
-            fi
+          if ! [[ "$service_identity" =~ ^[1-9][0-9]{0,9}\|[1-9][0-9]+$ ]] || [ -z "$service_binary" ]; then
             emit_private_evidence service-identity "$service_identity_file"
             printf 'service_cleanup=failed code=IDENTITY_UNAVAILABLE\n' >&2
             exit 1
           fi
           service_pid="${service_identity%%|*}"
           service_binary_windows="$(cygpath -w "$service_binary" | tr -d '\r')"
+          service_identity_file_windows="$(cygpath -w "$service_identity_file" | tr -d '\r')"
           cleanup_deadline_epoch=$((RUN_DEADLINE_EPOCH - 60))
-          verify_script=' $ErrorActionPreference="Stop"; $parts=$args[0] -split "\\|",2; $expected=[System.IO.Path]::GetFullPath($args[1]); $p=Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f ([int]$parts[0])) -ErrorAction Stop; if ($null -eq $p) { Write-Output "service_state=gone"; exit 2 }; $actual=[System.IO.Path]::GetFullPath([string]$p.ExecutablePath); $ticks=$p.CreationDate.ToUniversalTime().Ticks; if ($actual -ine $expected) { Write-Output ("service_state=path-mismatch actual=" + $actual); exit 3 }; if ([string]$parts[1] -ne [string]$ticks) { Write-Output ("service_state=identity-mismatch actual=" + $p.ProcessId + "|" + $ticks); exit 4 }; Write-Output ("service_state=running identity=" + $parts[0] + "|" + $ticks); exit 0'
-          cleanup_probe_log="$SERVICE_DIR/cleanup-probe-initial.raw.log"
-          cleanup_probe_status=0
-          remaining=$((cleanup_deadline_epoch - $(date +%s)))
-          probe_timeout=10
-          if [ "$probe_timeout" -gt "$remaining" ]; then probe_timeout="$remaining"; fi
-          if [ "$probe_timeout" -le 0 ]; then printf 'service_cleanup=failed code=CLEANUP_DEADLINE\n' >&2; exit 1; fi
-          timeout --foreground --signal=TERM --kill-after=1s "${probe_timeout}s" \
-            powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$verify_script" "$service_identity" "$service_binary_windows" > "$cleanup_probe_log" 2>&1 || cleanup_probe_status=$?
-          emit_private_evidence cleanup-probe "$cleanup_probe_log"
-          case "$cleanup_probe_status" in
-            0) running=true;;
-            2) running=false;;
-            *) printf 'service_cleanup=failed code=IDENTITY_PROBE status=%s\n' "$cleanup_probe_status" >&2; exit 1;;
-          esac
-          stopped=false
-          if [ "$running" = true ]; then
-            taskkill_log="$SERVICE_DIR/taskkill.raw.log"
-            taskkill_status=0
-            remaining=$((cleanup_deadline_epoch - $(date +%s)))
-            kill_timeout=30
-            if [ "$kill_timeout" -gt "$remaining" ]; then kill_timeout="$remaining"; fi
-            if [ "$kill_timeout" -le 0 ]; then printf 'service_cleanup=failed code=CLEANUP_DEADLINE\n' >&2; exit 1; fi
-            timeout --foreground --signal=TERM --kill-after=1s "${kill_timeout}s" \
-              taskkill.exe /PID "$service_pid" /T /F > "$taskkill_log" 2>&1 || taskkill_status=$?
-            emit_private_evidence taskkill "$taskkill_log"
-            if [ "$taskkill_status" -ne 0 ]; then
-              printf 'service_cleanup=taskkill status=%s; continuing identity verification\n' "$taskkill_status" >&2
-            fi
-            for attempt in $(seq 1 30); do
-              printf 'service_cleanup_attempt=%s\n' "$attempt"
-              remaining=$((cleanup_deadline_epoch - $(date +%s)))
-              if [ "$remaining" -le 0 ]; then break; fi
-              cleanup_probe_log="$SERVICE_DIR/cleanup-probe-${attempt}.raw.log"
-              cleanup_probe_status=0
-              probe_timeout=10
-              if [ "$probe_timeout" -gt "$remaining" ]; then probe_timeout="$remaining"; fi
-              timeout --foreground --signal=TERM --kill-after=1s "${probe_timeout}s" \
-                powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$verify_script" "$service_identity" "$service_binary_windows" > "$cleanup_probe_log" 2>&1 || cleanup_probe_status=$?
-              emit_private_evidence cleanup-probe "$cleanup_probe_log"
-              if [ "$cleanup_probe_status" -eq 2 ]; then stopped=true; break; fi
-              if [ "$cleanup_probe_status" -ne 0 ]; then printf 'service_cleanup=failed code=IDENTITY_PROBE status=%s\n' "$cleanup_probe_status" >&2; exit 1; fi
-              sleep 1
-            done
-          else
-            stopped=true
+          cleanup_remaining=$((cleanup_deadline_epoch - $(date +%s)))
+          controller_timeout=40
+          if [ "$controller_timeout" -gt "$cleanup_remaining" ]; then controller_timeout="$cleanup_remaining"; fi
+          if [ "$controller_timeout" -le 0 ]; then
+            printf 'service cleanup has no bounded budget before workflow deadline\n' >&2
+            exit 1
           fi
-          test "$stopped" = true
+          controller_status=0
+          timeout --foreground --signal=TERM --kill-after=1s "${controller_timeout}s" \
+            env PYTHONPATH="$GITHUB_WORKSPACE/torturer" python -m torturer_checks.hosted.finalize_windows_service \
+              --service-identity-file "$service_identity_file" \
+              --service-binary "$service_binary" \
+              --raw-log-dir "$controller_raw" \
+              --timeout-seconds "$controller_timeout" > "$controller_log" 2>&1 || controller_status=$?
+          emit_private_evidence controller-finalizer "$controller_log"
+          while IFS= read -r -d '' evidence_path; do
+            emit_private_evidence controller-command "$evidence_path"
+          done < <(find "$controller_raw" -type f -print0)
+          if [ "$controller_status" -eq 0 ]; then
+            printf 'service_stop_verified=true method=torturer-controller tree=proven pid=%s\n' "$service_pid"
+            exit 0
+          fi
+
+          # Fallback is deliberately leader-only.  It proves the sidecar
+          # identity adjacent to Stop-Process, records every observation, and
+          # exits nonzero because YAML cannot prove descendants without the
+          # controller's native finalizer.  A GitHub-observed successful
+          # hosted step is the only allowed already-gone case: trusted adapter
+          # finalization already proved the replacement Job empty and the
+          # initial tree stopped before that step could return success.
+          fallback_status=0
+          allow_already_gone=0
+          controller_reported_absent=0
+          while IFS= read -r controller_line; do
+            if [ "$controller_line" = 'windows_service_finalizer=failed code=SERVICE_PID_PROBE_FAILED' ]; then
+              controller_reported_absent=1
+            fi
+          done < "$controller_log"
+          if [ "$FUNCTIONAL_OUTCOME" = "success" ] && [ "$controller_reported_absent" -eq 1 ]; then allow_already_gone=1; fi
+          fallback_timeout=5
+          fallback_remaining=$((cleanup_deadline_epoch - $(date +%s)))
+          if [ "$fallback_timeout" -gt "$fallback_remaining" ]; then fallback_timeout="$fallback_remaining"; fi
+          if [ "$fallback_timeout" -le 0 ]; then
+            printf 'fallback has no bounded budget before workflow deadline\n' >&2
+            exit 1
+          fi
+          timeout --foreground --signal=TERM --kill-after=1s "${fallback_timeout}s" \
+            powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; $identity=([System.IO.File]::ReadAllText($args[0])).Trim(); if ($identity -notmatch "^[1-9][0-9]{0,9}\|[1-9][0-9]+$") { Write-Output "fallback_state=identity-invalid"; exit 2 }; $separator=$identity.IndexOf([char]124); $processId=[int]$identity.Substring(0,$separator); $expectedTicks=$identity.Substring($separator+1); $expected=[System.IO.Path]::GetFullPath($args[1]); $allow=([int]$args[2] -eq 1); $p=Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $processId) -ErrorAction Stop; if ($null -eq $p) { if ($allow) { Write-Output "fallback_state=leader-absent trusted-controller-result"; exit 0 }; Write-Output "fallback_state=leader-absent tree-unproven"; exit 3 }; $actual=[System.IO.Path]::GetFullPath([string]$p.ExecutablePath); $ticks=$p.CreationDate.ToUniversalTime().Ticks; if ($actual -ine $expected) { Write-Output ("fallback_state=path-mismatch actual=" + $actual); exit 4 }; if ($expectedTicks -ne [string]$ticks) { Write-Output ("fallback_state=identity-mismatch actual=" + $p.ProcessId + "|" + $ticks); exit 5 }; Write-Output ("fallback_state=identity-checked pid=" + $processId + "|" + $ticks); Stop-Process -Id $processId -Force -ErrorAction Stop; $after=Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $processId) -ErrorAction Stop; if ($null -ne $after) { Write-Output "fallback_state=leader-survived tree-unproven"; exit 6 }; Write-Output "fallback_state=leader-gone tree-unproven"; exit 7' \
+            "$service_identity_file_windows" "$service_binary_windows" "$allow_already_gone" > "$fallback_log" 2>&1 || fallback_status=$?
+          emit_private_evidence controller-fallback "$fallback_log"
+          if [ "$allow_already_gone" -eq 1 ] && [ "$fallback_status" -eq 0 ]; then
+            printf 'service_stop_verified=true method=completed-hosted-controller tree=proven pid=%s\n' "$service_pid"
+            exit 0
+          fi
+          printf 'service_cleanup=failed code=CONTROLLER_FINALIZER status=%s fallback_status=%s\n' "$controller_status" "$fallback_status" >&2
+          exit 1
 
       - name: Remove plaintext handoff material and prepare completion marker
         if: always()

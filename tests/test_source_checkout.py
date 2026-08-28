@@ -27,9 +27,34 @@ from torturer_checks.source_checkout import (
     run_bounded_preflight,
     verify_source_checkout,
 )
+from torturer_checks.windows_job import WindowsJobCloseDiagnostics
 
 
 class SourceCheckoutTest(unittest.TestCase):
+    def test_finalizer_retains_transient_job_close_diagnostics_without_failing(self) -> None:
+        class _Process:
+            stdout = None
+            stderr = None
+
+            def wait(self, *, timeout: float | None = None) -> int:
+                return 0
+
+        transient = WindowsJobCloseDiagnostics(
+            (
+                "stage=source-preflight api=CloseHandle winerror=6",
+                "stage=source-preflight detail=close-retry attempt=2",
+            ),
+            failed=False,
+        )
+        with patch.object(source_checkout, "close_windows_job", return_value=transient):
+            diagnostics = source_checkout._finalize_process(
+                _Process(),
+                deadline=time.monotonic() + 1.0,
+                description="source-preflight",
+            )
+        self.assertFalse(diagnostics)
+        self.assertTrue(any("close-retry attempt=2" in item for item in diagnostics))
+
     def test_accepts_exact_clean_commit_and_rejects_tracked_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
