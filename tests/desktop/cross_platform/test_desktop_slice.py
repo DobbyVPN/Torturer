@@ -46,6 +46,14 @@ from torturer_checks.desktop_slice import (
     service_command,
     service_environment,
     safe_failure_reason,
+    classify_service_startup_log,
+    SERVICE_STARTUP_CONTROL_AUTH_FAILED,
+    SERVICE_STARTUP_EMPTY,
+    SERVICE_STARTUP_GRPC_SERVE_FAILED,
+    SERVICE_STARTUP_INTERRUPTED_STATE_RECOVERY_FAILED,
+    SERVICE_STARTUP_LOOPBACK_LISTEN_FAILED,
+    SERVICE_STARTUP_SECURE_LOCAL_LOGGING_FAILED,
+    SERVICE_STARTUP_UNCLASSIFIED,
     stop_service,
     _prepare_evidence_directory,
     _validate_evidence_directory,
@@ -58,6 +66,136 @@ from torturer_checks.windows_job import WindowsJobCloseDiagnostics
 
 
 class DesktopSliceHelperTest(unittest.TestCase):
+    def test_service_startup_classifier_maps_known_dobby_messages_to_fixed_classes(self) -> None:
+        cases = (
+            (
+                b"panic: failed to prepare control authentication: token=private-value",
+                SERVICE_STARTUP_CONTROL_AUTH_FAILED,
+            ),
+            (
+                b"[ERROR] failed to listen: listen tcp 127.0.0.1:50151: address already in use",
+                SERVICE_STARTUP_LOOPBACK_LISTEN_FAILED,
+            ),
+            (
+                b"panic: failed to recover interrupted product state: route table=233",
+                SERVICE_STARTUP_INTERRUPTED_STATE_RECOVERY_FAILED,
+            ),
+            (
+                b"failed to initialize secure local logging: open /home/alex/.config/dobby.log: permission denied",
+                SERVICE_STARTUP_SECURE_LOCAL_LOGGING_FAILED,
+            ),
+            (
+                b"[ERROR] failed to serve: accept tcp 127.0.0.1:50151: use of closed network connection",
+                SERVICE_STARTUP_GRPC_SERVE_FAILED,
+            ),
+        )
+        allowed = {
+            SERVICE_STARTUP_CONTROL_AUTH_FAILED,
+            SERVICE_STARTUP_LOOPBACK_LISTEN_FAILED,
+            SERVICE_STARTUP_INTERRUPTED_STATE_RECOVERY_FAILED,
+            SERVICE_STARTUP_SECURE_LOCAL_LOGGING_FAILED,
+            SERVICE_STARTUP_GRPC_SERVE_FAILED,
+            SERVICE_STARTUP_EMPTY,
+            SERVICE_STARTUP_UNCLASSIFIED,
+        }
+        for payload, expected in cases:
+            with self.subTest(payload=payload):
+                result = classify_service_startup_log(payload)
+                self.assertEqual(result, expected)
+                self.assertIn(result, allowed)
+
+    def test_service_startup_classifier_has_empty_and_unclassified_classes(self) -> None:
+        self.assertEqual(classify_service_startup_log(b""), SERVICE_STARTUP_EMPTY)
+        self.assertEqual(classify_service_startup_log(b"\x00\r\n \t"), SERVICE_STARTUP_EMPTY)
+        self.assertEqual(
+            classify_service_startup_log(b"candidate output with no known startup marker"),
+            SERVICE_STARTUP_UNCLASSIFIED,
+        )
+        self.assertEqual(classify_service_startup_log("not bytes"), SERVICE_STARTUP_UNCLASSIFIED)  # type: ignore[arg-type]
+
+    def test_service_startup_classifier_output_is_fixed_for_adversarial_private_content(self) -> None:
+        private_values = (
+            b"https://user:password@private.example.test/profile?token=secret",
+            b"C:\\Users\\Alex\\AppData\\Local\\DobbyVPN\\control.token",
+            b"/home/alex/.config/dobbyvpn/private.toml",
+            b"Authorization: Bearer private-bearer-value",
+            b"candidate-user\nprivate-password\n198.51.100.5",
+        )
+        for private_value in private_values:
+            with self.subTest(private_value=private_value):
+                result = classify_service_startup_log(private_value)
+                self.assertEqual(result, SERVICE_STARTUP_UNCLASSIFIED)
+                self.assertRegex(result, r"^(?:CONTROL_AUTH_INIT_FAILED|LOOPBACK_LISTEN_FAILED|INTERRUPTED_STATE_RECOVERY_FAILED|SECURE_LOCAL_LOGGING_FAILED|GRPC_SERVE_FAILED|EMPTY|UNCLASSIFIED)$")
+                self.assertNotIn(private_value.decode("utf-8", "replace"), result)
+
+    def test_service_startup_classifier_is_case_insensitive_and_does_not_return_log_bytes(self) -> None:
+        payload = b"FAILED TO SERVE: url=https://private.example.test token=secret"
+        self.assertEqual(classify_service_startup_log(payload), SERVICE_STARTUP_GRPC_SERVE_FAILED)
+
+    def test_service_exit_summary_exposes_only_fixed_startup_class(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="desktop-startup-class-") as temporary:
+            service_log = Path(temporary) / "service.combined.log"
+            service_log.write_bytes(
+                b"panic: failed to listen: https://user:password@private.example.test/config\n"
+            )
+            summary = desktop_slice._service_failure_summary(
+                SliceFailure("service exited before readiness (exit code 2)"),
+                service_log,
+            )
+        self.assertEqual(
+            safe_failure_reason(SliceFailure(summary)),
+            "service exited before readiness (exit code 2); "
+            "startup_failure_class=LOOPBACK_LISTEN_FAILED; "
+            "complete service diagnostics retained privately",
+        )
+        self.assertNotIn("private.example.test", summary)
+        self.assertNotIn("password", summary)
+
+    def test_service_exit_summary_keeps_original_failure_when_classification_fails(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="desktop-startup-classifier-failure-") as temporary:
+            service_log = Path(temporary) / "service.combined.log"
+            service_log.write_bytes(b"private startup bytes")
+            with patch.object(
+                desktop_slice,
+                "classify_service_startup_log",
+                side_effect=RuntimeError("classifier failure with private path"),
+            ):
+                summary = desktop_slice._service_failure_summary(
+                    SliceFailure("service exited before readiness (exit code 2)"),
+                    service_log,
+                )
+        self.assertEqual(
+            safe_failure_reason(SliceFailure(summary)),
+            "service exited before readiness (exit code 2); "
+            "startup_failure_class=UNCLASSIFIED; "
+            "complete service diagnostics retained privately",
+        )
+        self.assertNotIn("classifier failure", summary)
+        self.assertNotIn("private startup bytes", summary)
+
+    def test_service_exit_summary_keeps_original_failure_when_log_read_fails(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="desktop-startup-log-read-failure-") as temporary:
+            service_log = Path(temporary) / "service.combined.log"
+            service_log.write_bytes(b"private startup bytes")
+            with patch.object(Path, "read_bytes", side_effect=OSError("private path")):
+                summary = desktop_slice._service_failure_summary(
+                    SliceFailure("service exited before readiness (exit code 2)"),
+                    service_log,
+                )
+        self.assertIn("service exited before readiness (exit code 2)", summary)
+        self.assertIn("startup_failure_class=UNCLASSIFIED", summary)
+        self.assertNotIn("private path", summary)
+
+    def test_service_non_startup_failure_summary_does_not_claim_startup_class(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="desktop-non-startup-class-") as temporary:
+            service_log = Path(temporary) / "service.combined.log"
+            service_log.write_bytes(b"failed to serve: private detail")
+            summary = desktop_slice._service_failure_summary(
+                SliceFailure("CLI status failed"),
+                service_log,
+            )
+        self.assertEqual(summary, "CLI status failed; complete service diagnostics retained privately")
+
     def test_build_commands_use_public_candidate_interfaces(self) -> None:
         root = Path("/candidate")
         self.assertEqual(
