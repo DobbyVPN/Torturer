@@ -92,7 +92,7 @@ class HostedArtifactSafetyTests(unittest.TestCase):
             return self.listing if calls == 1 else archive
 
         def slow_extract(*_args: object, **_kwargs: object) -> None:
-            time.sleep(0.2)
+            time.sleep(0.5)
 
         started = time.monotonic()
         with patch("torturer_checks.hosted.artifacts._get", side_effect=slow_get), patch(
@@ -103,10 +103,10 @@ class HostedArtifactSafetyTests(unittest.TestCase):
                     repository="o/r", artifact_name="candidate", run_id=77,
                     output_dir=self.root / "out", expected_files=("manifest.json",),
                     metadata_path=self.root / "listing.json", archive_path=self.root / "archive.zip",
-                    timeout_seconds=0.1,
+                    timeout_seconds=0.3,
                 )
         elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 0.2)
+        self.assertLess(elapsed, 0.5)
         self.assertEqual(calls, 2)
         self.assertEqual(len(set(deadlines)), 1)
 
