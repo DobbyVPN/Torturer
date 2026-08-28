@@ -18,7 +18,7 @@ from torturer_contract.workflow_policy import (
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "verify.yml"
 SELF_TEST_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
-PINNED_TORTURER_COMMIT = "76165452aca8c6572efdd5f0e0e340b5f26c0cc0"
+PINNED_TORTURER_COMMIT = "de4bb1e953ca5cdd920d1016dbc1797352b75dd8"
 
 class VerifyWorkflowPolicyTest(unittest.TestCase):
     @classmethod
