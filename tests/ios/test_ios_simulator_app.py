@@ -22,6 +22,7 @@ from torturer_checks.ios_simulator_app import (
     SubprocessCommandRunner,
     public_ios_simulator_app_contract,
     run_ios_simulator_app_contract,
+    safe_diagnostic_excerpt,
     select_available_iphone,
     xcodebuild_app_command,
 )
@@ -253,6 +254,19 @@ class IOSSimulatorAppContractTest(unittest.TestCase):
         self.assertNotIn("candidate output", str(raised.exception))
         self.assertFalse(any(command[:2] == ["xcodebuild", "test"] for command in runner.commands))
         self.assertTrue(any(command[:3] == ["xcrun", "simctl", "shutdown"] for command in runner.commands))
+
+    def test_failure_excerpt_keeps_safe_compiler_diagnostics_without_runner_secrets(self) -> None:
+        excerpt = safe_diagnostic_excerpt(
+            "\x1b[31m/Users/runner/work/DobbyVPN/DobbyVPN/swift_module/Foo.swift:12:4: error:"
+            " no such module 'PrivateThing'\x1b[0m\n"
+            "token=private-value https://example.invalid/private\n"
+            "warning: this non-diagnostic line is not selected\n"
+        )
+        self.assertIn("<path>:12:4: error: no such module 'PrivateThing'", excerpt)
+        self.assertNotIn("/Users/runner", excerpt)
+        self.assertNotIn("private-value", excerpt)
+        self.assertNotIn("https://example.invalid", excerpt)
+        self.assertNotIn("warning: this non-diagnostic", excerpt)
 
     @unittest.skipUnless(
         os.name == "posix" and Path("/proc").is_dir(),
