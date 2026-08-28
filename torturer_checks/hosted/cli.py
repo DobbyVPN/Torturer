@@ -2698,15 +2698,17 @@ def _kill_process_tree(
 def _allocate_owner_only_path(directory: Path, stem: str, suffix: str) -> Path:
     """Reserve a private path with O_EXCL; never reuse an old evidence file."""
 
+    posix_permissions = os.name != "nt"
     try:
         info = directory.lstat()
     except OSError as error:
         raise HostedAdapterError("EVIDENCE_PATH_UNSAFE") from error
     if (
-        directory.is_symlink()
+        not directory.is_absolute()
+        or directory.is_symlink()
         or not stat.S_ISDIR(info.st_mode)
         or _current_uid() is not None and info.st_uid != _current_uid()
-        or stat.S_IMODE(info.st_mode) & 0o077
+        or posix_permissions and stat.S_IMODE(info.st_mode) & 0o077
     ):
         raise HostedAdapterError("EVIDENCE_PATH_UNSAFE")
     for candidate in (
@@ -2721,8 +2723,19 @@ def _allocate_owner_only_path(directory: Path, stem: str, suffix: str) -> Path:
             )
         except FileExistsError:
             continue
-        os.fchmod(descriptor, 0o600)
-        os.close(descriptor)
+        try:
+            if posix_permissions:
+                fchmod = getattr(os, "fchmod", None)
+                if fchmod is not None:
+                    fchmod(descriptor, 0o600)
+                else:
+                    os.chmod(candidate, 0o600)
+            # Windows workflows establish and verify the ACL boundary on the
+            # parent directory.  POSIX chmod operations are neither a Windows
+            # security boundary nor a useful best-effort diagnostic, so do
+            # not invoke or silently suppress them here.
+        finally:
+            os.close(descriptor)
         return candidate
     raise HostedAdapterError("EVIDENCE_UNAVAILABLE")
 

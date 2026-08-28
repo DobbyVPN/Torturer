@@ -9,7 +9,12 @@ from pathlib import Path
 from unittest import mock
 
 import torturer_checks.hosted.cli as hosted_cli
-from torturer_checks.hosted.cli import HostedAdapterError, SubprocessRunner, _evidence_metadata
+from torturer_checks.hosted.cli import (
+    HostedAdapterError,
+    SubprocessRunner,
+    _allocate_owner_only_path,
+    _evidence_metadata,
+)
 from torturer_checks.windows_job import (
     WindowsJobCleanup,
     WindowsJobCloseDiagnostics,
@@ -110,6 +115,36 @@ class HostedWindowsJobRunnerTests(unittest.TestCase):
         with mock.patch.object(hosted_cli.os, "fsync", side_effect=OSError(5, "synthetic flush failure")):
             with self.assertRaisesRegex(HostedAdapterError, "EVIDENCE_FSYNC_FAILED"):
                 _evidence_metadata(path)
+
+    def test_windows_evidence_allocator_relies_on_acl_without_posix_chmod(self) -> None:
+        raw = Path(self.directory.name) / "windows-raw"
+        raw.mkdir(mode=0o777)
+        with (
+            mock.patch.object(hosted_cli.os, "name", "nt"),
+            mock.patch.object(
+                hosted_cli.os,
+                "fchmod",
+                side_effect=AssertionError("Windows must not call fchmod"),
+            ),
+            mock.patch.object(
+                hosted_cli.os,
+                "chmod",
+                side_effect=AssertionError("Windows must not call chmod"),
+            ),
+        ):
+            path = _allocate_owner_only_path(raw, "service", ".raw.log")
+
+        self.assertTrue(path.is_file())
+        self.assertEqual(path.read_bytes(), b"")
+
+    def test_evidence_allocator_rejects_relative_and_non_directory_paths(self) -> None:
+        with self.assertRaisesRegex(HostedAdapterError, "EVIDENCE_PATH_UNSAFE"):
+            _allocate_owner_only_path(Path("relative"), "service", ".raw.log")
+        not_directory = Path(self.directory.name) / "not-a-directory"
+        not_directory.write_bytes(b"file")
+        not_directory.chmod(0o700)
+        with self.assertRaisesRegex(HostedAdapterError, "EVIDENCE_PATH_UNSAFE"):
+            _allocate_owner_only_path(not_directory, "service", ".raw.log")
 
     def test_normal_completion_survivor_fails_after_complete_diagnostics(self) -> None:
         raw = Path(self.directory.name) / "survivor-raw"
