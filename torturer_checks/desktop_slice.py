@@ -55,7 +55,7 @@ from torturer_checks.source_checkout import (
     _proc_descendants,
     verify_source_checkout,
 )
-from torturer_checks.public_output import emit_evidence
+from torturer_checks.public_output import emit_evidence, safe_diagnostic_excerpt
 from torturer_checks.windows_job import (
     WindowsJobError,
     close_for as close_windows_job,
@@ -1442,7 +1442,10 @@ def run_command(
 
 def require_success(result: CommandResult, description: str) -> None:
     if result.returncode != 0:
-        raise SliceFailure(f"{description} failed\n{result.describe()}")
+        combined = "\n".join(part for part in (result.stdout, result.stderr) if part)
+        excerpt = safe_diagnostic_excerpt(combined)
+        diagnostic = f"; diagnostic_excerpt={' | '.join(excerpt.splitlines())}" if excerpt else ""
+        raise SliceFailure(f"{description} failed{diagnostic}\n{result.describe()}")
 
 
 def require_nonzero(result: CommandResult, description: str) -> None:

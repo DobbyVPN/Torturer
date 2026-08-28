@@ -20,7 +20,7 @@ import sys
 import time
 from typing import Protocol, Sequence
 
-from torturer_checks.public_output import emit_evidence
+from torturer_checks.public_output import emit_evidence, safe_diagnostic_excerpt
 
 from torturer_checks.ios_simulator import (
     IOSSimulatorContractError,
@@ -57,31 +57,6 @@ MAX_RUN_SECONDS = 30 * 60
 CLEANUP_RESERVE_SECONDS = 120
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
 COMMAND_TERMINATION_GRACE_SECONDS = 15
-_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-_ABSOLUTE_PATH = re.compile(
-    r"(?:/(?:Users|home|private/var|var/folders|tmp)/|[A-Za-z]:[\\/])[^\s:'\"]+"
-)
-_DIAGNOSTIC_URL = re.compile(r"(?i)\b(?:https?|wss?)://[^\s]+")
-_DIAGNOSTIC_SECRET = re.compile(
-    r"(?ix)(?P<label>\b(?:token|password|secret|credential|authorization|cookie)\b\s*[:=]\s*)"
-    r"(?:bearer\s+|basic\s+)?[^\s,;]+"
-)
-_DIAGNOSTIC_MARKERS = (
-    "error:",
-    "fatal error",
-    "build failed",
-    "the following build commands failed",
-    "undefined symbols",
-    "ld:",
-    "clang:",
-    "swiftcompile",
-    "compileswift",
-    "no such module",
-    "framework not found",
-    "codesign",
-)
-_MAX_DIAGNOSTIC_LINES = 24
-_MAX_DIAGNOSTIC_BYTES = 8 * 1024
 _TEST_IDENTIFIER = (
     "IOSSimulatorAppContractTests/IOSSimulatorAppContractTests/"
     "testAppLaunchesWithoutCredentials"
@@ -90,44 +65,6 @@ _TEST_IDENTIFIER = (
 
 class IOSSimulatorAppContractError(RuntimeError):
     """The fixed public app contract could not be executed or verified."""
-
-
-def _redact_diagnostic_line(line: str) -> str:
-    """Remove runner paths, URLs, and credential-shaped values from one line."""
-
-    line = _ANSI_ESCAPE.sub("", line)
-    line = _ABSOLUTE_PATH.sub("<path>", line)
-    line = _DIAGNOSTIC_URL.sub("<redacted-url>", line)
-    return _DIAGNOSTIC_SECRET.sub(r"\g<label><redacted>", line)
-
-
-def safe_diagnostic_excerpt(raw_output: str) -> str:
-    """Return a small safe compiler/linker excerpt for hosted failure output.
-
-    The complete original bytes are retained in ``TORTURER_IOS_RAW_LOG_DIR``.
-    This derived view is intentionally limited to stable diagnostic markers and
-    is scrubbed before crossing the public workflow boundary.
-    """
-
-    if not isinstance(raw_output, str):
-        return ""
-    selected: list[str] = []
-    total = 0
-    for raw_line in raw_output.splitlines():
-        line = _redact_diagnostic_line(raw_line).strip()
-        if not line:
-            continue
-        lowered = line.lower()
-        if not any(marker in lowered for marker in _DIAGNOSTIC_MARKERS):
-            continue
-        encoded_size = len(line.encode("utf-8", errors="replace"))
-        if encoded_size > _MAX_DIAGNOSTIC_BYTES or total + encoded_size + 1 > _MAX_DIAGNOSTIC_BYTES:
-            break
-        selected.append(line)
-        total += encoded_size + 1
-        if len(selected) >= _MAX_DIAGNOSTIC_LINES:
-            break
-    return "\n".join(selected)
 
 
 class RunBudget:

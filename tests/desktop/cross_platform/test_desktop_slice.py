@@ -980,6 +980,20 @@ class DesktopSliceHelperTest(unittest.TestCase):
         with self.assertRaisesRegex(SliceFailure, "unexpectedly succeeded"):
             require_nonzero(CommandResult(("tool",), 0, "", ""), "phase")
 
+    def test_failed_build_assertion_exposes_only_a_safe_diagnostic_excerpt(self) -> None:
+        failure = CommandResult(
+            ("xcodebuild",),
+            65,
+            "/Users/runner/work/candidate/Foo.swift:12:4: error: no such module 'PrivateThing'\n",
+            "token=private-value https://example.invalid/private\n",
+        )
+        with self.assertRaisesRegex(SliceFailure, r"diagnostic_excerpt=<path>:12:4: error: no such module") as raised:
+            require_success(failure, "phase")
+        message = str(raised.exception)
+        self.assertNotIn("/Users/runner", message)
+        self.assertNotIn("private-value", message)
+        self.assertNotIn("example.invalid", message)
+
     def test_safe_failure_reason_preserves_contract_detail_without_secrets(self) -> None:
         reason = safe_failure_reason(
             SliceFailure(
