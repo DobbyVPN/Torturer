@@ -100,9 +100,34 @@ class SliceFailure(RuntimeError):
 SERVICE_STARTUP_CONTROL_AUTH_IDENTITY_FAILED = "CONTROL_AUTH_IDENTITY_FAILED"
 SERVICE_STARTUP_CONTROL_AUTH_TOKEN_IO_FAILED = "CONTROL_AUTH_TOKEN_IO_FAILED"
 SERVICE_STARTUP_CONTROL_AUTH_ACL_APPLY_FAILED = "CONTROL_AUTH_ACL_APPLY_FAILED"
+# Keep the old aggregate class import-compatible.  New classifier results use
+# one of the fixed ACL invariant classes below instead.
 SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED = "CONTROL_AUTH_ACL_VERIFY_FAILED"
 SERVICE_STARTUP_CONTROL_AUTH_INVALID_TOKEN = "CONTROL_AUTH_INVALID_TOKEN"
 SERVICE_STARTUP_CONTROL_AUTH_OTHER = "CONTROL_AUTH_OTHER"
+SERVICE_STARTUP_CONTROL_AUTH_ACL_READ_FAILED = "CONTROL_AUTH_ACL_READ_FAILED"
+SERVICE_STARTUP_CONTROL_AUTH_SECURITY_DESCRIPTOR_MISSING = "CONTROL_AUTH_SECURITY_DESCRIPTOR_MISSING"
+SERVICE_STARTUP_CONTROL_AUTH_SECURITY_DESCRIPTOR_INVALID = "CONTROL_AUTH_SECURITY_DESCRIPTOR_INVALID"
+SERVICE_STARTUP_CONTROL_AUTH_SECURITY_DESCRIPTOR_CONTROL_READ_FAILED = (
+    "CONTROL_AUTH_SECURITY_DESCRIPTOR_CONTROL_READ_FAILED"
+)
+SERVICE_STARTUP_CONTROL_AUTH_OWNER_DEFAULTED = "CONTROL_AUTH_OWNER_DEFAULTED"
+SERVICE_STARTUP_CONTROL_AUTH_OWNER_READ_FAILED = "CONTROL_AUTH_OWNER_READ_FAILED"
+SERVICE_STARTUP_CONTROL_AUTH_OWNER_MISMATCH = "CONTROL_AUTH_OWNER_MISMATCH"
+SERVICE_STARTUP_CONTROL_AUTH_DACL_DEFAULTED = "CONTROL_AUTH_DACL_DEFAULTED"
+SERVICE_STARTUP_CONTROL_AUTH_DACL_MISSING = "CONTROL_AUTH_DACL_MISSING"
+SERVICE_STARTUP_CONTROL_AUTH_DACL_READ_FAILED = "CONTROL_AUTH_DACL_READ_FAILED"
+SERVICE_STARTUP_CONTROL_AUTH_DACL_COUNT_MISMATCH = "CONTROL_AUTH_DACL_COUNT_MISMATCH"
+SERVICE_STARTUP_CONTROL_AUTH_INHERITANCE_ENABLED = "CONTROL_AUTH_INHERITANCE_ENABLED"
+SERVICE_STARTUP_CONTROL_AUTH_TYPE_INSPECTION_FAILED = "CONTROL_AUTH_TYPE_INSPECTION_FAILED"
+SERVICE_STARTUP_CONTROL_AUTH_REPARSE_POINT = "CONTROL_AUTH_REPARSE_POINT"
+SERVICE_STARTUP_CONTROL_AUTH_ACE_TYPE_INVALID = "CONTROL_AUTH_ACE_TYPE_INVALID"
+SERVICE_STARTUP_CONTROL_AUTH_ACE_FLAGS_INVALID = "CONTROL_AUTH_ACE_FLAGS_INVALID"
+SERVICE_STARTUP_CONTROL_AUTH_ACE_MASK_MISMATCH = "CONTROL_AUTH_ACE_MASK_MISMATCH"
+SERVICE_STARTUP_CONTROL_AUTH_ACE_SID_INVALID = "CONTROL_AUTH_ACE_SID_INVALID"
+SERVICE_STARTUP_CONTROL_AUTH_ACE_DUPLICATE = "CONTROL_AUTH_ACE_DUPLICATE"
+SERVICE_STARTUP_CONTROL_AUTH_ACE_UNEXPECTED = "CONTROL_AUTH_ACE_UNEXPECTED"
+SERVICE_STARTUP_CONTROL_AUTH_ACE_MISSING = "CONTROL_AUTH_ACE_MISSING"
 # Keep the previous name and value source-compatible.  New output uses the
 # more precise OTHER bucket for the generic marker.
 SERVICE_STARTUP_CONTROL_AUTH_FAILED = "CONTROL_AUTH_INIT_FAILED"
@@ -147,28 +172,51 @@ _SERVICE_STARTUP_CONTROL_AUTH_RULES = (
     # ACL construction/application.
     (b"build explicit runtime path acl", SERVICE_STARTUP_CONTROL_AUTH_ACL_APPLY_FAILED),
     (b"set explicit runtime path acl", SERVICE_STARTUP_CONTROL_AUTH_ACL_APPLY_FAILED),
-    # ACL verification/owner/inheritance/entries.  The concrete descriptions
-    # below are the values passed to verifyExactACL in token_windows.go; using
-    # their stable wording avoids matching arbitrary private text.
-    (b"read control token acl:", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
-    (b"control token has no security descriptor", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
-    (b"control token security descriptor is invalid", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
-    (b"read control token security descriptor control:", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
-    (b"control token owner is defaulted", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
-    (b"control token dacl is defaulted", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
-    (b"control token has no dacl", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
-    (b"read control token owner:", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
-    (b"control token owner is not the expected identity", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
-    (b"control token acl inheritance is not disabled", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
-    (b"read control token dacl:", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
-    (b"control token acl contains", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
-    (b"control token acl repeats an identity", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
-    (b"control token acl grants access to an unexpected identity", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
-    (b"control token acl is missing an expected identity", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
-    (b"inspect control token type:", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
-    (b"control token is a reparse point", SERVICE_STARTUP_CONTROL_AUTH_ACL_VERIFY_FAILED),
+    # ACL verification.  Every literal below is the stable ``description``
+    # expansion from verifyExactACL in token_windows.go.  The classifier never
+    # returns the following log text or a wrapped OS error.
+    (b"read control token acl:", SERVICE_STARTUP_CONTROL_AUTH_ACL_READ_FAILED),
+    (
+        b"control token has no security descriptor",
+        SERVICE_STARTUP_CONTROL_AUTH_SECURITY_DESCRIPTOR_MISSING,
+    ),
+    (
+        b"control token security descriptor is invalid",
+        SERVICE_STARTUP_CONTROL_AUTH_SECURITY_DESCRIPTOR_INVALID,
+    ),
+    (
+        b"read control token security descriptor control:",
+        SERVICE_STARTUP_CONTROL_AUTH_SECURITY_DESCRIPTOR_CONTROL_READ_FAILED,
+    ),
+    (b"control token owner is defaulted", SERVICE_STARTUP_CONTROL_AUTH_OWNER_DEFAULTED),
+    (b"read control token owner:", SERVICE_STARTUP_CONTROL_AUTH_OWNER_READ_FAILED),
+    (b"control token owner is not the expected identity", SERVICE_STARTUP_CONTROL_AUTH_OWNER_MISMATCH),
+    (b"control token dacl is defaulted", SERVICE_STARTUP_CONTROL_AUTH_DACL_DEFAULTED),
+    (b"control token has no dacl", SERVICE_STARTUP_CONTROL_AUTH_DACL_MISSING),
+    (b"read control token dacl:", SERVICE_STARTUP_CONTROL_AUTH_DACL_READ_FAILED),
+    (b"control token acl inheritance is not disabled", SERVICE_STARTUP_CONTROL_AUTH_INHERITANCE_ENABLED),
+    (b"inspect control token type:", SERVICE_STARTUP_CONTROL_AUTH_TYPE_INSPECTION_FAILED),
+    (b"control token is a reparse point", SERVICE_STARTUP_CONTROL_AUTH_REPARSE_POINT),
+    (b"control token acl contains an unsupported entry", SERVICE_STARTUP_CONTROL_AUTH_ACE_TYPE_INVALID),
+    (b"control token acl contains unsupported inheritance flags", SERVICE_STARTUP_CONTROL_AUTH_ACE_FLAGS_INVALID),
+    (
+        b"control token acl contains an entry with unexpected access mask or inheritance",
+        SERVICE_STARTUP_CONTROL_AUTH_ACE_MASK_MISMATCH,
+    ),
+    (b"control token acl contains an invalid identity", SERVICE_STARTUP_CONTROL_AUTH_ACE_SID_INVALID),
+    (b"control token acl repeats an identity", SERVICE_STARTUP_CONTROL_AUTH_ACE_DUPLICATE),
+    (b"control token acl grants access to an unexpected identity", SERVICE_STARTUP_CONTROL_AUTH_ACE_UNEXPECTED),
+    (b"control token acl is missing an expected identity", SERVICE_STARTUP_CONTROL_AUTH_ACE_MISSING),
     # The outer marker is intentionally last among control-auth rules.
     (b"failed to prepare control authentication", SERVICE_STARTUP_CONTROL_AUTH_OTHER),
+)
+
+# The ACL count message contains values rendered by ``%d`` in token_windows.go.
+# Match only its complete stable shape and return a fixed class; neither number
+# is ever copied into public output.  A broad ``ACL contains`` prefix would
+# incorrectly classify the distinct ACE invariant messages above.
+_SERVICE_STARTUP_CONTROL_AUTH_DACL_COUNT_RE = re.compile(
+    rb"control token acl contains [0-9]+ entries; expected [0-9]+(?![0-9A-Za-z_.-])"
 )
 
 
@@ -186,6 +234,9 @@ def classify_service_startup_log(payload: bytes) -> str:
     if not isinstance(payload, bytes):
         return SERVICE_STARTUP_UNCLASSIFIED
     lowered = payload.lower()
+    # This must run before the generic outer control-auth marker below.
+    if _SERVICE_STARTUP_CONTROL_AUTH_DACL_COUNT_RE.search(lowered):
+        return SERVICE_STARTUP_CONTROL_AUTH_DACL_COUNT_MISMATCH
     for needle, classification in _SERVICE_STARTUP_CONTROL_AUTH_RULES:
         if needle in lowered:
             return classification
