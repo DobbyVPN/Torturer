@@ -867,17 +867,29 @@ class LinuxHostedAdapter(HostedCLIAdapter):
     ) -> None:
         super().finalize(timeout_seconds, deadline=deadline)
         if self.service is not None:
-            effective_deadline = deadline
-            if effective_deadline is None:
+            if deadline is None:
+                # Preserve the legacy one-argument lifecycle contract when
+                # no outer lane deadline exists; the service controller owns
+                # the timeout clock in that case.
                 _call_with_deadline(
                     self.service.stop_restarted_service, timeout_seconds, None
                 )
-            else:
-                _call_with_deadline(
-                    self.service.stop_restarted_service,
-                    self._remaining(effective_deadline, "SERVICE_FINALIZE_TIMEOUT"),
-                    effective_deadline,
-                )
+                return
+            # ``deadline`` is the outer lane deadline.  The timeout argument
+            # is the finalizer's own bounded budget and must remain effective
+            # even when the lane has much more time left.  Otherwise a
+            # resistant replacement can keep the hosted lane blocked until
+            # its full 30-minute ceiling.
+            now = time.monotonic()
+            effective_deadline = now + timeout_seconds
+            if deadline <= now:
+                raise ScenarioExecutionError("SERVICE_FINALIZE_TIMEOUT")
+            effective_deadline = min(effective_deadline, deadline)
+            _call_with_deadline(
+                self.service.stop_restarted_service,
+                self._remaining(effective_deadline, "SERVICE_FINALIZE_TIMEOUT"),
+                effective_deadline,
+            )
 
     def _network_transition(self, timeout: float) -> dict[str, object]:
         if self.network_interface is None:
