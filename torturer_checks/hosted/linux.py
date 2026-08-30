@@ -659,11 +659,41 @@ class LinuxServiceProcessController:
         if self._replacement_identity is None:
             raise HostedAdapterError("SERVICE_PID_PROBE_FAILED")
         if not alive():
-            # The leader's disappearance is not a cleanup proof: tracked
-            # descendants may have escaped its process group.  There is no
-            # safe way to reconstruct an unobserved tree after the root is
-            # gone, so fail closed instead of certifying a false pass.
-            raise HostedAdapterError("SERVICE_TREE_PROBE_FAILED")
+            # A replacement launched by the hosted lane is adopted by the
+            # outer Linux subreaper.  Once that process exits, it can remain
+            # visible as a zombie until the subreaper reaps it.  The state
+            # probe in ``_alive`` is the authoritative proof that the root
+            # cannot execute or retain service resources; do not turn that
+            # expected hand-off state into a lane-wide deadlock.  A clean
+            # disappearance is still handled fail-closed below because it
+            # cannot reconstruct an unobserved descendant tree.
+            root_record = self._read_process_stat(
+                self.pid,
+                min(5.0, remaining("SERVICE_TREE_PROBE_FAILED")),
+            )
+            if root_record is None or root_record.state != "Z":
+                raise HostedAdapterError("SERVICE_TREE_PROBE_FAILED")
+            root_start, root_group = self._replacement_identity
+            if (
+                root_record.start != root_start
+                or root_record.process_group != root_group
+            ):
+                raise HostedAdapterError("SERVICE_PID_NOT_CANDIDATE")
+            # Capture the exact tree while the zombie root is still visible.
+            # ``_tracked_tree`` validates every descendant and the isolated
+            # process group before any cleanup decision is made.  A lone
+            # zombie is already clean; live descendants continue through the
+            # normal bounded TERM/KILL path below.
+            self._replacement_tree = self._tracked_tree(
+                min(5.0, remaining("SERVICE_TREE_PROBE_FAILED"))
+            )
+            if all(record.state == "Z" for record in self._replacement_tree):
+                # The exact process census proved that the adopted root and
+                # every process still attributable to its tree are zombies.
+                # They are already unable to execute or retain resources;
+                # leave reaping to the outer subreaper and avoid signalling a
+                # process group whose only member is a zombie.
+                return
         _call_with_deadline(
             self._verify_candidate_pid,
             min(5.0, remaining("SERVICE_FINALIZE_TIMEOUT")),
