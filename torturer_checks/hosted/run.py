@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import time
 import uuid
@@ -90,6 +91,7 @@ EXPECTED_UNAVAILABLE_BY_PLATFORM: dict[str, frozenset[tuple[str, str]]] = {
 # process-tree cleanup remains bounded and still fails closed when it cannot
 # be proven.  Desktop lanes retain the ordinary five-second reserve.
 _ANDROID_COMMAND_CLEANUP_RESERVE_SECONDS = 1.0
+_HOSTED_PROGRESS_ENV = "TORTURER_HOSTED_PROGRESS_PATH"
 
 
 def _full_sha(value: str, name: str) -> str:
@@ -413,6 +415,38 @@ def _diagnostic_code(error: BaseException) -> str:
     return type(error).__name__
 
 
+def _emit_hosted_progress(message: str) -> None:
+    """Emit a safe live marker and optionally mirror it to the deadline watcher."""
+
+    print(message, flush=True)
+    configured = os.environ.get(_HOSTED_PROGRESS_ENV)
+    if not configured:
+        return
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        raise ValueError("HOSTED_PROGRESS_PATH_UNSAFE")
+    _ensure_owner_only_directory(path.parent)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("HOSTED_PROGRESS_PATH_UNSAFE")
+            os.fchmod(descriptor, 0o600)
+            payload = (message + "\n").encode("ascii")
+            view = memoryview(payload)
+            while view:
+                view = view[os.write(descriptor, view):]
+        finally:
+            os.close(descriptor)
+    except ValueError:
+        raise
+    except OSError as error:
+        raise ValueError("HOSTED_PROGRESS_UNAVAILABLE") from error
+
+
 def _finalize_adapter(adapter, deadline: float | None) -> None:
     """Release adapter-owned resources before the hosted process may exit."""
 
@@ -484,70 +518,91 @@ def _run_scenarios(
             required_seconds=required_seconds,
             operation=f"scenario {scenario.id}",
         )
-        if engine.schema_version == 1:
-            # Historical v1 carries opaque IDs only; do not feed structured
-            # v2 evidence metadata into a v1 result object.
-            result = engine.run(scenario, adapter, provenance)
-        else:
-            before = len(safe_evidence())
-            reset_error: Exception | None = None
-            reset_called = False
+        started = time.monotonic()
+        _emit_hosted_progress(
+            f"hosted-functional scenario-start id={scenario.id} "
+            f"required_seconds={required_seconds} missing_capabilities={len(missing)}"
+        )
+        try:
+            if engine.schema_version == 1:
+                # Historical v1 carries opaque IDs only; do not feed structured
+                # v2 evidence metadata into a v1 result object.
+                result = engine.run(scenario, adapter, provenance)
+            else:
+                before = len(safe_evidence())
+                reset_error: Exception | None = None
+                reset_called = False
 
-            def finalize_evidence(
-                *, before: int = before
-            ) -> tuple[EvidenceReference, ...]:
-                nonlocal reset_called, reset_error
-                if not reset_called:
-                    reset_called = True
-                    try:
-                        reset_timeout = _lane_remaining(deadline)
-                        if reset_timeout is not None:
-                            if reset_timeout <= 0:
-                                raise ValueError(
-                                    "HOSTED_LANE_DEADLINE_EXCEEDED before scenario reset"
+                def finalize_evidence(
+                    *, before: int = before
+                ) -> tuple[EvidenceReference, ...]:
+                    nonlocal reset_called, reset_error
+                    if not reset_called:
+                        reset_called = True
+                        try:
+                            reset_timeout = _lane_remaining(deadline)
+                            if reset_timeout is not None:
+                                if reset_timeout <= 0:
+                                    raise ValueError(
+                                        "HOSTED_LANE_DEADLINE_EXCEEDED before scenario reset"
+                                    )
+                                reset_timeout = min(
+                                    float(_RESET_TIMEOUT_SECONDS), reset_timeout
                                 )
-                            reset_timeout = min(
-                                float(_RESET_TIMEOUT_SECONDS), reset_timeout
-                            )
-                        else:
-                            reset_timeout = float(_RESET_TIMEOUT_SECONDS)
-                        adapter.reset(timeout_seconds=reset_timeout)
-                    except Exception as error:
-                        reset_error = error
-                return _evidence_references(safe_evidence()[before:])
+                            else:
+                                reset_timeout = float(_RESET_TIMEOUT_SECONDS)
+                            adapter.reset(timeout_seconds=reset_timeout)
+                        except Exception as error:
+                            reset_error = error
+                    return _evidence_references(safe_evidence()[before:])
 
-            result = engine.run(
-                scenario,
-                adapter,
-                provenance,
-                evidence_provider=finalize_evidence,
+                result = engine.run(
+                    scenario,
+                    adapter,
+                    provenance,
+                    evidence_provider=finalize_evidence,
+                )
+            payload = result.to_dict()
+            validate_result_payload(payload)
+            results.append(payload)
+            reset_count += 1
+            if engine.schema_version == 2:
+                if reset_error is not None:
+                    reset_failures.append(type(reset_error).__name__)
+            else:
+                try:
+                    reset_timeout = _lane_remaining(deadline)
+                    if reset_timeout is not None:
+                        if reset_timeout <= 0:
+                            raise ValueError(
+                                "HOSTED_LANE_DEADLINE_EXCEEDED before scenario reset"
+                            )
+                        reset_timeout = min(float(_RESET_TIMEOUT_SECONDS), reset_timeout)
+                    else:
+                        reset_timeout = float(_RESET_TIMEOUT_SECONDS)
+                    adapter.reset(timeout_seconds=reset_timeout)
+                except Exception as error:
+                    reset_failures.append(type(error).__name__)
+            remaining = _lane_remaining(deadline)
+            if remaining is not None and remaining <= 0:
+                raise ValueError(
+                    f"HOSTED_LANE_DEADLINE_EXCEEDED after scenario {scenario.id} cleanup"
+                )
+            outcome = payload.get("outcome")
+            if outcome not in {"passed", "failed", "unavailable"}:
+                outcome = "unknown"
+            _emit_hosted_progress(
+                f"hosted-functional scenario-finish id={scenario.id} "
+                f"outcome={outcome} duration_seconds={time.monotonic() - started:.3f} "
+                f"reset_failures={len(reset_failures)}"
             )
-        payload = result.to_dict()
-        validate_result_payload(payload)
-        results.append(payload)
-        reset_count += 1
-        if engine.schema_version == 2:
-            if reset_error is not None:
-                reset_failures.append(type(reset_error).__name__)
-        else:
-            try:
-                reset_timeout = _lane_remaining(deadline)
-                if reset_timeout is not None:
-                    if reset_timeout <= 0:
-                        raise ValueError(
-                            "HOSTED_LANE_DEADLINE_EXCEEDED before scenario reset"
-                        )
-                    reset_timeout = min(float(_RESET_TIMEOUT_SECONDS), reset_timeout)
-                else:
-                    reset_timeout = float(_RESET_TIMEOUT_SECONDS)
-                adapter.reset(timeout_seconds=reset_timeout)
-            except Exception as error:
-                reset_failures.append(type(error).__name__)
-        remaining = _lane_remaining(deadline)
-        if remaining is not None and remaining <= 0:
-            raise ValueError(
-                f"HOSTED_LANE_DEADLINE_EXCEEDED after scenario {scenario.id} cleanup"
+        except Exception as error:
+            _emit_hosted_progress(
+                f"hosted-functional scenario-error id={scenario.id} "
+                f"code={_diagnostic_code(error)} "
+                f"duration_seconds={time.monotonic() - started:.3f}"
             )
+            raise
     return results, reset_failures, reset_count
 
 

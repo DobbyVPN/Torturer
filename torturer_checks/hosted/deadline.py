@@ -10,9 +10,11 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 import tempfile
+import threading
 import time
 
 from .cli import (
@@ -29,10 +31,93 @@ _MAX_GRACE_SECONDS = 60
 _MIN_CLEANUP_SECONDS = 0.01
 _MAX_SUMMARY_RECORDS = 256
 _MAX_SUMMARY_BYTES = 1024 * 1024
+_PROGRESS_PATH_ENV = "TORTURER_HOSTED_PROGRESS_PATH"
+_SAFE_PROGRESS_LINE = re.compile(
+    r"hosted-functional scenario-(?:"
+    r"start id=[a-z][a-z0-9._-]{2,95} required_seconds=[0-9]+ "
+    r"missing_capabilities=[0-9]+|"
+    r"finish id=[a-z][a-z0-9._-]{2,95} "
+    r"outcome=(?:passed|failed|unavailable|unknown) "
+    r"duration_seconds=[0-9]+(?:\.[0-9]+)? reset_failures=[0-9]+|"
+    r"error id=[a-z][a-z0-9._-]{2,95} "
+    r"code=[A-Za-z][A-Za-z0-9_.-]* "
+    r"duration_seconds=[0-9]+(?:\.[0-9]+)?)"
+)
 
 
 class DeadlineError(ValueError):
     """The requested command or deadline is unsafe."""
+
+
+class _ProgressForwarder:
+    """Forward only allow-listed hosted scenario markers from the child."""
+
+    def __init__(self, path: Path) -> None:
+        if not path.is_absolute():
+            raise DeadlineError("progress path must be absolute")
+        try:
+            _ensure_owner_only_directory(path.parent)
+        except HostedAdapterError as error:
+            raise DeadlineError("progress path is unsafe") from error
+        self.path = path
+        self.offset = 0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _drain(self) -> None:
+        try:
+            info = self.path.lstat()
+        except FileNotFoundError:
+            return
+        except OSError:
+            return
+        if self.path.is_symlink() or not stat.S_ISREG(info.st_mode):
+            return
+        try:
+            with self.path.open("rb") as source:
+                source.seek(self.offset)
+                data = source.read()
+        except OSError:
+            return
+        if not data:
+            return
+        consumed = 0
+        for raw_line in data.splitlines(keepends=True):
+            if not raw_line.endswith(b"\n"):
+                break
+            consumed += len(raw_line)
+            try:
+                line = raw_line[:-1].decode("ascii")
+            except UnicodeDecodeError:
+                continue
+            if _SAFE_PROGRESS_LINE.fullmatch(line):
+                print(line, flush=True)
+        self.offset += consumed
+
+    def _watch(self) -> None:
+        while not self._stop.wait(0.1):
+            self._drain()
+        self._drain()
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._watch,
+            name="hosted-progress-forwarder",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+
+def _progress_forwarder() -> _ProgressForwarder | None:
+    configured = os.environ.get(_PROGRESS_PATH_ENV)
+    if not configured:
+        return None
+    return _ProgressForwarder(Path(configured).expanduser())
 
 
 def _safe_reason(error: Exception) -> str:
@@ -289,6 +374,9 @@ def run(
     except HostedAdapterError as error:
         raise DeadlineError(error.code) from error
     summary = _summary_path(summary_output)
+    progress = _progress_forwarder()
+    if progress is not None:
+        progress.start()
     print(
         f"hosted-deadline status=started timeout_seconds={timeout} "
         f"command_arg_count={len(command)}",
@@ -328,6 +416,9 @@ def run(
             return_code=None,
         )
         raise DeadlineError(error.code) from error
+    finally:
+        if progress is not None:
+            progress.stop()
 
 
 def parser() -> argparse.ArgumentParser:
