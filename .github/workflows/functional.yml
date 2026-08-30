@@ -729,6 +729,9 @@ jobs:
           printf 'render_lease_lifetime_for_lane_seconds=%s required=%s reserve=%s margin=%s\n' \
             "$server_remaining" "$remaining" "$client_post_lane_reserve_seconds" "$lane_start_margin_seconds"
           printf 'canonical_lane_timeout_seconds=%s\n' "$remaining"
+          progress_path="$RUNNER_TEMP/dobbyvpn-render-handoff/hosted-progress.log"
+          ( umask 077; : > "$progress_path"; chmod 600 "$progress_path" )
+          export TORTURER_HOSTED_PROGRESS_PATH="$progress_path"
           upload_url="$(cat "$HANDOFF_DIR/upload-url.txt")"
           test -n "$upload_url"
           PYTHONPATH="$GITHUB_WORKSPACE/torturer" python3 -m torturer_checks.hosted.deadline \
