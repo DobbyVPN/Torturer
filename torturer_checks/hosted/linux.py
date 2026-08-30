@@ -500,7 +500,18 @@ class LinuxServiceProcessController:
     def _wait_dead(self, timeout: float) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if not self._alive(self._remaining(deadline, "SERVICE_DID_NOT_EXIT")):
+            # The process-loss operation has just sent SIGKILL.  Do not pair
+            # a signal probe with a later ``ps`` probe here: the process can
+            # exit between those two commands, and the otherwise useful
+            # fail-closed liveness policy would misclassify that normal race
+            # as SERVICE_PROBE_FAILED.  The bounded /proc identity helper is
+            # the authoritative post-kill check and explicitly distinguishes
+            # an absent process from a probe error.
+            record = self._read_process_stat(
+                self.pid,
+                self._remaining(deadline, "SERVICE_DID_NOT_EXIT"),
+            )
+            if record is None or record.state == "Z":
                 return
             time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
         raise ScenarioExecutionError("SERVICE_DID_NOT_EXIT")
