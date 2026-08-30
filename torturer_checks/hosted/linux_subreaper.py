@@ -202,17 +202,13 @@ def main() -> int:
 
     bound_descendants = os.environ.get(_BOUND_DESCENDANTS_ENV) == "1"
     leader_status: int | None = None
-    while True:
+    while leader_status is None:
         try:
-            pid, status = os.wait()
+            _pid, leader_status = os.waitpid(leader, 0)
         except InterruptedError:
             continue
         except ChildProcessError:
             break
-        if pid == leader:
-            leader_status = status
-            if bound_descendants:
-                break
     if bound_descendants:
         survivor_seen, containment_complete = _bound_remaining_descendants()
         if survivor_seen:
@@ -221,6 +217,20 @@ def main() -> int:
         if not containment_complete:
             _write_status(status_descriptor, b"SURVIVOR_UNCONTAINED")
             os.write(2, b"DOBBYVPN_SUBREAPER_SURVIVOR_UNCONTAINED=1\n")
+    else:
+        # Keep adopted descendants attributable until the command leader has
+        # exited.  In particular, the outer hosted deadline must not reap the
+        # intentionally restarted VPN service while the inner functional
+        # process still needs its /proc identity for strict finalization.
+        # Once the leader is gone, preserve the ordinary runner contract by
+        # waiting for and reaping every remaining descendant before return.
+        while True:
+            try:
+                os.wait()
+            except InterruptedError:
+                continue
+            except ChildProcessError:
+                break
     if leader_status is None:
         _write_status(status_descriptor, b"WAIT_FAILED")
         os.write(2, b"DOBBYVPN_SUBREAPER_WAIT_FAILED\n")
