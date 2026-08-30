@@ -375,6 +375,7 @@ def run(
         runner = SubprocessRunner(
             evidence_directory,
             cleanup_reserve_seconds=cleanup_reserve,
+            bound_subreaper_descendants=True,
         )
     except HostedAdapterError as error:
         raise DeadlineError(error.code) from error

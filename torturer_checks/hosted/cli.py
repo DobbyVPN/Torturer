@@ -47,6 +47,7 @@ _MIN_PROCESS_CLEANUP_SECONDS = 0.01
 _PROCESS_REAP_RESERVE_SECONDS = 0.05
 _PROCESS_TREE_PROOF_RESERVE_SECONDS = 0.05
 _PROCESS_TREE_MONITOR_STOP_RESERVE_SECONDS = 0.01
+_SUBREAPER_BOUND_DESCENDANTS_ENV = "DOBBYVPN_SUBREAPER_BOUND_DESCENDANTS"
 _ROUTE_CONVERGENCE_POLL_SECONDS = 0.5
 _SUBREAPER_STATUS_LIMIT = 1024
 
@@ -193,12 +194,20 @@ class SubprocessRunner:
         raw_directory: Path,
         *,
         cleanup_reserve_seconds: float = _DEFAULT_CLEANUP_RESERVE_SECONDS,
+        bound_subreaper_descendants: bool = False,
     ) -> None:
         if cleanup_reserve_seconds <= 0:
             raise HostedAdapterError("INVALID_CLEANUP_RESERVE")
         self.raw_directory = raw_directory
         _ensure_owner_only_directory(self.raw_directory)
         self.cleanup_reserve_seconds = float(cleanup_reserve_seconds)
+        # The outer hosted deadline wrapper has one deliberate detached
+        # service exception: the inner functional process must finalize that
+        # service before it exits. If it fails, the deadline supervisor must
+        # contain the adopted descendant immediately instead of waiting for
+        # the full lane timeout. Ordinary command runners retain the strict
+        # wait-for-all-descendants behavior by default.
+        self.bound_subreaper_descendants = bool(bound_subreaper_descendants)
         self._sequence = 0
         self._evidence: list[dict[str, object]] = []
 
@@ -307,6 +316,10 @@ class SubprocessRunner:
             if status_writer is not None:
                 popen_kwargs["pass_fds"] = (status_writer,)
             try:
+                if self.bound_subreaper_descendants and _linux_containment_required():
+                    child_environment = os.environ.copy()
+                    child_environment[_SUBREAPER_BOUND_DESCENDANTS_ENV] = "1"
+                    popen_kwargs["env"] = child_environment
                 process = popen_with_windows_job(
                     subprocess.Popen,
                     list(launch_argv),
@@ -1189,6 +1202,20 @@ def _consume_subreaper_status(
         return diagnostics + b"SUBREAPER_STATUS_INTERRUPTED=1\n", None
     if records == (b"READY", b"COMPLETE"):
         return diagnostics, None
+    if (
+        records
+        and records[0] == b"READY"
+        and records[-1] == b"COMPLETE"
+        and any(
+            marker in records
+            for marker in (b"SURVIVOR_KILLED", b"SURVIVOR_UNCONTAINED")
+        )
+    ):
+        # The bounded outer deadline supervisor found a descendant after the
+        # hosted leader exited.  It may have contained it, but the command's
+        # ordinary tree contract was not clean; retain this as a failure even
+        # if the final census races the descendant's disappearance.
+        return diagnostics, "PROCESS_TREE_UNPROVEN"
     if b"EXEC_FAILED" in records:
         return diagnostics, "COMMAND_UNAVAILABLE"
     return (
