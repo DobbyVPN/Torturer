@@ -852,7 +852,24 @@ def main(argv: list[str] | None = None) -> int:
             deadline=scenario_deadline,
         )
         finalization_attempted = True
-        _finalize_adapter(adapter, lane_deadline)
+        finalization_started = time.monotonic()
+        _emit_hosted_progress(
+            f"hosted-functional finalization-start "
+            f"timeout_seconds={_FINALIZE_TIMEOUT_SECONDS}"
+        )
+        try:
+            _finalize_adapter(adapter, lane_deadline)
+        except Exception as error:
+            _emit_hosted_progress(
+                "hosted-functional finalization-error "
+                f"code={_diagnostic_code(error)} "
+                f"duration_seconds={time.monotonic() - finalization_started:.3f}"
+            )
+            raise
+        _emit_hosted_progress(
+            "hosted-functional finalization-finish "
+            f"duration_seconds={time.monotonic() - finalization_started:.3f}"
+        )
         coverage = _coverage_contract(
             args.platform,
             selected_scenarios,

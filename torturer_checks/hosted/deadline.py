@@ -33,6 +33,7 @@ _MAX_SUMMARY_RECORDS = 256
 _MAX_SUMMARY_BYTES = 1024 * 1024
 _PROGRESS_PATH_ENV = "TORTURER_HOSTED_PROGRESS_PATH"
 _SAFE_PROGRESS_LINE = re.compile(
+    r"(?:"
     r"hosted-functional scenario-(?:"
     r"start id=[a-z][a-z0-9._-]{2,95} required_seconds=[0-9]+ "
     r"missing_capabilities=[0-9]+|"
@@ -41,7 +42,11 @@ _SAFE_PROGRESS_LINE = re.compile(
     r"duration_seconds=[0-9]+(?:\.[0-9]+)? reset_failures=[0-9]+|"
     r"error id=[a-z][a-z0-9._-]{2,95} "
     r"code=[A-Za-z][A-Za-z0-9_.-]* "
-    r"duration_seconds=[0-9]+(?:\.[0-9]+)?)"
+    r"duration_seconds=[0-9]+(?:\.[0-9]+)?)|"
+    r"hosted-functional finalization-(?:start timeout_seconds=[0-9]+(?:\.[0-9]+)?|"
+    r"finish duration_seconds=[0-9]+(?:\.[0-9]+)?|"
+    r"error code=[A-Za-z][A-Za-z0-9_.-]* duration_seconds=[0-9]+(?:\.[0-9]+)?)"
+    r")"
 )
 
 

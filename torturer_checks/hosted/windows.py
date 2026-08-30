@@ -1209,10 +1209,15 @@ class WindowsHostedAdapter(HostedCLIAdapter):
         super().finalize(timeout_seconds, deadline=deadline)
         if self.service is None or self.service._restart_number == 0:
             return
+        now = time.monotonic()
         if deadline is None:
-            deadline = time.monotonic() + timeout_seconds
-        elif deadline <= time.monotonic():
-            raise ScenarioExecutionError("SERVICE_FINALIZE_TIMEOUT")
+            deadline = now + timeout_seconds
+        else:
+            if deadline <= now:
+                raise ScenarioExecutionError("SERVICE_FINALIZE_TIMEOUT")
+            # The lane deadline is an outer bound; never let it expand the
+            # finalizer's explicit timeout budget.
+            deadline = min(deadline, now + timeout_seconds)
         _call_with_deadline(
             self.service.finalize_restarted_service,
             self._remaining(deadline, "SERVICE_FINALIZE_TIMEOUT"),

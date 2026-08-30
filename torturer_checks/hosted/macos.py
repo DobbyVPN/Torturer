@@ -870,10 +870,15 @@ class MacOSHostedAdapter(HostedCLIAdapter):
     ) -> None:
         super().finalize(timeout_seconds, deadline=deadline)
         if self.service is not None:
+            now = time.monotonic()
             if deadline is None:
-                deadline = time.monotonic() + timeout_seconds
-            elif deadline <= time.monotonic():
-                raise ScenarioExecutionError("SERVICE_FINALIZE_TIMEOUT")
+                deadline = now + timeout_seconds
+            else:
+                if deadline <= now:
+                    raise ScenarioExecutionError("SERVICE_FINALIZE_TIMEOUT")
+                # Keep the adapter's own finalization budget independent of
+                # the larger outer hosted-lane deadline.
+                deadline = min(deadline, now + timeout_seconds)
             _call_with_deadline(
                 self.service.finalize_restarted_service,
                 self._remaining(deadline, "SERVICE_FINALIZE_TIMEOUT"),
