@@ -98,7 +98,8 @@ def _publish_evidence(runner: SubprocessRunner, *, status: str) -> None:
             raise DeadlineError("deadline evidence metadata is incomplete")
         print(
             f"hosted-deadline evidence status={status} id={identifier} "
-            f"bytes={size} sha256={digest}"
+            f"bytes={size} sha256={digest}",
+            flush=True,
         )
 
 
@@ -288,7 +289,11 @@ def run(
     except HostedAdapterError as error:
         raise DeadlineError(error.code) from error
     summary = _summary_path(summary_output)
-    print(f"hosted-deadline status=started timeout_seconds={timeout} command_arg_count={len(command)}")
+    print(
+        f"hosted-deadline status=started timeout_seconds={timeout} "
+        f"command_arg_count={len(command)}",
+        flush=True,
+    )
     try:
         result = runner.run(command, timeout_seconds=timeout)
         status = "failed" if result.returncode else "completed"
@@ -299,7 +304,10 @@ def run(
             status=status,
             return_code=result.returncode,
         )
-        print(f"hosted-deadline status=completed return_code={result.returncode}")
+        print(
+            f"hosted-deadline status=completed return_code={result.returncode}",
+            flush=True,
+        )
         return result.returncode
     except HostedAdapterError as error:
         if error.code == "COMMAND_TIMEOUT":
@@ -310,7 +318,7 @@ def run(
                 status="timed-out",
                 return_code=124,
             )
-            print("hosted-deadline status=timed-out")
+            print("hosted-deadline status=timed-out", flush=True)
             return 124
         _publish_evidence(runner, status="failed")
         _write_deadline_summary(
@@ -345,10 +353,15 @@ def main(argv: list[str] | None = None) -> int:
             f"hosted-deadline invalid-request={type(error).__name__} "
             f"reason={_safe_reason(error)}",
             file=sys.stderr,
+            flush=True,
         )
         return 2
     except OSError as error:
-        print(f"hosted-deadline launch-error={type(error).__name__}", file=sys.stderr)
+        print(
+            f"hosted-deadline launch-error={type(error).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
         return 1
 
 

@@ -103,5 +103,5 @@ def emit_evidence(
         if not isinstance(payload, bytes):
             raise TypeError("evidence payload must be bytes")
         fields.extend((f"{name}_bytes={len(payload)}", f"{name}_sha256={_digest(payload)}"))
-    print("diagnostic_evidence " + " ".join(fields))
+    print("diagnostic_evidence " + " ".join(fields), flush=True)
     return identifier
